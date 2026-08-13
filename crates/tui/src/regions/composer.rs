@@ -1,0 +1,403 @@
+//! Z2 Composer — Z2.R0 AppInfoLine, Z2.R1 TopRule, Z2.R2 Content (Z2.R2.S0 Editor base +
+//! Z2.R2.S1 CompletionPopup floating + Z2.R2.S2 Approval stacked above Editor), Z2.R3 BottomRule.
+
+use crate::frame_state::{
+    ApprovalRequest, ApprovalState, ApprovalViewMode, BottomRuleState, CompletionPopupState,
+    ComposerState, ContentState, EditorState, InputMode, TopRuleState,
+};
+use crate::regions::style::{self, separator_color, COLOR_ACCENT, COLOR_SECONDARY};
+use ratatui::{
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Clear, Paragraph},
+    Frame,
+};
+
+pub fn height(state: &ComposerState, width: u16) -> u16 {
+    let app_info = if state.app_info.text.is_some() { 1 } else { 0 };
+    let top_rule = 1;
+    let bottom_rule = 1;
+    app_info + top_rule + content_height(&state.content, width) + bottom_rule
+}
+
+fn content_height(state: &ContentState, width: u16) -> u16 {
+    editor_height(&state.editor)
+        + state
+            .approval
+            .as_ref()
+            .map(|a| approval_height(a, width))
+            .unwrap_or(0)
+}
+
+fn editor_height(state: &EditorState) -> u16 {
+    let text_lines = state.draft.lines().count().max(1) as u16;
+    let paste = if state.paste_placeholder.is_some() {
+        1
+    } else {
+        0
+    };
+    (text_lines + paste).clamp(1, 12)
+}
+
+fn approval_height(state: &ApprovalState, _width: u16) -> u16 {
+    let border = 2;
+    match state.view_mode {
+        ApprovalViewMode::TabView => {
+            let tabs = if state.pending.len() > 1 { 1 } else { 0 };
+            let card = state
+                .pending
+                .get(state.active_idx)
+                .map(card_inner_height)
+                .unwrap_or(0);
+            border + tabs + card
+        }
+        ApprovalViewMode::ListView => border + 1 + state.pending.len() as u16 + 2,
+    }
+}
+
+fn card_inner_height(req: &ApprovalRequest) -> u16 {
+    let msg_lines = req.message.lines().count().max(1) as u16;
+    1 /* tool_name header */ + msg_lines + 1 /* blank */ + req.options.len() as u16 + 1 /* blank */ + 1
+    /* footer */
+}
+
+pub fn render(frame: &mut Frame, area: Rect, state: &ComposerState) {
+    let app_info_h = if state.app_info.text.is_some() { 1 } else { 0 };
+    let content_h = content_height(&state.content, area.width);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(app_info_h),
+            Constraint::Length(1),
+            Constraint::Length(content_h),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    if app_info_h > 0 {
+        render_app_info_line(frame, rows[0], state.app_info.text.as_deref().unwrap_or(""));
+    }
+    render_top_rule(frame, rows[1], &state.top_rule);
+    render_content(frame, rows[2], &state.content);
+    render_bottom_rule(frame, rows[3], &state.bottom_rule);
+}
+
+fn render_app_info_line(frame: &mut Frame, area: Rect, text: &str) {
+    let w = area.width as usize;
+    let pad = w.saturating_sub(text.len());
+    let line = Line::from(Span::styled(
+        format!("{}{text}", " ".repeat(pad)),
+        Style::default().fg(COLOR_ACCENT),
+    ));
+    frame.render_widget(Paragraph::new(line), area);
+}
+
+fn render_top_rule(frame: &mut Frame, area: Rect, state: &TopRuleState) {
+    let color = separator_color(state.color);
+    let label = state
+        .right_label
+        .as_ref()
+        .map(|l| l.text())
+        .unwrap_or_default();
+    let dash_w = area.width.saturating_sub(label.len() as u16) as usize;
+    let line = Line::from(vec![
+        Span::styled("─".repeat(dash_w), Style::default().fg(color)),
+        Span::styled(label, Style::default().fg(color)),
+    ]);
+    frame.render_widget(Paragraph::new(line), area);
+}
+
+fn render_bottom_rule(frame: &mut Frame, area: Rect, state: &BottomRuleState) {
+    let color = separator_color(state.color);
+    let line = Line::from(Span::styled(
+        "─".repeat(area.width as usize),
+        Style::default().fg(color),
+    ));
+    frame.render_widget(Paragraph::new(line), area);
+}
+
+fn render_content(frame: &mut Frame, area: Rect, state: &ContentState) {
+    let editor_h = editor_height(&state.editor);
+    let approval_h = state
+        .approval
+        .as_ref()
+        .map(|a| approval_height(a, area.width))
+        .unwrap_or(0);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(approval_h), Constraint::Length(editor_h)])
+        .split(area);
+
+    render_editor(frame, rows[1], &state.editor);
+    if let Some(approval) = &state.approval {
+        render_approval(frame, rows[0], approval);
+    } else if let Some(completion) = &state.completion {
+        render_completion_popup(frame, rows[1], completion);
+    }
+}
+
+fn render_editor(frame: &mut Frame, area: Rect, state: &EditorState) {
+    let prefix = match state.mode {
+        InputMode::BashEscape => "! ",
+        _ => "> ",
+    };
+    let text = if state.locked {
+        format!("{prefix}{}", state.draft)
+    } else {
+        format!("{prefix}{}█", state.draft)
+    };
+    let style = if state.locked {
+        Style::default().fg(COLOR_SECONDARY)
+    } else {
+        Style::default().fg(style::COLOR_PRIMARY)
+    };
+    let mut lines: Vec<Line<'static>> = text
+        .lines()
+        .map(|l| Line::from(Span::styled(l.to_string(), style)))
+        .collect();
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(text, style)));
+    }
+    if let Some(paste) = &state.paste_placeholder {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  [Pasted text +{} lines, {} bytes]",
+                paste.lines, paste.bytes
+            ),
+            Style::default().fg(COLOR_SECONDARY),
+        )));
+    }
+    if matches!(state.mode, InputMode::VimNormal) {
+        lines.push(Line::from(Span::styled(
+            "[NORMAL]",
+            Style::default()
+                .fg(style::COLOR_ACCENT)
+                .add_modifier(Modifier::BOLD),
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn render_completion_popup(frame: &mut Frame, editor_area: Rect, state: &CompletionPopupState) {
+    let h = (state.candidates.len() as u16 + 2).min(5);
+    let w = editor_area.width.min(60);
+    let area = Rect {
+        x: editor_area.x,
+        y: editor_area.y.saturating_sub(h),
+        width: w,
+        height: h,
+    };
+    frame.render_widget(Clear, area);
+    let lines: Vec<Line<'static>> = state
+        .candidates
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let selected = i == state.selected;
+            let marker = if selected { "❯ " } else { "  " };
+            let style = if selected {
+                Style::default()
+                    .fg(COLOR_ACCENT)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            Line::from(vec![
+                Span::styled(format!("{marker}{}", c.name), style),
+                Span::raw("  "),
+                Span::styled(c.description.clone(), Style::default().fg(COLOR_SECONDARY)),
+            ])
+        })
+        .collect();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLOR_ACCENT));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn render_approval(frame: &mut Frame, area: Rect, state: &ApprovalState) {
+    match state.view_mode {
+        ApprovalViewMode::TabView => render_approval_tabs(frame, area, state),
+        ApprovalViewMode::ListView => render_approval_list(frame, area, state),
+    }
+}
+
+fn render_approval_tabs(frame: &mut Frame, area: Rect, state: &ApprovalState) {
+    let mut area = area;
+    if state.pending.len() > 1 {
+        let tab_area = Rect { height: 1, ..area };
+        let tabs: Vec<Span<'static>> = state
+            .pending
+            .iter()
+            .enumerate()
+            .flat_map(|(i, req)| {
+                let style = if i == state.active_idx {
+                    Style::default()
+                        .fg(COLOR_ACCENT)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(COLOR_SECONDARY)
+                };
+                vec![Span::styled(
+                    format!(" [{}#{}]", req.tool_name, i + 1),
+                    style,
+                )]
+            })
+            .collect();
+        frame.render_widget(Paragraph::new(Line::from(tabs)), tab_area);
+        area = Rect {
+            y: area.y + 1,
+            height: area.height.saturating_sub(1),
+            ..area
+        };
+    }
+    let Some(req) = state.pending.get(state.active_idx) else {
+        return;
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLOR_ACCENT));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut lines = vec![Line::from(Span::styled(
+        format!("{}:", req.tool_name),
+        Style::default().add_modifier(Modifier::BOLD),
+    ))];
+    for l in req.message.lines() {
+        lines.push(Line::from(format!("  {l}")));
+    }
+    lines.push(Line::from(""));
+    for (i, opt) in req.options.iter().enumerate() {
+        let marker = if i == req.selected_option {
+            "❯ "
+        } else {
+            "  "
+        };
+        let style = if i == req.selected_option {
+            Style::default()
+                .fg(COLOR_ACCENT)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(Span::styled(
+            format!("  {marker}{}", opt.label()),
+            style,
+        )));
+    }
+    lines.push(Line::from(""));
+    let footer = if state.pending.len() > 1 {
+        "Enter=confirm  Esc=deny  Ctrl-Tab=next"
+    } else {
+        "Enter=confirm  Esc=deny"
+    };
+    lines.push(Line::from(Span::styled(
+        format!("  {footer}"),
+        Style::default().fg(COLOR_SECONDARY),
+    )));
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn render_approval_list(frame: &mut Frame, area: Rect, state: &ApprovalState) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLOR_ACCENT));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut lines = vec![Line::from(Span::styled(
+        format!("{} pending approvals", state.pending.len()),
+        Style::default().add_modifier(Modifier::BOLD),
+    ))];
+    for (i, req) in state.pending.iter().enumerate() {
+        let selected = i == state.active_idx;
+        let marker = if selected { "❯ " } else { "  " };
+        let style = if selected {
+            Style::default()
+                .fg(COLOR_ACCENT)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(Span::styled(
+            format!(
+                "{marker}{}: {}",
+                req.tool_name,
+                req.message.lines().next().unwrap_or("")
+            ),
+            style,
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  Enter=expand  ↑/↓=move",
+        Style::default().fg(COLOR_SECONDARY),
+    )));
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frame_state::{ApprovalOption, SeparatorColor};
+
+    fn empty_editor() -> EditorState {
+        EditorState {
+            mode: InputMode::Normal,
+            draft: String::new(),
+            cursor: 0,
+            paste_placeholder: None,
+            locked: false,
+        }
+    }
+
+    #[test]
+    fn app_info_hidden_when_empty() {
+        let state = ComposerState {
+            app_info: crate::frame_state::AppInfoLineState { text: None },
+            top_rule: TopRuleState {
+                color: SeparatorColor::DarkGray,
+                right_label: None,
+            },
+            content: ContentState {
+                editor: empty_editor(),
+                completion: None,
+                approval: None,
+            },
+            bottom_rule: BottomRuleState {
+                color: SeparatorColor::DarkGray,
+            },
+        };
+        assert_eq!(
+            height(&state, 80),
+            1 /*top_rule*/ + 1 /*editor*/ + 1 /*bottom_rule*/
+        );
+    }
+
+    #[test]
+    fn single_pending_approval_has_no_tab_strip_height() {
+        let req = ApprovalRequest {
+            prompt_id: "test-1".into(),
+            tool_name: "Bash".into(),
+            message: "git status".into(),
+            options: vec![ApprovalOption::PermitOnce, ApprovalOption::Deny],
+            selected_option: 0,
+        };
+        let with_one = ApprovalState {
+            pending: vec![req.clone()],
+            active_idx: 0,
+            view_mode: ApprovalViewMode::TabView,
+        };
+        let with_two = ApprovalState {
+            pending: vec![req.clone(), req],
+            active_idx: 0,
+            view_mode: ApprovalViewMode::TabView,
+        };
+        assert_eq!(
+            approval_height(&with_two, 80) - approval_height(&with_one, 80),
+            1
+        );
+    }
+}

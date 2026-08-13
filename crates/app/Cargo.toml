@@ -1,0 +1,23 @@
+[package]
+name = "app"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+license      = { workspace = true }
+publish      = { workspace = true }
+description  = "AttaCode application binary — terminal event loop wiring tui + bridge + keybindings"
+
+[[bin]]
+name = "attacode"
+path = "src/main.rs"
+
+[dependencies]
+tui         = { path = "../tui" }
+bridge      = { path = "../bridge" }
+keybindings = { path = "../keybindings" }
+
+ratatui      = { workspace = true }
+crossterm    = { workspace = true }
+tokio        = { workspace = true }
+tokio-stream = { workspace = true }
+anyhow       = { workspace = true }

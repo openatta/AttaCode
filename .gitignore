@@ -1,0 +1,36 @@
+# Rust
+/target
+debug/
+**/*.rs.bk
+*.pdb
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# macOS
+.DS_Store
+
+# 本地配置 / 凭证
+.env
+.env.local
+.atta/
+*.pem
+
+# Python bytecode cache
+__pycache__/
+*.pyc
+
+# attacode worktrees (auto-added)
+.attacode/*
+
+# Editor tags
+.tags
+
+# Build artifacts
+/build-check.log
+*.log
+
+# Third-party reference implementations
+3rds/

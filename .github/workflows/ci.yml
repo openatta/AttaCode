@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel previous runs on the same PR / branch.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: cargo test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # rustup is preinstalled on GitHub-hosted runners; we just need to
+      # ensure stable + components are present.
+      - name: Configure Rust toolchain
+        run: |
+          rustup default stable
+          rustup component add rustfmt clippy
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # **v2-6 (M30)**: on Windows we explicitly want the named-pipe daemon
+      # tests to run. They're cfg(windows)-gated so they're invisible elsewhere.
+      - name: cargo test --workspace
+        run: cargo test --workspace --no-fail-fast
+
+      # **D3 (M30)**: clippy ran ubuntu-only before; M30 cleanup got the
+      # workspace down to zero warnings, so strict mode is feasible on every
+      # platform. Catches windows-only path/cfg issues we'd otherwise miss
+      # until next CI run.
+      - name: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+        if: matrix.os == 'ubuntu-latest'

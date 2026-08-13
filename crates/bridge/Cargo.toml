@@ -1,0 +1,30 @@
+[package]
+name = "bridge"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+license      = { workspace = true }
+publish      = { workspace = true }
+description  = "AttaCode TUI↔Core glue layer — bootstraps runtime::Agent, converts AgentEvent into tui::FrameState"
+
+[dependencies]
+tui         = { path = "../tui" }
+
+base        = { workspace = true }
+model       = { workspace = true }
+runtime     = { workspace = true }
+scene       = { workspace = true }
+permissions = { workspace = true }
+compaction  = { workspace = true }
+
+tokio       = { workspace = true }
+tokio-util  = { workspace = true }
+serde_json  = { workspace = true }
+thiserror   = { workspace = true }
+tracing     = { workspace = true }
+async-trait = { workspace = true }
+url         = { workspace = true }
+
+[dev-dependencies]
+tokio  = { workspace = true, features = ["macros", "rt-multi-thread"] }
+anyhow = { workspace = true }
