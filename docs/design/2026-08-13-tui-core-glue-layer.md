@@ -3,6 +3,22 @@
 **日期：** 2026-08-13
 **基于需求：** `docs/reqs/2026-08-13-tui-core-glue-layer.md`
 
+> **后续更新（Core 换到 `live-commands-and-per-turn-cancel` 之后）**
+>
+> 本文"现状核查"最后一条记的那个阻塞性缺口（Core 不调 `Agent.permission`、没有
+> `AgentEvent::PermissionPrompt` 发送点）**已经不成立**。现在的 Core：
+>
+> - `runtime::turn` 把 `Agent.permission` 交给工具分派，`PermissionOutcome::Prompt`
+>   会发 `AgentEvent::PermissionPrompt` 并挂起等 `InputMessage::PermissionResponse`，
+>   超时（`execution.permission_prompt_timeout_secs`，默认 300s）按**拒绝**处理。
+> - `permissions::rule_set_permission::RuleSetPermission` 就是那个官方实现，
+>   `Builder::build()` 会给它 `bind_tool_registry` / `bind_session_state`。
+>
+> 因此本文里"`bridge` 自建 `GatePermission` 适配器"的决策（下方第 21/42/81 行附近）
+> 已被撤销：`crates/bridge/src/permission.rs` 现在只负责按 settings 装配
+> `RuleSetPermission`，不再自己实现 `Permission`。同理，`ApprovalOption` 的三档
+> "允许"不再统一塌成 `Permit`，而是分别映射到 `PermitAlways { scope }`。
+
 ## 现状核查（只读探索结论）
 
 - `crates/tui` 当前是纯渲染库：`lib.rs`/`frame_state.rs` 顶部注释明确写着"zero AttaCore dependency"，`Cargo.toml` 也确实不依赖任何 `core/crates/*`。整个仓库（`core/` 之外）没有任何 `main.rs`/`[[bin]]`——**目前没有可运行的程序，TUI 与 Core 之间完全没有接线**，与需求文档"从零设计"的前提一致。

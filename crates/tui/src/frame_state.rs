@@ -29,6 +29,12 @@ pub struct TranscriptBodyState {
     pub entries: Vec<TranscriptEntry>,
     pub scroll: ScrollState,
     pub auto_follow: bool,
+    /// `block_id` of the block transcript keys act on (expand/collapse). `None`
+    /// means "no explicit selection" — the host then targets the most recent
+    /// foldable block, which is what a user who never touches the navigation
+    /// keys expects. Rendered as a marker on every line of the selected block.
+    #[serde(default)]
+    pub selected_block: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

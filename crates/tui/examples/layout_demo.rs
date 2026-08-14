@@ -202,6 +202,7 @@ fn base_frame(entries: Vec<TranscriptEntry>) -> FrameState {
                     total_lines: 0,
                 },
                 auto_follow: true,
+                selected_block: None,
             },
         },
         operation_status: OperationStatusState {

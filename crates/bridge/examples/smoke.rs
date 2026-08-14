@@ -9,11 +9,22 @@ use tui::frame_state::LineKind;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // 没有 subscriber 的话 bridge/Core 里所有 `tracing::warn!` 都掉进黑洞——而这个
+    // 示例存在的意义就是诊断。默认只放 warn 及以上，`RUST_LOG` 可以调。
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+
     let config = BootstrapConfig::defaults("claude-sonnet-4-6");
-    println!("model = {}", config.model_name);
 
     let (handle, cancel) = bridge::start(config).await?;
     let mut frame_rx = handle.subscribe();
+    // 三层 settings.json 合并之后才知道最终用的是哪个模型，所以从快照里读。
+    println!("model = {}", frame_rx.borrow().footer_hints.model);
 
     let prompt = "What is 2 + 2? Answer in one short sentence, no tools needed.";
     println!("> {prompt}");

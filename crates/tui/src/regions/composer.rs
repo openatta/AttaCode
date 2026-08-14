@@ -10,9 +10,14 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
     Frame,
 };
+use unicode_width::UnicodeWidthStr;
+
+/// Editor content is prefixed with `"> "` (or `"! "` in bash-escape mode) — reserve
+/// that much width when estimating wrapped row count.
+const EDITOR_PREFIX_WIDTH: u16 = 2;
 
 pub fn height(state: &ComposerState, width: u16) -> u16 {
     let app_info = if state.app_info.text.is_some() { 1 } else { 0 };
@@ -22,7 +27,7 @@ pub fn height(state: &ComposerState, width: u16) -> u16 {
 }
 
 fn content_height(state: &ContentState, width: u16) -> u16 {
-    editor_height(&state.editor)
+    editor_height(&state.editor, width)
         + state
             .approval
             .as_ref()
@@ -30,14 +35,31 @@ fn content_height(state: &ContentState, width: u16) -> u16 {
             .unwrap_or(0)
 }
 
-fn editor_height(state: &EditorState) -> u16 {
-    let text_lines = state.draft.lines().count().max(1) as u16;
+fn editor_height(state: &EditorState, width: u16) -> u16 {
+    let avail = width.saturating_sub(EDITOR_PREFIX_WIDTH).max(1);
+    let text_lines = wrapped_line_count(&state.draft, avail);
     let paste = if state.paste_placeholder.is_some() {
         1
     } else {
         0
     };
     (text_lines + paste).clamp(1, 12)
+}
+
+/// Number of visual rows `text` occupies once soft-wrapped at `avail_width` columns.
+/// Explicit `\n`s always start a new row; a single long line without `\n` still wraps
+/// across multiple rows once it exceeds `avail_width` (mirrors the `Wrap` applied in
+/// `render_editor` — this must stay in sync with that or the allocated area will be
+/// too short for what actually gets rendered).
+fn wrapped_line_count(text: &str, avail_width: u16) -> u16 {
+    let avail = avail_width.max(1) as usize;
+    let mut total: u16 = 0;
+    for line in text.split('\n') {
+        let w = line.width();
+        let rows = w.saturating_add(avail).saturating_sub(1) / avail;
+        total = total.saturating_add(rows.max(1) as u16);
+    }
+    total.max(1)
 }
 
 fn approval_height(state: &ApprovalState, _width: u16) -> u16 {
@@ -118,7 +140,7 @@ fn render_bottom_rule(frame: &mut Frame, area: Rect, state: &BottomRuleState) {
 }
 
 fn render_content(frame: &mut Frame, area: Rect, state: &ContentState) {
-    let editor_h = editor_height(&state.editor);
+    let editor_h = editor_height(&state.editor, area.width);
     let approval_h = state
         .approval
         .as_ref()
@@ -176,7 +198,7 @@ fn render_editor(frame: &mut Frame, area: Rect, state: &EditorState) {
                 .add_modifier(Modifier::BOLD),
         )));
     }
-    frame.render_widget(Paragraph::new(lines), area);
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
 fn render_completion_popup(frame: &mut Frame, editor_area: Rect, state: &CompletionPopupState) {
@@ -399,5 +421,36 @@ mod tests {
             approval_height(&with_two, 80) - approval_height(&with_one, 80),
             1
         );
+    }
+
+    #[test]
+    fn editor_height_grows_with_explicit_newlines() {
+        let mut state = empty_editor();
+        state.draft = "line one\nline two\nline three".into();
+        assert_eq!(editor_height(&state, 80), 3);
+    }
+
+    #[test]
+    fn editor_height_soft_wraps_a_long_single_line() {
+        let mut state = empty_editor();
+        // no '\n' at all, but far longer than a narrow terminal width
+        state.draft = "x".repeat(100);
+        // avail width = 20 - EDITOR_PREFIX_WIDTH(2) = 18 → ceil(100/18) = 6 rows
+        assert_eq!(editor_height(&state, 20), 6);
+    }
+
+    #[test]
+    fn editor_height_clamps_at_twelve_rows() {
+        let mut state = empty_editor();
+        state.draft = "x".repeat(1000);
+        assert_eq!(editor_height(&state, 20), 12);
+    }
+
+    #[test]
+    fn wrapped_line_count_matches_manual_expectation() {
+        assert_eq!(wrapped_line_count("", 10), 1);
+        assert_eq!(wrapped_line_count("hello", 10), 1);
+        assert_eq!(wrapped_line_count("hello world!", 5), 3); // ceil(12/5)
+        assert_eq!(wrapped_line_count("a\nb\nc", 10), 3);
     }
 }

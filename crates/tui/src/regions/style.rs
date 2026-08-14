@@ -19,6 +19,8 @@ pub const ERROR_PREFIX: &str = "  ✗ ";
 pub const DIFF_OLD_PREFIX: &str = "  - ";
 pub const DIFF_NEW_PREFIX: &str = "  + ";
 pub const USER_PROMPT_PREFIX: &str = "> ";
+/// Left gutter bar marking the transcript block the fold/expand keys act on.
+pub const SELECTION_GUTTER: &str = "▌";
 
 pub const COLOR_PRIMARY: Color = Color::White;
 pub const COLOR_SECONDARY: Color = Color::DarkGray;

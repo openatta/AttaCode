@@ -8,10 +8,11 @@ publish      = { workspace = true }
 description  = "AttaCode TUI (v3 layout) — pure ratatui rendering, zero AttaCore dependency"
 
 [dependencies]
-ratatui    = { workspace = true }
-crossterm  = { workspace = true }
-serde      = { workspace = true }
-serde_json = { workspace = true }
+ratatui        = { workspace = true }
+crossterm      = { workspace = true }
+serde          = { workspace = true }
+serde_json     = { workspace = true }
+unicode-width  = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }

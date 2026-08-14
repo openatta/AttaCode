@@ -7,7 +7,12 @@ use ratatui::{
     Frame,
 };
 
-pub fn render(frame: &mut Frame, area: Rect, state: &FrameState, spinner: char) {
+/// 转录正文区的高度——所有其他区块都是内容定高的，正文吃掉剩下的。
+///
+/// 单独暴露出来是因为"翻一页"是多少行只有这里知道，而滚动位置是 UI-本地状态、
+/// 归 `crates/app` 管（同 draft/补全选择）。app 拿这个值算翻页步长，`render`
+/// 自己也用它，两边不会各算一套。
+pub fn transcript_body_height(area: Rect, state: &FrameState) -> u16 {
     let header_h = transcript::header_height(&state.transcript.header);
     let status_h = operation_status::status_line_height(&state.operation_status.status_line);
     let task_h = operation_status::task_list_height(&state.operation_status.task_list);
@@ -16,11 +21,20 @@ pub fn render(frame: &mut Frame, area: Rect, state: &FrameState, spinner: char) 
     let footer_h = footer_hints::HEIGHT;
 
     let fixed_below_transcript = status_h + task_h + composer_h + sub_agent_h + footer_h;
-    let body_h = area
-        .height
+    area.height
         .saturating_sub(header_h)
         .saturating_sub(fixed_below_transcript)
-        .max(1);
+        .max(1)
+}
+
+pub fn render(frame: &mut Frame, area: Rect, state: &FrameState, spinner: char) {
+    let header_h = transcript::header_height(&state.transcript.header);
+    let status_h = operation_status::status_line_height(&state.operation_status.status_line);
+    let task_h = operation_status::task_list_height(&state.operation_status.task_list);
+    let composer_h = composer::height(&state.composer, area.width);
+    let sub_agent_h = sub_agent_bar::height(&state.sub_agent_bar);
+    let footer_h = footer_hints::HEIGHT;
+    let body_h = transcript_body_height(area, state);
 
     let rows = Layout::default()
         .direction(Direction::Vertical)

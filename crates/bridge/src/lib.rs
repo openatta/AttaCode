@@ -5,6 +5,7 @@
 //! `EventReceiver`/`InputSender` 等 AttaCore 类型完全留在这个 crate 内部。
 
 pub mod bootstrap;
+pub mod commands;
 pub mod handle;
 pub mod permission;
 pub mod reducer;
@@ -22,18 +23,33 @@ use tui::FrameState;
 pub async fn start(
     config: BootstrapConfig,
 ) -> Result<(Arc<dyn EngineHandle>, CancellationToken), BootstrapError> {
-    let (agent, event_rx, input_tx) = bootstrap::build_agent(&config)?;
+    let engine = bootstrap::build_agent(&config).await?;
+
+    // `Agent::commands()` 必须在 spawn 之前取：`run()` 会 `&mut self` 借走整个
+    // session，之后就没有 `&Agent` 可问了。拿到的是 `Arc`，一直持有即可。
+    let (command_catalog, commands_rx) = commands::CommandCatalog::new(engine.agent.commands());
 
     let cancel = CancellationToken::new();
     let run_cancel = cancel.clone();
     tokio::spawn(async move {
-        let mut agent = agent;
+        let mut agent = engine.agent;
         agent.run(run_cancel).await;
     });
 
-    let (reducer, frame_rx) =
-        Reducer::spawn(event_rx, config.model_name.clone(), cwd_display(&config));
-    let handle: Arc<dyn EngineHandle> = Arc::new(BridgeHandle::new(input_tx, frame_rx, reducer));
+    let (reducer, frame_rx) = Reducer::spawn(
+        engine.event_rx,
+        engine.model_name,
+        cwd_display(&config),
+        command_catalog,
+    );
+
+    let handle: Arc<dyn EngineHandle> = Arc::new(BridgeHandle::new(
+        engine.input_tx,
+        frame_rx,
+        commands_rx,
+        reducer,
+        cancel.clone(),
+    ));
 
     Ok((handle, cancel))
 }
@@ -41,7 +57,7 @@ pub async fn start(
 fn cwd_display(config: &BootstrapConfig) -> String {
     std::env::current_dir()
         .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| config.local_data_dir.display().to_string())
+        .unwrap_or_else(|_| config.paths.project_root().display().to_string())
 }
 
 /// 方便 `crates/app` 在渲染前订阅当前快照而不必知道 `watch` 的具体类型别名。

@@ -16,6 +16,7 @@ runtime     = { workspace = true }
 scene       = { workspace = true }
 permissions = { workspace = true }
 compaction  = { workspace = true }
+history     = { workspace = true }
 
 tokio       = { workspace = true }
 tokio-util  = { workspace = true }
@@ -26,5 +27,10 @@ async-trait = { workspace = true }
 url         = { workspace = true }
 
 [dev-dependencies]
-tokio  = { workspace = true, features = ["macros", "rt-multi-thread"] }
-anyhow = { workspace = true }
+# 只有 `commands` 的单测需要它——生产路径上技能目录完全由 Core 的
+# `CommandRegistry` 持有，bridge 不再自己装配 `SkillManager`。
+skills    = { workspace = true }
+tokio     = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tracing-subscriber = { workspace = true }
+anyhow    = { workspace = true }
+tempfile  = { workspace = true }

@@ -1,21 +1,32 @@
 //! Bridge 启动装配 — 组装 `runtime::Agent` 所需依赖，调用 `Builder::build()`。
 //!
 //! 装配顺序沿用 `core/daemon/src/main.rs` 的参考实现：Settings → AnthropicClient/Model
-//! → CodingScene → `runtime::agent::Builder`。`Permission` 字段留空——`Builder::build()`
-//! 会默认注入一个 always-allow 的占位实现（见 `runtime::agent::Builder::build`），真正的
-//! `GatePermission`（`crate::permission`）尚不能接入：Core 侧 `execute_tool_inner` 目前
-//! 并不会调用 `Agent.permission`，接入了也不会生效（见 docs/design/2026-08-13-tui-core-glue-layer.md）。
+//! → CodingScene → `runtime::agent::Builder`。`Permission` 由 `crate::permission::build`
+//! 装配后显式传入：`Builder::build()` 的默认值是 always-allow 占位实现，留着它等于
+//! 工具调用一律不过门、TUI 的审批对话框永远不弹。
+//!
+//! `Settings` 走 `Settings::load()`（Core 唯一的 settings.json 加载器，三层合并：
+//! 全局 → 场景 → 项目），而不是手搓字面量。手搓那版把 `instruction_file` /
+//! `hooks_config` / `permission_rules` 一律钉成空，效果是用户写在 settings.json 里的
+//! 东西一件都不生效——而这些字段 `Builder::build()` 全都会自己消费。
 
-use base::interface::settings::{
-    CompactionConfig, ExecutionSettings, ModelSettings, PathSettings, SandboxConfig, Settings,
-    ThinkingMode,
-};
+use base::interface::settings::{PathSettings, Settings};
 use model::adapter::AnthropicModel;
 use model::client::{AuthMode, HttpAnthropicClient};
 use runtime::agent::{Agent, Builder, EventReceiver, InputSender};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
+
+/// `scope` for [`base::paths::ConfigPaths`] — must equal the scene's `id()`
+/// (`CodingScene::id() == "coding"`), because that is what picks the
+/// user-level override tree `~/.atta/scenes/<scope>/` that Core itself reads
+/// skills/settings/plugins from.
+const SCENE_SCOPE: &str = "coding";
+
+/// `Settings::defaults_for` 给 `max_tokens` 的值。见 [`resolve_settings`] 里对它的用法
+/// ——和 `daemon::config::load_daemon_config` 用的是同一个哨兵值。
+const CORE_DEFAULT_MAX_TOKENS: u32 = 2000;
 
 /// 装配失败原因。
 #[derive(Debug, Error)]
@@ -30,36 +41,134 @@ pub enum BootstrapError {
     Engine(#[from] runtime::agent::EngineError),
 }
 
-/// 最小可用装配所需的运行参数。
+/// 最小可用装配所需的运行参数。三个 model 相关字段是**兜底**，不是最终值——真正的
+/// 取值在 [`resolve_settings`] 里和 settings.json 合并之后才定下来。
 pub struct BootstrapConfig {
-    pub model_name: String,
-    pub max_tokens: u32,
-    pub user_data_dir: PathBuf,
-    pub local_data_dir: PathBuf,
+    /// settings.json 没写 `model.model_name` 时用的兜底模型。
+    pub fallback_model: String,
+    /// `ANTHROPIC_MODEL` 环境变量。和 `fallback_model` 的优先级相反：这是**硬覆盖**，
+    /// 压过 settings.json——用户为这一次运行显式指定的东西，不该被配置文件推翻。
+    pub model_override: Option<String>,
+    /// settings.json 没写 `model.max_tokens` 时用的兜底值。
+    pub fallback_max_tokens: u32,
+    /// 数据目录三元组。**必须**由 [`base::paths::ConfigPaths`] 派生而不是手写：
+    /// Core 自己的技能/设置/插件加载器（`runtime::agent::build_default_skill_manager`
+    /// 等）就是从这几个字段推目录的，手写一套等于给引擎换了个它不认识的家。
+    pub paths: PathSettings,
 }
 
 impl BootstrapConfig {
-    /// 用 `$HOME/.atta/code`（用户级）+ 当前目录下 `.atta/code`（项目级）的既有约定构造默认值。
-    /// `ANTHROPIC_MODEL` 环境变量存在且非空时覆盖 `fallback_model`。
+    /// 走 Core 的路径约定（`ConfigPaths::from_env`）：全局 `~/.atta/`、场景覆盖
+    /// `~/.atta/scenes/coding/`、项目 `<cwd>/.atta/`，并尊重 `ATTA_DATA_DIR` /
+    /// `ATTA_LOCAL_DATA_DIR` 覆盖。
     pub fn defaults(fallback_model: impl Into<String>) -> Self {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-        let model_name = std::env::var("ANTHROPIC_MODEL")
-            .ok()
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| fallback_model.into());
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let dirs = base::paths::ConfigPaths::from_env(&cwd, SCENE_SCOPE);
         Self {
-            model_name,
-            max_tokens: 8192,
-            user_data_dir: PathBuf::from(home).join(".atta").join("code"),
-            local_data_dir: PathBuf::from(".").join(".atta").join("code"),
+            fallback_model: fallback_model.into(),
+            model_override: std::env::var("ANTHROPIC_MODEL")
+                .ok()
+                .filter(|v| !v.is_empty()),
+            fallback_max_tokens: 8192,
+            paths: PathSettings {
+                user_data_dir: dirs.user_data_dir,
+                global_data_dir: dirs.global_data_dir,
+                local_data_dir: dirs.local_data_dir,
+                scope: SCENE_SCOPE.to_string(),
+            },
         }
     }
 }
 
-/// 组装并启动一个 `runtime::Agent`。调用方负责 `tokio::spawn(agent.run(cancel))`。
-pub fn build_agent(
-    config: &BootstrapConfig,
-) -> Result<(Agent, EventReceiver, InputSender), BootstrapError> {
+/// 三层 settings.json 合并 + AttaCode 自己拥有的那几项覆盖。
+///
+/// 优先级（高→低）：`ANTHROPIC_MODEL` → 项目 settings.json → 场景 → 全局 →
+/// `fallback_*`。`Settings::load` 自己不失败：读不到的层跳过，解析不了的层 warn 后跳过。
+fn resolve_settings(config: &BootstrapConfig) -> Settings {
+    let mut settings = Settings::load(
+        config.paths.global_data_dir.clone(),
+        config.paths.user_data_dir.clone(),
+        config.paths.local_data_dir.clone(),
+        &config.paths.scope,
+        &config.fallback_model,
+    );
+
+    if let Some(model) = &config.model_override {
+        settings.model.model_name = model.clone();
+    }
+    // `max_tokens` 没法像 `model_name` 那样作为参数塞进 `Settings::load`，只能靠这个
+    // 哨兵判断"没有任何一层设过它"。和 `daemon::config::load_daemon_config` 同款，
+    // 连注释里的顾虑都一样：万一哪天真有人把它显式写成 2000，这里会误判成没设过，
+    // 后果是拿到 8192——一个更宽松的上限，不是错误行为。
+    if settings.model.max_tokens == CORE_DEFAULT_MAX_TOKENS {
+        settings.model.max_tokens = config.fallback_max_tokens;
+    }
+    // 跟着 daemon 设这一项。**注意它在 Core 里没有任何消费方**——全仓只有 daemon 在写、
+    // 测试里一律 `None`；真正的转录落盘走的是 `Builder::history_store`（见
+    // [`build_history_store`]），跟这个字段无关。留着只是为了和 daemon 的 Settings
+    // 形状一致，别指望改它能改变落盘位置。
+    settings.session_dir = Some(config.paths.local_data_dir.clone());
+    // TUI 就是这个引擎的宿主本身，没有第三方 RPC 客户端可以来放宽权限模式。
+    settings.allow_client_permission_override = false;
+
+    if settings.instruction_file.is_none() {
+        settings.instruction_file = discover_instruction_file(&config.paths.project_root());
+    }
+
+    settings
+}
+
+/// settings.json 没指定 `instruction_file` 时，在项目根找一个。
+///
+/// **只找 `CLAUDE.md`，故意不找 `AGENTS.md`。** `AGENTS.md` 已经由
+/// `base::frozen::FrozenContext` 从 cwd 往上爬着收进 system prompt（`memory_blocks`，
+/// 见 `frozen/memory.rs`——那边写着 `AGENTS.md` 是"唯一权威"的指令文件）。再把它塞进
+/// `instruction_file` 只会让同一份内容进两次 prompt。`CLAUDE.md` 不在那条链路上，
+/// 这里是它唯一的入口。
+fn discover_instruction_file(project_root: &Path) -> Option<PathBuf> {
+    let candidate = project_root.join("CLAUDE.md");
+    candidate.is_file().then_some(candidate)
+}
+
+/// 会话转录的落盘后端。没有它 `SessionManager` 纯内存，进程一退整段对话就没了。
+///
+/// 根目录用 `global_data_dir/sessions/`（**不是**场景目录）：`sessions` 和
+/// `memory`/`vcr`/`mcp` 一样属于"全局 + 项目、没有场景层"那一类，而
+/// `JsonlHistoryStore` 自己会按 cwd 在这个根下再分项目——见 `base::paths` 的模块文档。
+/// 和 `daemon/src/main.rs` 取的是同一个根。
+///
+/// 失败不致命：warn 一声，这次运行退回纯内存会话——落不了盘不该让人连 agent 都用不上。
+async fn build_history_store(
+    paths: &PathSettings,
+) -> Option<Arc<dyn history::store::HistoryStore>> {
+    let root = paths.global_data_dir.join("sessions");
+    match history::store::JsonlHistoryStore::with_root(&paths.project_root(), root).await {
+        Ok(store) => Some(Arc::new(store)),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "failed to initialize the session history store; this session will be in-memory only"
+            );
+            None
+        }
+    }
+}
+
+/// 装配好的引擎。调用方负责 `tokio::spawn(agent.run(cancel))`。
+pub struct BuiltEngine {
+    pub agent: Agent,
+    pub event_rx: EventReceiver,
+    pub input_tx: InputSender,
+    /// 三层 settings.json 合并完之后**真正生效**的模型名——状态栏要显示的是这个，
+    /// 不是调用方传进来的兜底值。
+    pub model_name: String,
+    /// 这次会话的 id（BASE58）。转录落在
+    /// `<global_data_dir>/sessions/<项目>/<session_id>.jsonl`，将来 resume 要拿它去找。
+    pub session_id: String,
+}
+
+/// 组装一个 `runtime::Agent`。
+pub async fn build_agent(config: &BootstrapConfig) -> Result<BuiltEngine, BootstrapError> {
     let api_key = std::env::var("ANTHROPIC_AUTH_TOKEN")
         .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
         .map_err(|_| BootstrapError::MissingCredentials)?;
@@ -81,46 +190,282 @@ pub fn build_agent(
     };
     let model = Arc::new(AnthropicModel::new(client));
 
-    let settings = Arc::new(Settings {
-        model: ModelSettings {
-            api_type: base::provider::ApiType::Anthropic,
-            base_url: String::new(),
-            auth_token: String::new(),
-            model_name: config.model_name.clone(),
-            max_tokens: config.max_tokens,
-            thinking_mode: ThinkingMode::Auto,
-            fallback_model: None,
-        },
-        paths: PathSettings {
-            user_data_dir: config.user_data_dir.clone(),
-            local_data_dir: config.local_data_dir.clone(),
-        },
-        execution: ExecutionSettings::default(),
-        compaction: CompactionConfig::default(),
-        sandbox: SandboxConfig::default(),
-        instruction_file: None,
-        prompt_append: None,
-        prompt_override: None,
-        vcr: None,
-        telemetry_url: None,
-        session_dir: Some(config.local_data_dir.clone()),
-        memory_enabled: true,
-        permission_mode: base::interface::settings::PermissionMode::default(),
-        permission_rules: Vec::new(),
-        hooks_config: None,
-        mcp_servers: Vec::new(),
-        language: None,
-        feature_flags: Default::default(),
-    });
+    let settings = Arc::new(resolve_settings(config));
+    let model_name = settings.model.model_name.clone();
 
     let scene: Arc<dyn base::interface::scene::AgentScene> =
         Arc::new(scene::scene::coding::CodingScene);
 
-    let (agent, event_rx, input_tx) = Builder::new()
+    // 权限门。默认模式是"没有规则命中就问"——工具自判允许的调用（只读工具、项目内的
+    // Write/Edit）照旧静默通过，其余会走 `PermissionOutcome::Prompt` →
+    // `AgentEvent::PermissionPrompt` → TUI 对话框 → `InputMessage::PermissionResponse`。
+    // 没人应答时引擎等 `execution.permission_prompt_timeout_secs`（默认 300s）后
+    // **拒绝**——未作答不是同意。模式和规则现在都来自 settings.json。
+    let permission = crate::permission::build(&settings);
+
+    // **必须**显式给 session id，不能用 `SessionManager::new` 的默认值。
+    //
+    // 那个默认值是 `uuid::Uuid::new_v4().to_string()`（带连字符的十六进制），而
+    // `SessionManager::persist()` 走 `SessionId::parse()`，要的是 BASE58 的 16 字节 id。
+    // UUID 永远 parse 不过，于是每个 turn 都 warn 一句 "failed to persist session" 然后
+    // 一个字节都不落盘——静默失败，因为宿主通常没装 tracing subscriber。同一个不匹配
+    // 还会让 `Builder::build` 里的会话记忆边车（`session_memory.md`）被静默跳过，它那边
+    // 是 `if let Ok(sid) = SessionId::parse(..)`。
+    //
+    // daemon 没踩到是因为它的 id 来自 `session.create` RPC，本来就是合法的。
+    // 这是 Core 的缺陷，记在 scripts/ 的 patch 规格里；在它修好之前，自己生成一个合法
+    // id 传进去是干净的解法——`Builder::session_id` 本来就是公开 API，daemon 走的也是它。
+    let session_id = base::session::SessionId::new().to_string();
+    let mut builder = Builder::new()
         .scene(scene)
         .model(model)
-        .settings(settings)
-        .build()?;
+        .permission(permission)
+        .session_id(session_id.clone())
+        .settings(settings);
+    // 有落盘后端时，`SessionManager` 每个 turn 结束增量追加一次 jsonl；没有就纯内存
+    // （`Builder` 的默认行为），进程一退全丢。顺带一提，会话记忆边车
+    // （`session_memory.md`）也只在有这个 store 的时候才建——见 `Builder::build`。
+    if let Some(store) = build_history_store(&config.paths).await {
+        builder = builder.history_store(store);
+    }
+    let (agent, event_rx, input_tx) = builder.build()?;
 
-    Ok((agent, event_rx, input_tx))
+    tracing::info!(session_id = %session_id, "session started");
+    Ok(BuiltEngine {
+        agent,
+        event_rx,
+        input_tx,
+        model_name,
+        session_id,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 三层目录 + 一个项目根。`local_data_dir` 是 `<project>/.atta`，所以
+    /// `PathSettings::project_root()` 会推回 `<project>`。
+    struct Layout {
+        _tmp: tempfile::TempDir,
+        global: PathBuf,
+        scene: PathBuf,
+        project: PathBuf,
+        config: BootstrapConfig,
+    }
+
+    fn layout() -> Layout {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("atta");
+        let scene = global.join("scenes").join(SCENE_SCOPE);
+        let project = tmp.path().join("proj");
+        let local = project.join(".atta");
+        for d in [&global, &scene, &project, &local] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let config = BootstrapConfig {
+            fallback_model: "fallback-model".into(),
+            model_override: None,
+            fallback_max_tokens: 8192,
+            paths: PathSettings {
+                user_data_dir: scene.clone(),
+                global_data_dir: global.clone(),
+                local_data_dir: local,
+                scope: SCENE_SCOPE.to_string(),
+            },
+        };
+        Layout {
+            _tmp: tmp,
+            global,
+            scene,
+            project,
+            config,
+        }
+    }
+
+    fn write_settings(dir: &Path, json: serde_json::Value) {
+        std::fs::write(dir.join("settings.json"), json.to_string()).unwrap();
+    }
+
+    #[test]
+    fn nothing_configured_falls_back_to_the_caller_supplied_defaults() {
+        let l = layout();
+        let s = resolve_settings(&l.config);
+        assert_eq!(s.model.model_name, "fallback-model");
+        assert_eq!(s.model.max_tokens, 8192);
+    }
+
+    #[test]
+    fn project_settings_win_over_scene_which_win_over_global() {
+        let l = layout();
+        write_settings(&l.global, serde_json::json!({"model": {"model_name": "g"}}));
+        write_settings(&l.scene, serde_json::json!({"model": {"model_name": "s"}}));
+        assert_eq!(resolve_settings(&l.config).model.model_name, "s");
+
+        write_settings(
+            &l.config.paths.local_data_dir,
+            serde_json::json!({"model": {"model_name": "p"}}),
+        );
+        assert_eq!(resolve_settings(&l.config).model.model_name, "p");
+    }
+
+    /// `ANTHROPIC_MODEL` 是为这一次运行显式指定的，配置文件不该推翻它。
+    #[test]
+    fn env_model_override_beats_every_settings_layer() {
+        let mut l = layout();
+        write_settings(
+            &l.config.paths.local_data_dir,
+            serde_json::json!({"model": {"model_name": "from-settings"}}),
+        );
+        l.config.model_override = Some("from-env".into());
+        assert_eq!(resolve_settings(&l.config).model.model_name, "from-env");
+    }
+
+    #[test]
+    fn explicit_max_tokens_is_not_clobbered_by_the_fallback() {
+        let l = layout();
+        write_settings(
+            &l.config.paths.local_data_dir,
+            serde_json::json!({"model": {"max_tokens": 4096}}),
+        );
+        assert_eq!(resolve_settings(&l.config).model.max_tokens, 4096);
+    }
+
+    /// 这条线以前是死的：手搓的 `Settings` 把 `permission_rules` 钉成空，于是
+    /// settings.json 里写的规则永远到不了权限门。
+    #[test]
+    fn permission_rules_and_mode_reach_the_gate() {
+        let l = layout();
+        write_settings(
+            &l.config.paths.local_data_dir,
+            serde_json::json!({
+                "permission_mode": "acceptEdits",
+                "permission_rules": [{"tool": "Bash(rm:*)", "action": "deny"}],
+            }),
+        );
+        let s = resolve_settings(&l.config);
+        assert_eq!(
+            s.permission_mode,
+            base::interface::settings::PermissionMode::AcceptEdits
+        );
+        assert_eq!(s.permission_rules.len(), 1);
+        assert_eq!(s.permission_rules[0].tool, "Bash(rm:*)");
+    }
+
+    /// 同上：`hooks_config` 是 `Builder::build()` 自己会消费的字段
+    /// （`build_hook_runner`），钉成 `None` 等于钩子系统整个不存在。
+    #[test]
+    fn hooks_config_survives_the_merge() {
+        let l = layout();
+        write_settings(
+            &l.config.paths.local_data_dir,
+            serde_json::json!({"hooks_config": {"PreToolUse": []}}),
+        );
+        assert!(resolve_settings(&l.config).hooks_config.is_some());
+    }
+
+    #[test]
+    fn claude_md_in_the_project_root_becomes_the_instruction_file() {
+        let l = layout();
+        std::fs::write(l.project.join("CLAUDE.md"), "# rules").unwrap();
+        assert_eq!(
+            resolve_settings(&l.config).instruction_file,
+            Some(l.project.join("CLAUDE.md"))
+        );
+    }
+
+    /// `AGENTS.md` 走的是 `FrozenContext` 的 `memory_blocks`，这里再认一次就会
+    /// 让同一份内容进两次 prompt。
+    #[test]
+    fn agents_md_is_left_to_the_frozen_context() {
+        let l = layout();
+        std::fs::write(l.project.join("AGENTS.md"), "# rules").unwrap();
+        assert_eq!(resolve_settings(&l.config).instruction_file, None);
+    }
+
+    #[test]
+    fn an_explicit_instruction_file_is_not_overridden_by_discovery() {
+        let l = layout();
+        std::fs::write(l.project.join("CLAUDE.md"), "# rules").unwrap();
+        write_settings(
+            &l.config.paths.local_data_dir,
+            serde_json::json!({"instruction_file": "/somewhere/else.md"}),
+        );
+        assert_eq!(
+            resolve_settings(&l.config).instruction_file,
+            Some(PathBuf::from("/somewhere/else.md"))
+        );
+    }
+
+    /// 转录落在 `global_data_dir/sessions/` 下，**不是**场景目录——`sessions` 属于
+    /// "全局 + 项目、没有场景层"那一类。这是这里唯一一个可能选错的东西，所以真写一条
+    /// 进去看看文件落在哪。
+    #[tokio::test]
+    async fn transcripts_land_under_the_global_sessions_root() {
+        let l = layout();
+        let store = build_history_store(&l.config.paths).await.unwrap();
+        let session = base::session::SessionId::new();
+
+        store
+            .append(
+                session,
+                history::entry::LogEntry::System {
+                    subkind: history::entry::SystemSubkind::Notice,
+                    text: "hello".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let written: Vec<_> = walk_files(&l.global.join("sessions")).collect();
+        assert_eq!(
+            written.len(),
+            1,
+            "expected exactly one transcript under {}, got {written:?}",
+            l.global.join("sessions").display()
+        );
+        assert!(written[0].to_string_lossy().ends_with(".jsonl"));
+        // 场景目录不该有任何东西。
+        assert_eq!(walk_files(&l.scene.join("sessions")).count(), 0);
+    }
+
+    fn walk_files(root: &Path) -> impl Iterator<Item = PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else {
+                    out.push(p);
+                }
+            }
+        }
+        out.into_iter()
+    }
+
+    /// settings.json 不能决定自己住在哪 —— `Settings::load` 会把每层的 `paths`
+    /// 摘掉。钉住这一点，否则一个手滑写进项目配置的 `paths` 能把技能/权限的
+    /// 目录整体挪走。
+    #[test]
+    fn settings_json_cannot_relocate_the_data_dirs() {
+        let l = layout();
+        write_settings(
+            &l.config.paths.local_data_dir,
+            serde_json::json!({"paths": {
+                "user_data_dir": "/evil",
+                "global_data_dir": "/evil",
+                "local_data_dir": "/evil",
+                "scope": "evil",
+            }}),
+        );
+        let s = resolve_settings(&l.config);
+        assert_eq!(s.paths.global_data_dir, l.global);
+        assert_eq!(s.paths.user_data_dir, l.scene);
+        assert_eq!(s.paths.scope, SCENE_SCOPE);
+    }
 }
