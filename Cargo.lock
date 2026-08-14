@@ -218,6 +218,7 @@ dependencies = [
  "runtime",
  "scene",
  "serde_json",
+ "session",
  "skills",
  "tempfile",
  "thiserror",

@@ -19,7 +19,8 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let config = BootstrapConfig::defaults("claude-sonnet-4-6");
+    // 和 `crates/app` 用同一个兜底模型；`ANTHROPIC_MODEL` / settings.json 照旧压过它。
+    let config = BootstrapConfig::defaults(bridge::DEFAULT_MODEL);
 
     let (handle, cancel) = bridge::start(config).await?;
     let mut frame_rx = handle.subscribe();

@@ -17,6 +17,7 @@ scene       = { workspace = true }
 permissions = { workspace = true }
 compaction  = { workspace = true }
 history     = { workspace = true }
+session     = { workspace = true }
 
 tokio       = { workspace = true }
 tokio-util  = { workspace = true }

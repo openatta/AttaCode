@@ -11,7 +11,7 @@
 //! actions are bound but currently drive completion selection and line motion),
 //! selection, and undo.
 
-use bridge::{BootstrapConfig, BridgeCommand, EngineHandle};
+use bridge::{BootstrapConfig, BridgeCommand, EngineHandle, Resume, DEFAULT_MODEL};
 use crossterm::event::{
     Event, EventStream, KeyCode as CtKeyCode, KeyEvent, KeyEventKind, KeyModifiers,
 };
@@ -27,11 +27,6 @@ use tui::frame_state::{
     ApprovalOption, ApprovalRequest, CompletionCandidate, CompletionKind, CompletionPopupState,
 };
 
-/// 三层 settings.json 和 `ANTHROPIC_MODEL` 都没说话时用的模型。**只是兜底**——
-/// 优先级见 `bridge::bootstrap::resolve_settings`：`--model` > `ANTHROPIC_MODEL`
-/// > 项目/场景/全局 settings.json > 这里。
-const DEFAULT_MODEL: &str = "claude-opus-5";
-
 const USAGE: &str = "\
 attacode — AttaCore 引擎的终端 UI
 
@@ -39,6 +34,8 @@ attacode — AttaCore 引擎的终端 UI
 
 选项:
   -m, --model <NAME>  这次运行用的模型（压过 ANTHROPIC_MODEL 和 settings.json）
+  -c, --continue      接着本项目最近一次会话跑
+      --resume <ID>   接着指定的会话跑（id 见 ~/.atta/sessions/<项目>/）
   -h, --help          打印这段帮助
 ";
 
@@ -54,6 +51,7 @@ async fn main() -> anyhow::Result<()> {
     if args.model.is_some() {
         config.model_override = args.model;
     }
+    config.resume = args.resume;
     let (handle, cancel) = bridge::start(config).await?;
 
     enable_raw_mode()?;
@@ -70,10 +68,11 @@ async fn main() -> anyhow::Result<()> {
     result
 }
 
-/// 命令行参数。手写解析而不是拉 `clap`：目前只有两个开关，一个依赖换不来这点便利。
+/// 命令行参数。手写解析而不是拉 `clap`：目前就这几个开关，一个依赖换不来这点便利。
 #[derive(Default)]
 struct Args {
     model: Option<String>,
+    resume: Option<Resume>,
 }
 
 impl Args {
@@ -83,24 +82,32 @@ impl Args {
         let mut out = Args::default();
         let mut args = args.peekable();
         while let Some(arg) = args.next() {
+            let value = |args: &mut std::iter::Peekable<_>| -> anyhow::Result<String> {
+                Iterator::next(args)
+                    .filter(|v: &String| !v.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("{arg} 需要一个值"))
+            };
             match arg.as_str() {
                 "-h" | "--help" => return Ok(None),
-                "-m" | "--model" => {
-                    out.model = Some(
-                        args.next()
-                            .filter(|v| !v.is_empty())
-                            .ok_or_else(|| anyhow::anyhow!("{arg} 需要一个模型名"))?,
-                    );
-                }
-                other => match other.strip_prefix("--model=") {
-                    Some("") => anyhow::bail!("--model= 需要一个模型名"),
-                    Some(name) => out.model = Some(name.to_string()),
+                "-m" | "--model" => out.model = Some(value(&mut args)?),
+                "-c" | "--continue" => out.resume = Some(Resume::Latest),
+                "--resume" => out.resume = Some(Resume::Id(value(&mut args)?)),
+                other => match split_long(other) {
+                    Some(("--model", name)) => out.model = Some(name.to_string()),
+                    Some(("--resume", id)) => out.resume = Some(Resume::Id(id.to_string())),
+                    Some((flag, _)) => anyhow::bail!("{flag} 不接受 `=值` 形式\n\n{USAGE}"),
                     None => anyhow::bail!("未知参数: {other}\n\n{USAGE}"),
                 },
             }
         }
         Ok(Some(out))
     }
+}
+
+/// `--flag=value` 拆成 `("--flag", "value")`；值为空视为没写（走上面的报错分支）。
+fn split_long(arg: &str) -> Option<(&str, &str)> {
+    let (flag, value) = arg.split_once('=')?;
+    (!value.is_empty()).then_some((flag, value))
 }
 
 /// UI-local composer state — never sent to bridge; merged onto bridge's
@@ -127,6 +134,15 @@ struct LocalUi {
     /// 这时目标是最新的那个块（不用先导航就能展开刚跑完的工具，是最常见的动作）。
     /// 和滚动位置一样是 UI-本地状态，渲染前由 `merge` 覆盖进快照。
     selected_block: Option<String>,
+    /// 这次会话里提交过的输入，旧的在前。`--continue` 起手时会用转录里恢复出来的
+    /// 用户输入填上（见 [`run`]），所以接着上次跑的时候历史也是接着的。
+    /// 只在内存里，不落盘。
+    history: Vec<String>,
+    /// 正在浏览历史的第几条；`None` = 在自己的草稿里。
+    history_pos: Option<usize>,
+    /// 开始翻历史之前的那份草稿。翻过头（回到最新之后）时原样还回去——
+    /// 手打了一半的东西不该因为好奇按了下 `↑` 就没了。
+    history_stash: String,
     /// 上一帧转录正文区的高度，`PageUp`/`PageDown` 的步长。渲染循环每帧更新。
     viewport_lines: usize,
     /// `Ctrl+L`：下一帧渲染前先清屏，用来收拾被别的进程写花的终端。
@@ -144,6 +160,9 @@ impl LocalUi {
             approval_selected: 0,
             scroll_offset: None,
             selected_block: None,
+            history: Vec::new(),
+            history_pos: None,
+            history_stash: String::new(),
             viewport_lines: 1,
             redraw_requested: false,
         }
@@ -242,6 +261,9 @@ async fn run(
     let mut commands_rx = handle.subscribe_commands();
     let mut resolver = Resolver::new(default_bindings());
     let mut local = LocalUi::new(commands_rx.borrow().clone());
+    // `--continue` / `--resume` 起手时，输入历史也接着上次：转录里恢复出来的用户
+    // 输入就是上次提交过的东西。bridge 不单独暴露它们，从首帧快照里读即可。
+    local.history = user_prompts(&frame_rx.borrow());
     let mut keys = EventStream::new();
 
     loop {
@@ -398,12 +420,11 @@ fn dispatch_action(
         "editor.cursor.line-end" => local.cursor = local.line_end(),
         "editor.redraw" => local.redraw_requested = true,
         // Up/Down 一键三义，按当前上下文取一个：补全弹窗开着时移动选中项；
-        // 否则草稿是多行的话在行间移动光标；再否则留给将来的历史回溯（action
-        // 名就是为它起的，功能还没做）。
+        // 多行草稿里先在行间走；走到首/末行（单行草稿则一开始就是）才翻历史。
         "editor.history.prev" if completion_active => move_completion_selection(local, -1),
         "editor.history.next" if completion_active => move_completion_selection(local, 1),
-        "editor.history.prev" => local.move_line(-1),
-        "editor.history.next" => local.move_line(1),
+        "editor.history.prev" => local.up(),
+        "editor.history.next" => local.down(),
         "repl.scroll-up" => {
             local.scroll_up(snapshot.transcript.body.entries.len());
         }
@@ -429,6 +450,18 @@ fn dispatch_action(
         _ => {}
     }
     true
+}
+
+/// 转录里的用户输入，按出现顺序——resume 之后用它续上输入历史。
+fn user_prompts(frame: &tui::FrameState) -> Vec<String> {
+    frame
+        .transcript
+        .body
+        .entries
+        .iter()
+        .filter(|e| e.kind == tui::frame_state::LineKind::UserPrompt)
+        .map(|e| e.text.clone())
+        .collect()
 }
 
 /// 转录里所有可折叠块的 id，按出现顺序、去重。一个块占多行，这里要的是块的序列。
@@ -514,6 +547,7 @@ fn submit(local: &mut LocalUi, handle: &dyn EngineHandle, snapshot: &tui::FrameS
     }
     let text = std::mem::take(&mut local.draft);
     local.cursor = 0;
+    local.remember(&text);
     local.note_draft_changed();
     // 发了新消息就跳回底部——不然自己刚发的那句在视口外，看着像没发出去。
     local.scroll_offset = None;
@@ -650,6 +684,68 @@ impl LocalUi {
             .map(|(i, _)| i)
             .unwrap_or(target_line.len());
         self.cursor = target_start + offset;
+    }
+
+    /// `↑`/`↓` 的语义分派：多行草稿里先在行间走，走到头了才翻历史。
+    /// 单行草稿的光标既在首行也在末行，所以直接翻历史——这才是常见情形。
+    fn up(&mut self) {
+        if self.line_start() > 0 {
+            self.move_line(-1);
+        } else {
+            self.recall(-1);
+        }
+    }
+
+    fn down(&mut self) {
+        if self.line_end() < self.draft.len() {
+            self.move_line(1);
+        } else {
+            self.recall(1);
+        }
+    }
+
+    /// 翻历史。`-1` 往更早翻，`1` 往更新翻；翻过最新一条就把原来的草稿还回来。
+    ///
+    /// 编辑一条翻出来的历史**不会**退出浏览态（位置还在，可以接着往上翻），
+    /// 但再翻一次会覆盖掉编辑——和 zsh 的行为一致，也是最容易预期的一种。
+    fn recall(&mut self, delta: isize) {
+        if self.history.is_empty() {
+            return;
+        }
+        let next = match (self.history_pos, delta < 0) {
+            // 第一次往上翻：先把手头的草稿收起来。
+            (None, true) => {
+                self.history_stash = std::mem::take(&mut self.draft);
+                Some(self.history.len() - 1)
+            }
+            (None, false) => return, // 没在浏览历史，往下没有去处
+            (Some(i), true) => Some(i.saturating_sub(1)),
+            (Some(i), false) => (i + 1 < self.history.len()).then_some(i + 1),
+        };
+        match next {
+            Some(i) => {
+                self.draft = self.history[i].clone();
+                self.history_pos = Some(i);
+            }
+            // 翻过最新一条 = 回到自己的草稿。
+            None => {
+                self.draft = std::mem::take(&mut self.history_stash);
+                self.history_pos = None;
+            }
+        }
+        self.cursor = self.draft.len();
+        self.completion_selected = 0;
+        self.completion_dismissed = false;
+    }
+
+    /// 记一条提交过的输入。连续重复的不重复记——连按两次同一条命令之后，
+    /// 按一下 `↑` 应该看到它，而不是按两下才翻过去。
+    fn remember(&mut self, text: &str) {
+        if self.history.last().map(String::as_str) != Some(text) {
+            self.history.push(text.to_string());
+        }
+        self.history_pos = None;
+        self.history_stash.clear();
     }
 
     fn line_start(&self) -> usize {
@@ -1190,6 +1286,23 @@ mod tests {
     }
 
     #[test]
+    fn resume_flags_map_to_the_right_target() {
+        let parse = |args: &[&str]| {
+            Args::parse(args.iter().map(|s| s.to_string()))
+                .unwrap()
+                .unwrap()
+                .resume
+        };
+        assert!(matches!(parse(&["-c"]), Some(Resume::Latest)));
+        assert!(matches!(parse(&["--continue"]), Some(Resume::Latest)));
+        assert!(matches!(parse(&["--resume", "abc"]), Some(Resume::Id(id)) if id == "abc"));
+        assert!(matches!(parse(&["--resume=abc"]), Some(Resume::Id(id)) if id == "abc"));
+        assert!(parse(&[]).is_none());
+        // 缺值要报错，不能默默当成 `--continue`。
+        assert!(Args::parse(["--resume".to_string()].into_iter()).is_err());
+    }
+
+    #[test]
     fn help_short_circuits_and_unknown_args_are_errors() {
         assert!(Args::parse(["--help".to_string()].into_iter())
             .unwrap()
@@ -1320,6 +1433,94 @@ mod tests {
             "lo|ngest line\nab\nanother line",
             "首行再往上不动"
         );
+    }
+
+    // ── 输入历史 ──
+
+    fn submitted(local: &mut LocalUi, handle: &FakeHandle, text: &str) {
+        local.draft = text.into();
+        local.cursor = local.draft.len();
+        submit(local, handle, &frame_without_approval());
+    }
+
+    #[test]
+    fn up_walks_back_through_submitted_prompts_and_down_returns() {
+        let mut local = local_with("");
+        let handle = FakeHandle::new();
+        submitted(&mut local, &handle, "第一句");
+        submitted(&mut local, &handle, "第二句");
+
+        local.up();
+        assert_eq!(local.draft, "第二句", "先翻到最近一条");
+        local.up();
+        assert_eq!(local.draft, "第一句");
+        local.up();
+        assert_eq!(local.draft, "第一句", "翻到头就停住");
+        local.down();
+        assert_eq!(local.draft, "第二句");
+        local.down();
+        assert_eq!(local.draft, "", "翻过最新一条回到草稿");
+        assert_eq!(local.cursor, 0);
+    }
+
+    /// 手打了一半的东西不该因为按了下 `↑` 就没了。
+    #[test]
+    fn a_half_typed_draft_survives_a_trip_through_history() {
+        let mut local = local_with("");
+        let handle = FakeHandle::new();
+        submitted(&mut local, &handle, "旧的");
+
+        local.draft = "打了一半".into();
+        local.cursor = local.draft.len();
+        local.up();
+        assert_eq!(local.draft, "旧的");
+        local.down();
+        assert_eq!(local.draft, "打了一半", "草稿要原样还回来");
+        assert_eq!(local.cursor, local.draft.len());
+    }
+
+    #[test]
+    fn consecutive_duplicates_are_recorded_once() {
+        let mut local = local_with("");
+        let handle = FakeHandle::new();
+        submitted(&mut local, &handle, "同一句");
+        submitted(&mut local, &handle, "同一句");
+        assert_eq!(local.history, vec!["同一句"], "连按两次不该占两条");
+    }
+
+    /// 多行草稿里 `↑` 先在行间走，走到首行才翻历史。
+    #[test]
+    fn vertical_motion_takes_priority_until_the_edge_of_a_multiline_draft() {
+        let mut local = local_with("");
+        let handle = FakeHandle::new();
+        submitted(&mut local, &handle, "历史里的");
+
+        local.draft = "first\nsecond".into();
+        local.cursor = local.draft.len();
+        local.up();
+        assert_eq!(local.draft, "first\nsecond", "还在草稿里，只是光标上移");
+        assert_eq!(local.cursor, 5);
+        local.up();
+        assert_eq!(local.draft, "历史里的", "已经在首行，这次才翻历史");
+    }
+
+    /// resume 起手时输入历史接着上次——从转录里恢复出来的用户输入读。
+    #[test]
+    fn history_is_seeded_from_a_restored_transcript() {
+        let mut frame = frame_without_approval();
+        frame.transcript.body.entries = vec![
+            TranscriptEntry {
+                kind: LineKind::UserPrompt,
+                text: "上次问的".into(),
+                block_id: None,
+            },
+            TranscriptEntry {
+                kind: LineKind::AssistantText,
+                text: "上次答的".into(),
+                block_id: None,
+            },
+        ];
+        assert_eq!(user_prompts(&frame), vec!["上次问的"]);
     }
 
     /// 光标在中间时提交，整段草稿都要发出去，光标复位。

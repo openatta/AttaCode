@@ -109,8 +109,9 @@ impl Reducer {
         model_name: String,
         cwd: String,
         commands: Arc<CommandCatalog>,
+        restored: Vec<base::message::Message>,
     ) -> (Arc<Self>, watch::Receiver<FrameState>) {
-        let (reducer, frame_rx) = Self::build(model_name, cwd, Some(commands));
+        let (reducer, frame_rx) = Self::build(model_name, cwd, Some(commands), restored);
 
         let task_reducer = reducer.clone();
         tokio::spawn(async move {
@@ -135,9 +136,10 @@ impl Reducer {
         model_name: String,
         cwd: String,
         commands: Option<Arc<CommandCatalog>>,
+        restored: Vec<base::message::Message>,
     ) -> (Arc<Self>, watch::Receiver<FrameState>) {
         let initial = DomainState {
-            turns: Vec::new(),
+            turns: restore_turns(restored),
             pending_approvals: Vec::new(),
             sub_agents: Vec::new(),
             tasks: Vec::new(),
@@ -496,6 +498,125 @@ fn spinner_char() -> char {
     SPINNER_FRAMES[((ms / 150) % SPINNER_FRAMES.len() as u128) as usize]
 }
 
+/// resume 时把读回来的历史消息铺回转录区。
+///
+/// 和实时事件流的形状对齐：一条用户文本开一个新 turn，assistant 的文本/思考/工具
+/// 调用挂在当前 turn 上，`ToolResult` 按 `tool_use_id` 回填到对应的工具块里
+/// （历史里工具结果是**下一条 user 消息**的内容块，不是独立消息）。
+///
+/// turn id 用 `restored-N`：Core 的 turn id 是 `Id::new()` 生成的，不会撞；
+/// 之后的实时事件按自己的 id 找/建自己的 turn，不会误挂到恢复出来的 turn 上。
+fn restore_turns(messages: Vec<base::message::Message>) -> Vec<Turn> {
+    use base::message::{ContentBlock, Message, ToolResultContent};
+
+    let mut turns: Vec<Turn> = Vec::new();
+    let push_block = |turns: &mut Vec<Turn>, block: Block| {
+        if turns.is_empty() {
+            turns.push(Turn {
+                id: format!("restored-{}", 0),
+                blocks: Vec::new(),
+            });
+        }
+        turns.last_mut().unwrap().blocks.push(block);
+    };
+
+    for message in messages {
+        match message {
+            Message::User { content } => {
+                for block in content {
+                    match block {
+                        ContentBlock::Text { text, .. } => turns.push(Turn {
+                            id: format!("restored-{}", turns.len()),
+                            blocks: vec![Block::UserPrompt(text)],
+                        }),
+                        ContentBlock::ToolResult {
+                            tool_use_id,
+                            content,
+                            is_error,
+                        } => {
+                            let text = match content {
+                                ToolResultContent::Text(t) => t,
+                                // 结构化结果（图片等）在转录里只留个占位，别把
+                                // base64 糊一屏。
+                                ToolResultContent::Blocks(blocks) => blocks
+                                    .iter()
+                                    .map(|b| match b {
+                                        ContentBlock::Text { text, .. } => text.clone(),
+                                        other => format!("[{}]", block_kind(other)),
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("\n"),
+                            };
+                            fill_tool_result(&mut turns, &tool_use_id, text, is_error);
+                        }
+                        other => {
+                            push_block(&mut turns, Block::Note(format!("[{}]", block_kind(&other))))
+                        }
+                    }
+                }
+            }
+            Message::Assistant { content, .. } => {
+                for block in content {
+                    match block {
+                        ContentBlock::Text { text, .. } => {
+                            push_block(&mut turns, Block::AssistantText(text))
+                        }
+                        ContentBlock::Thinking { thinking, .. } => {
+                            push_block(&mut turns, Block::Thinking(thinking))
+                        }
+                        ContentBlock::ToolUse { id, name, input } => push_block(
+                            &mut turns,
+                            Block::Tool {
+                                id,
+                                name,
+                                input_summary: summarize_input(&input),
+                                result: None,
+                                expanded: false,
+                            },
+                        ),
+                        other => {
+                            push_block(&mut turns, Block::Note(format!("[{}]", block_kind(&other))))
+                        }
+                    }
+                }
+            }
+            // `project_messages` 不产出 System（它只投影进 API 的那部分），
+            // 这条分支是为了把 `Message` 穷举掉，将来加了别的来源也不会静默丢。
+            Message::System { content, .. } => push_block(&mut turns, Block::Note(content)),
+        }
+    }
+    turns
+}
+
+/// 把工具结果回填到它的工具块上。找不到对应块时落成一条 note——和实时链路里
+/// 孤儿 `ToolResult` 的处理一致，宁可显示得难看也不静默丢。
+fn fill_tool_result(turns: &mut Vec<Turn>, tool_use_id: &str, text: String, is_error: bool) {
+    for turn in turns.iter_mut().rev() {
+        for block in turn.blocks.iter_mut().rev() {
+            if let Block::Tool { id, result, .. } = block {
+                if id == tool_use_id {
+                    *result = Some(ToolOutcome { text, is_error });
+                    return;
+                }
+            }
+        }
+    }
+    push_note(turns, format!("[orphan tool result {tool_use_id}] {text}"));
+}
+
+/// 内容块的类型名，用于给不展示的块留个占位。
+fn block_kind(block: &base::message::ContentBlock) -> &'static str {
+    use base::message::ContentBlock as B;
+    match block {
+        B::Text { .. } => "text",
+        B::Image { .. } => "image",
+        B::ToolUse { .. } => "tool_use",
+        B::ToolResult { .. } => "tool_result",
+        B::Thinking { .. } => "thinking",
+        _ => "block",
+    }
+}
+
 /// 最后一个 turn 的用户输入的第一行，用作转录区顶上的 sticky header。
 /// 合成 turn（`push_note` 在第一条消息之前建的那个）没有 `UserPrompt` 块，
 /// 自然返回 `None`。
@@ -825,7 +946,7 @@ mod tests {
     // must keep the receiver alive for the whole test (bridge's real `spawn` doesn't hit
     // this because `EngineHandle::subscribe` always holds a live clone).
     fn reducer() -> (Arc<Reducer>, watch::Receiver<FrameState>) {
-        Reducer::build("test-model".into(), "/tmp".into(), None)
+        Reducer::build("test-model".into(), "/tmp".into(), None, Vec::new())
     }
 
     fn frame(rx: &watch::Receiver<FrameState>) -> FrameState {
@@ -1118,6 +1239,105 @@ mod tests {
             "换模型应该在转录里留痕:\n{:?}",
             f.transcript.body.entries
         );
+    }
+
+    /// resume：读回来的历史铺成转录，形状要和实时事件流一致——用户文本开新 turn，
+    /// 工具调用配对上它的结果，思考块保留。
+    #[test]
+    fn restored_history_is_laid_out_like_a_live_transcript() {
+        use base::message::{ContentBlock, Message, ToolResultContent};
+
+        let history = vec![
+            Message::User {
+                content: vec![ContentBlock::Text {
+                    text: "读一下 Cargo.toml".into(),
+                    cache_control: None,
+                }],
+            },
+            Message::Assistant {
+                content: vec![
+                    ContentBlock::Text {
+                        text: "好的".into(),
+                        cache_control: None,
+                    },
+                    ContentBlock::ToolUse {
+                        id: "t1".into(),
+                        name: "Read".into(),
+                        input: serde_json::json!({"file_path": "Cargo.toml"}),
+                    },
+                ],
+                stop_reason: None,
+                model: None,
+            },
+            // 历史里工具结果是**下一条 user 消息**的内容块，不是独立消息。
+            Message::User {
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "t1".into(),
+                    content: ToolResultContent::Text("[workspace]".into()),
+                    is_error: false,
+                }],
+            },
+            Message::Assistant {
+                content: vec![ContentBlock::Text {
+                    text: "是个 workspace".into(),
+                    cache_control: None,
+                }],
+                stop_reason: None,
+                model: None,
+            },
+        ];
+
+        let (_r, rx) = Reducer::build("m".into(), "/tmp".into(), None, history);
+        let f = frame(&rx);
+        let kinds: Vec<LineKind> = f.transcript.body.entries.iter().map(|e| e.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                LineKind::UserPrompt,
+                LineKind::AssistantText,
+                LineKind::ToolHeading,
+                LineKind::ToolResultOk,
+                LineKind::AssistantText,
+            ]
+        );
+        // 工具结果回填到了它自己的块上（block_id 和 heading 一致）。
+        let heading = f.transcript.body.entries[2].block_id.clone();
+        assert_eq!(heading.as_deref(), Some("t1"));
+        assert_eq!(f.transcript.body.entries[3].block_id, heading);
+        // header 钉的是恢复出来的最后一个用户输入。
+        assert_eq!(
+            f.transcript.header.text.as_deref(),
+            Some("读一下 Cargo.toml")
+        );
+    }
+
+    /// 恢复出来的 turn 用 `restored-N` 做 id，之后的实时事件按自己的 turn_id
+    /// 另起一个 turn，不会误挂到历史上。
+    #[test]
+    fn live_events_after_a_resume_do_not_merge_into_restored_turns() {
+        use base::message::{ContentBlock, Message};
+
+        let history = vec![Message::User {
+            content: vec![ContentBlock::Text {
+                text: "旧问题".into(),
+                cache_control: None,
+            }],
+        }];
+        let (r, rx) = Reducer::build("m".into(), "/tmp".into(), None, history);
+        let turn_id = r.begin_turn("新问题".into());
+        r.apply_event(AgentEvent::TextDelta {
+            text: "新回答".into(),
+            turn_id,
+        });
+
+        let texts: Vec<String> = frame(&rx)
+            .transcript
+            .body
+            .entries
+            .iter()
+            .map(|e| e.text.clone())
+            .collect();
+        assert_eq!(texts, vec!["旧问题", "新问题", "新回答"]);
     }
 
     /// 第一个 turn 之前来的 note 以前会被静默吞掉（`turns.last_mut()` 拿不到就返回）。

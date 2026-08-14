@@ -84,10 +84,18 @@ cargo test  --workspace
 export ANTHROPIC_AUTH_TOKEN=...        # 或 ANTHROPIC_API_KEY
 cargo run -p app                        # attacode
 cargo run -p app -- --model claude-sonnet-5
+cargo run -p app -- --continue          # 接着本项目最近一次会话
+cargo run -p app -- --resume <id>       # 接着指定会话（id 见 ~/.atta/sessions/<项目>/）
+
+# 无终端冒烟（真 API，验装配→事件流→归约那半条链）
+cargo run -p bridge --example smoke
 ```
 
 模型优先级（高→低）：`--model` → `ANTHROPIC_MODEL` → 项目 `.atta/settings.json` → 场景 →
-全局 → `crates/app` 里的 `DEFAULT_MODEL`。运行中用 `/model <name>` 切换，下一个 turn 起效。
+全局 → `bridge::DEFAULT_MODEL`。运行中用 `/model <name>` 切换，下一个 turn 起效。
+
+改了渲染/事件循环/装配之后，按 `docs/manual-smoke-checklist.md` 在真终端里过一遍
+——那些东西单元测试验不了。
 
 ## 已删除（不在 scope）
 

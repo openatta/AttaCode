@@ -10,7 +10,7 @@ pub mod handle;
 pub mod permission;
 pub mod reducer;
 
-pub use bootstrap::{BootstrapConfig, BootstrapError};
+pub use bootstrap::{BootstrapConfig, BootstrapError, Resume, DEFAULT_MODEL};
 pub use handle::{BridgeCommand, BridgeError, BridgeHandle, EngineHandle};
 
 use reducer::Reducer;
@@ -41,6 +41,7 @@ pub async fn start(
         engine.model_name,
         cwd_display(&config),
         command_catalog,
+        engine.restored,
     );
 
     let handle: Arc<dyn EngineHandle> = Arc::new(BridgeHandle::new(

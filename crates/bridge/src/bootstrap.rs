@@ -11,6 +11,7 @@
 //! 东西一件都不生效——而这些字段 `Builder::build()` 全都会自己消费。
 
 use base::interface::settings::{PathSettings, Settings};
+use history::store::HistoryStore;
 use model::adapter::AnthropicModel;
 use model::client::{AuthMode, HttpAnthropicClient};
 use runtime::agent::{Agent, Builder, EventReceiver, InputSender};
@@ -28,11 +29,35 @@ const SCENE_SCOPE: &str = "coding";
 /// ——和 `daemon::config::load_daemon_config` 用的是同一个哨兵值。
 const CORE_DEFAULT_MAX_TOKENS: u32 = 2000;
 
+/// 三层 settings.json 和 `ANTHROPIC_MODEL` 都没说话时用的模型。**只是兜底**——
+/// 优先级见 [`resolve_settings`]：调用方的显式覆盖 > `ANTHROPIC_MODEL` >
+/// 项目/场景/全局 settings.json > 这里。
+///
+/// 放在 bridge 而不是 `crates/app`：`examples/smoke.rs` 也要装配同一个引擎，
+/// 两边各写一个字面量的结果就是它们悄悄跑在不同模型上（之前正是如此）。
+pub const DEFAULT_MODEL: &str = "claude-opus-5";
+
+/// 要恢复哪个会话。
+#[derive(Debug, Clone)]
+pub enum Resume {
+    /// 当前项目里最近改动过的那次会话（`--continue`）。没有历史时静默开新会话
+    /// ——"没有可继续的"不是错误。
+    Latest,
+    /// 指定 session id（`--resume <id>`）。找不到就是错误：用户点名要的东西不在，
+    /// 静默开一个新会话等于把他的上下文吞了。
+    Id(String),
+}
+
 /// 装配失败原因。
 #[derive(Debug, Error)]
 pub enum BootstrapError {
     #[error("missing API credentials: set ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY")]
     MissingCredentials,
+    #[error("cannot resume session {id}: {source}")]
+    Resume {
+        id: String,
+        source: session::session::SessionError,
+    },
     #[error("invalid ANTHROPIC_BASE_URL: {0}")]
     InvalidBaseUrl(#[from] url::ParseError),
     #[error("failed to construct Anthropic client: {0}")]
@@ -55,6 +80,8 @@ pub struct BootstrapConfig {
     /// Core 自己的技能/设置/插件加载器（`runtime::agent::build_default_skill_manager`
     /// 等）就是从这几个字段推目录的，手写一套等于给引擎换了个它不认识的家。
     pub paths: PathSettings,
+    /// 要不要接着某次旧会话跑。`None` = 全新会话。
+    pub resume: Option<Resume>,
 }
 
 impl BootstrapConfig {
@@ -76,6 +103,7 @@ impl BootstrapConfig {
                 local_data_dir: dirs.local_data_dir,
                 scope: SCENE_SCOPE.to_string(),
             },
+            resume: None,
         }
     }
 }
@@ -138,9 +166,12 @@ fn discover_instruction_file(project_root: &Path) -> Option<PathBuf> {
 /// 和 `daemon/src/main.rs` 取的是同一个根。
 ///
 /// 失败不致命：warn 一声，这次运行退回纯内存会话——落不了盘不该让人连 agent 都用不上。
+/// 返回具体类型而不是 `Arc<dyn HistoryStore>`：`list_recent_sessions`（`--continue`
+/// 要的"最近一次"）是 `JsonlHistoryStore` 的固有方法，不在 trait 上。给 `Builder`
+/// 时再退化成 trait object。
 async fn build_history_store(
     paths: &PathSettings,
-) -> Option<Arc<dyn history::store::HistoryStore>> {
+) -> Option<Arc<history::store::JsonlHistoryStore>> {
     let root = paths.global_data_dir.join("sessions");
     match history::store::JsonlHistoryStore::with_root(&paths.project_root(), root).await {
         Ok(store) => Some(Arc::new(store)),
@@ -163,8 +194,43 @@ pub struct BuiltEngine {
     /// 不是调用方传进来的兜底值。
     pub model_name: String,
     /// 这次会话的 id（BASE58）。转录落在
-    /// `<global_data_dir>/sessions/<项目>/<session_id>.jsonl`，将来 resume 要拿它去找。
+    /// `<global_data_dir>/sessions/<项目>/<session_id>.jsonl`；`--resume` 要的就是它。
     pub session_id: String,
+    /// resume 时从 jsonl 读回来的历史消息，用来把转录区填回去。全新会话是空的。
+    ///
+    /// Core 那边 `Agent::resume_session` 已经把同一份历史灌进 `SessionManager`
+    /// （模型看得见），这里是给**人**看的那一份——两条路读的是同一个文件、同一个
+    /// 投影函数（`history::transcript::project_messages`），不会各说各话。
+    pub restored: Vec<base::message::Message>,
+}
+
+/// 把 [`Resume`] 解析成一个具体的 session id。
+///
+/// 两种目标的失败语义**故意不同**：`--resume <id>` 点名要某个会话，找不到就报错
+/// 退出（静默开新会话等于把用户的上下文吞了）；`--continue` 是"接着上次跑"，
+/// 没有上次就正常开新的。
+async fn resolve_resume_target(
+    target: &Resume,
+    store: &history::store::JsonlHistoryStore,
+) -> Result<Option<String>, BootstrapError> {
+    match target {
+        Resume::Id(id) => {
+            // 先自己校验一次 id 格式：让 `--resume 手滑打错的东西` 报"不是合法 id"，
+            // 而不是等 `resume_session` 回一个 NotFound。
+            base::session::SessionId::parse(id).map_err(|e| BootstrapError::Resume {
+                id: id.clone(),
+                source: session::session::SessionError::Id(e.to_string()),
+            })?;
+            Ok(Some(id.clone()))
+        }
+        Resume::Latest => match store.list_recent_sessions(1).await {
+            Ok(recent) => Ok(recent.first().map(|(id, _)| id.to_string())),
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to list recent sessions; starting fresh");
+                Ok(None)
+            }
+        },
+    }
 }
 
 /// 组装一个 `runtime::Agent`。
@@ -215,7 +281,25 @@ pub async fn build_agent(config: &BootstrapConfig) -> Result<BuiltEngine, Bootst
     // daemon 没踩到是因为它的 id 来自 `session.create` RPC，本来就是合法的。
     // 这是 Core 的缺陷，记在 scripts/ 的 patch 规格里；在它修好之前，自己生成一个合法
     // id 传进去是干净的解法——`Builder::session_id` 本来就是公开 API，daemon 走的也是它。
-    let session_id = base::session::SessionId::new().to_string();
+    let store = build_history_store(&config.paths).await;
+    // 要恢复的会话 id（如果有）。先定下来，因为它同时是 `Builder::session_id`——
+    // 会话记忆边车和落盘文件名都跟着它走，恢复之后还用一个新 id 的话，续写会落到
+    // 另一个文件里，下次 `--continue` 就只看得到后半截。
+    let resuming = match (&config.resume, &store) {
+        (Some(target), Some(store)) => resolve_resume_target(target, store).await?,
+        // 没有落盘后端就没有可恢复的东西；显式 `--resume <id>` 时这是个错误。
+        (Some(Resume::Id(id)), None) => {
+            return Err(BootstrapError::Resume {
+                id: id.clone(),
+                source: session::session::SessionError::NotFound(id.clone()),
+            })
+        }
+        (Some(Resume::Latest), None) | (None, _) => None,
+    };
+
+    let session_id = resuming
+        .clone()
+        .unwrap_or_else(|| base::session::SessionId::new().to_string());
     let mut builder = Builder::new()
         .scene(scene)
         .model(model)
@@ -225,18 +309,48 @@ pub async fn build_agent(config: &BootstrapConfig) -> Result<BuiltEngine, Bootst
     // 有落盘后端时，`SessionManager` 每个 turn 结束增量追加一次 jsonl；没有就纯内存
     // （`Builder` 的默认行为），进程一退全丢。顺带一提，会话记忆边车
     // （`session_memory.md`）也只在有这个 store 的时候才建——见 `Builder::build`。
-    if let Some(store) = build_history_store(&config.paths).await {
-        builder = builder.history_store(store);
+    if let Some(store) = &store {
+        builder = builder.history_store(store.clone() as Arc<dyn history::store::HistoryStore>);
     }
-    let (agent, event_rx, input_tx) = builder.build()?;
+    let (mut agent, event_rx, input_tx) = builder.build()?;
 
-    tracing::info!(session_id = %session_id, "session started");
+    // 恢复分两半：`resume_session` 把消息灌回 `SessionManager`（模型的上下文），
+    // `restored` 是同一份历史给 TUI 转录区用的。必须在 `agent.run()` 之前——
+    // `run()` 会 `&mut self` 借走整个 session。
+    let mut restored = Vec::new();
+    if let Some(id) = &resuming {
+        agent
+            .resume_session(id)
+            .await
+            .map_err(|source| BootstrapError::Resume {
+                id: id.clone(),
+                source,
+            })?;
+        if let Some(store) = &store {
+            match base::session::SessionId::parse(id) {
+                Ok(sid) => match store.load_messages(sid).await {
+                    Ok(messages) => restored = messages,
+                    // 转录读不回来不该让人连 agent 都用不上：模型侧的上下文
+                    // （`resume_session`）已经成功了，这里丢的只是回显。
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to read the transcript for display")
+                    }
+                },
+                Err(e) => tracing::warn!(error = %e, "resumed id is not a valid SessionId"),
+            }
+        }
+        tracing::info!(session_id = %id, messages = restored.len(), "session resumed");
+    } else {
+        tracing::info!(session_id = %session_id, "session started");
+    }
+
     Ok(BuiltEngine {
         agent,
         event_rx,
         input_tx,
         model_name,
         session_id,
+        restored,
     })
 }
 
@@ -273,6 +387,7 @@ mod tests {
                 local_data_dir: local,
                 scope: SCENE_SCOPE.to_string(),
             },
+            resume: None,
         };
         Layout {
             _tmp: tmp,
@@ -427,6 +542,66 @@ mod tests {
         assert!(written[0].to_string_lossy().ends_with(".jsonl"));
         // 场景目录不该有任何东西。
         assert_eq!(walk_files(&l.scene.join("sessions")).count(), 0);
+    }
+
+    /// 往 store 里塞一个会话，返回它的 id。
+    async fn seed_session(
+        store: &history::store::JsonlHistoryStore,
+        text: &str,
+    ) -> base::session::SessionId {
+        let sid = base::session::SessionId::new();
+        store
+            .append(
+                sid,
+                history::entry::LogEntry::User {
+                    content: vec![base::message::ContentBlock::Text {
+                        text: text.into(),
+                        cache_control: None,
+                    }],
+                },
+            )
+            .await
+            .unwrap();
+        sid
+    }
+
+    /// `--continue` 要的是**最近改动过**的那个会话，不是随便一个。
+    #[tokio::test]
+    async fn latest_resolves_to_the_most_recently_touched_session() {
+        let l = layout();
+        let store = build_history_store(&l.config.paths).await.unwrap();
+
+        let _older = seed_session(&store, "第一次").await;
+        // mtime 的分辨率没那么细，隔一下再写第二个，否则"最近"是不确定的。
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        let newer = seed_session(&store, "第二次").await;
+
+        let resolved = resolve_resume_target(&Resume::Latest, &store)
+            .await
+            .unwrap();
+        assert_eq!(resolved.as_deref(), Some(newer.to_string().as_str()));
+    }
+
+    /// 没有任何历史时 `--continue` 不是错误——正常开新会话。
+    #[tokio::test]
+    async fn latest_with_no_history_starts_fresh() {
+        let l = layout();
+        let store = build_history_store(&l.config.paths).await.unwrap();
+        assert!(resolve_resume_target(&Resume::Latest, &store)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// `--resume` 打错 id 时立刻报"不是合法 id"，而不是等引擎回 NotFound。
+    #[tokio::test]
+    async fn an_unparseable_resume_id_fails_early() {
+        let l = layout();
+        let store = build_history_store(&l.config.paths).await.unwrap();
+        let err = resolve_resume_target(&Resume::Id("手滑打的东西".into()), &store)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BootstrapError::Resume { .. }), "got: {err}");
     }
 
     fn walk_files(root: &Path) -> impl Iterator<Item = PathBuf> {
