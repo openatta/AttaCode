@@ -164,23 +164,12 @@ fn render_editor(frame: &mut Frame, area: Rect, state: &EditorState) {
         InputMode::BashEscape => "! ",
         _ => "> ",
     };
-    let text = if state.locked {
-        format!("{prefix}{}", state.draft)
-    } else {
-        format!("{prefix}{}█", state.draft)
-    };
     let style = if state.locked {
         Style::default().fg(COLOR_SECONDARY)
     } else {
         Style::default().fg(style::COLOR_PRIMARY)
     };
-    let mut lines: Vec<Line<'static>> = text
-        .lines()
-        .map(|l| Line::from(Span::styled(l.to_string(), style)))
-        .collect();
-    if lines.is_empty() {
-        lines.push(Line::from(Span::styled(text, style)));
-    }
+    let mut lines = editor_lines(state, prefix, style);
     if let Some(paste) = &state.paste_placeholder {
         lines.push(Line::from(Span::styled(
             format!(
@@ -199,6 +188,62 @@ fn render_editor(frame: &mut Frame, area: Rect, state: &EditorState) {
         )));
     }
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+}
+
+/// 草稿的每一行，光标画在 `state.cursor`（草稿里的**字节**下标）指的位置上。
+///
+/// 光标压在字符上时用反色，不额外占一格——插一个 `█` 进去会把后面的文字整体
+/// 右推一列，行内移动光标时整行来回抖。只有光标在行尾（下面没字符可压）时才画
+/// 那个块，也就是这个函数以前唯一的行为。
+///
+/// 换行：`prefix`（`> `）只出现在第一行，续行不带——和 `wrapped_line_count`
+/// 估高时的假设一致。
+fn editor_lines(state: &EditorState, prefix: &str, style: Style) -> Vec<Line<'static>> {
+    let cursor_style = style.add_modifier(Modifier::REVERSED);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut offset = 0usize;
+    for (i, segment) in state.draft.split('\n').enumerate() {
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        if i == 0 {
+            spans.push(Span::styled(prefix.to_string(), style));
+        }
+        // 光标在本行：`offset..=offset+len`。行尾那个位置归本行（下一行从
+        // `offset+len+1` 起，`\n` 自己占一个字节），不会两行都认领。
+        let local = state
+            .cursor
+            .checked_sub(offset)
+            .filter(|rel| !state.locked && *rel <= segment.len());
+        match local {
+            Some(rel) => {
+                let (before, rest) = segment.split_at(floor_boundary(segment, rel));
+                spans.push(Span::styled(before.to_string(), style));
+                match rest.chars().next() {
+                    Some(c) => {
+                        spans.push(Span::styled(c.to_string(), cursor_style));
+                        spans.push(Span::styled(rest[c.len_utf8()..].to_string(), style));
+                    }
+                    None => spans.push(Span::styled("█".to_string(), style)),
+                }
+            }
+            None => spans.push(Span::styled(segment.to_string(), style)),
+        }
+        lines.push(Line::from(spans));
+        offset += segment.len() + 1; // +1 = 那个 '\n'
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(prefix.to_string(), style)));
+    }
+    lines
+}
+
+/// 把一个可能落在多字节字符中间的下标退回最近的字符边界。宿主本该只给合法下标，
+/// 但快照是可序列化的公开结构，一个错的 `cursor` 不该让渲染 panic。
+fn floor_boundary(s: &str, mut idx: usize) -> usize {
+    idx = idx.min(s.len());
+    while idx > 0 && !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
 }
 
 fn render_completion_popup(frame: &mut Frame, editor_area: Rect, state: &CompletionPopupState) {
@@ -444,6 +489,80 @@ mod tests {
         let mut state = empty_editor();
         state.draft = "x".repeat(1000);
         assert_eq!(editor_height(&state, 20), 12);
+    }
+
+    /// 一行的可见文本（含 `> ` 前缀）。
+    fn line_text(line: &Line<'static>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    /// 光标压在字符上时不额外占格——行内移动光标不该让后面的文字左右抖。
+    #[test]
+    fn a_mid_line_cursor_does_not_shift_the_text() {
+        let mut state = empty_editor();
+        state.draft = "hello".into();
+        state.cursor = 2;
+        let lines = editor_lines(&state, "> ", Style::default());
+        assert_eq!(line_text(&lines[0]), "> hello");
+        // 光标那一格是被反色的那个 span，正好是第 3 个字符。
+        let cursor_span = lines[0]
+            .spans
+            .iter()
+            .find(|s| s.style.add_modifier.contains(Modifier::REVERSED))
+            .expect("应该有一个反色的光标格");
+        assert_eq!(cursor_span.content.as_ref(), "l");
+    }
+
+    /// 光标在行尾时下面没字符可压，画那个块——这也是以前唯一的行为。
+    #[test]
+    fn a_cursor_at_the_end_is_drawn_as_a_block() {
+        let mut state = empty_editor();
+        state.draft = "hi".into();
+        state.cursor = 2;
+        let lines = editor_lines(&state, "> ", Style::default());
+        assert_eq!(line_text(&lines[0]), "> hi█");
+    }
+
+    /// 多行草稿：前缀只在第一行，光标只落在它所在的那一行。
+    #[test]
+    fn the_cursor_lands_on_its_own_line_only() {
+        let mut state = empty_editor();
+        state.draft = "one\ntwo".into();
+        state.cursor = 5; // "one\n" 之后的 't','w' 之间
+        let lines = editor_lines(&state, "> ", Style::default());
+        assert_eq!(line_text(&lines[0]), "> one");
+        assert_eq!(line_text(&lines[1]), "two");
+        assert!(!lines[0]
+            .spans
+            .iter()
+            .any(|s| s.style.add_modifier.contains(Modifier::REVERSED)));
+        assert!(lines[1]
+            .spans
+            .iter()
+            .any(|s| s.style.add_modifier.contains(Modifier::REVERSED)));
+    }
+
+    /// 权限对话框开着时 composer 是锁的，不该画光标。
+    #[test]
+    fn a_locked_editor_draws_no_cursor() {
+        let mut state = empty_editor();
+        state.draft = "hi".into();
+        state.cursor = 1;
+        state.locked = true;
+        let lines = editor_lines(&state, "> ", Style::default());
+        assert_eq!(line_text(&lines[0]), "> hi");
+    }
+
+    /// 快照是公开可序列化结构，一个落在多字节字符中间的 cursor 不该让渲染 panic。
+    #[test]
+    fn an_out_of_bounds_or_mid_char_cursor_does_not_panic() {
+        let mut state = empty_editor();
+        state.draft = "重构".into();
+        state.cursor = 1; // 第一个汉字的中间
+        let lines = editor_lines(&state, "> ", Style::default());
+        assert_eq!(line_text(&lines[0]), "> 重构");
+        state.cursor = 999;
+        let _ = editor_lines(&state, "> ", Style::default());
     }
 
     #[test]

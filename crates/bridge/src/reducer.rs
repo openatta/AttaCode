@@ -14,6 +14,8 @@ use tokio::sync::watch;
 use tui::frame_state::*;
 
 const FOLD_LINE_THRESHOLD: usize = 8;
+/// Core 里维护待办清单的工具名（`core/crates/tools/src/todo_write.rs`）。
+const TODO_TOOL: &str = "TodoWrite";
 const STATUS_TICK: Duration = Duration::from_millis(500);
 const SPINNER_FRAMES: [char; 4] = ['|', '/', '-', '\\'];
 
@@ -30,6 +32,10 @@ struct DomainState {
     turns: Vec<Turn>,
     pending_approvals: Vec<PendingApproval>,
     sub_agents: Vec<SubAgentInfo>,
+    /// 模型自己维护的待办清单，来自 `TodoWrite` 工具调用的入参。Core 没有"清单变了"
+    /// 这类事件——清单是那个工具的 input，所以这里从 `ToolUse` 里读。每次调用是
+    /// 全量替换（工具语义如此），空列表就等于收起这块区域。
+    tasks: Vec<TaskItem>,
     usage: SessionUsageState,
     status: Option<StatusContent>,
     /// When the in-flight turn started, if any. Drives `StatusContent::TurnRunning`'s
@@ -76,10 +82,22 @@ struct PendingApproval {
     message: String,
 }
 
+/// 子代理条上的一行。
+///
+/// **键是 `SubagentProgress.agent_label`**（`explore#3f2a1b7c` 那种），不是
+/// `AgentSpawned.agent_id`：全仓搜下来 Core 根本没有发过 `AgentSpawned`/
+/// `AgentCompleted`（只有同名的 telemetry payload），子代理唯一的实时信号就是
+/// `SubagentProgress` —— 它把子代理自己的事件流原样转发到父通道上。用量也只能
+/// 从这里来：转发过来的 `TurnComplete` 里带子代理这一轮的 `usage`。
+/// 那两个变体仍然照接，万一哪天 Core 真发了，它们按 `agent_id` 落到同一张表里。
 struct SubAgentInfo {
-    agent_id: String,
+    id: String,
     state: SubAgentState,
-    elapsed_or_status: String,
+    tokens: u64,
+    started: Instant,
+    /// 收尾原因（stop_reason / outcome / 错误摘要）。还在跑时是 `None`，
+    /// 渲染时换算成已耗时。
+    outcome: Option<String>,
 }
 
 impl Reducer {
@@ -122,6 +140,7 @@ impl Reducer {
             turns: Vec::new(),
             pending_approvals: Vec::new(),
             sub_agents: Vec::new(),
+            tasks: Vec::new(),
             usage: SessionUsageState::default(),
             status: None,
             active_turn_started: None,
@@ -264,6 +283,11 @@ impl Reducer {
             } => {
                 let input_summary = summarize_input(&input);
                 state.activity = format!("Running {name}…");
+                if name == TODO_TOOL {
+                    if let Some(tasks) = parse_todos(&input) {
+                        state.tasks = tasks;
+                    }
+                }
                 let turn = find_or_create_turn(&mut state.turns, &turn_id);
                 turn.blocks.push(Block::Tool {
                     id,
@@ -372,25 +396,45 @@ impl Reducer {
                 }
             }
             AgentEvent::AgentSpawned { agent_id, .. } => {
-                state.sub_agents.push(SubAgentInfo {
-                    agent_id,
-                    state: SubAgentState::Running,
-                    elapsed_or_status: "running".into(),
-                });
+                sub_agent(&mut state.sub_agents, &agent_id);
             }
             AgentEvent::AgentCompleted {
                 agent_id, outcome, ..
             } => {
-                if let Some(a) = state.sub_agents.iter_mut().find(|a| a.agent_id == agent_id) {
-                    a.state = SubAgentState::Done;
-                    a.elapsed_or_status = outcome;
+                let a = sub_agent(&mut state.sub_agents, &agent_id);
+                a.state = SubAgentState::Done;
+                a.outcome = Some(outcome);
+            }
+            // 子代理把自己的整条事件流转发到父通道上。这里只取子代理条要的三件事，
+            // 不把子代理的文本灌进父转录——那是另一个层级的内容，混在一起会让
+            // "谁在说话"彻底看不清。
+            AgentEvent::SubagentProgress {
+                agent_label, event, ..
+            } => {
+                let a = sub_agent(&mut state.sub_agents, &agent_label);
+                match *event {
+                    AgentEvent::TurnComplete {
+                        usage, stop_reason, ..
+                    } => {
+                        a.tokens += usage.input_tokens as u64 + usage.output_tokens as u64;
+                        a.state = SubAgentState::Done;
+                        a.outcome = Some(stop_reason);
+                    }
+                    AgentEvent::Error { message, .. } => {
+                        a.state = SubAgentState::Failed;
+                        a.outcome = Some(first_line(&message));
+                    }
+                    // 还在动就是还在跑——子代理多轮时（收完一个 TurnComplete 又来事件）
+                    // 这条会把它从 Done 拨回 Running。
+                    _ => {
+                        a.state = SubAgentState::Running;
+                        a.outcome = None;
+                    }
                 }
             }
-            // 子代理内部事件在父通道上的转发 / 团队编排进度。两者都还没有对应的
-            // FrameState 结构（子代理条只有 Running/Done 两态，没有嵌套转录；
-            // TaskListState 也还没接线），落地成转录噪音不如先不接——
-            // `AgentSpawned`/`AgentCompleted` 已经覆盖了子代理条要的信息。
-            AgentEvent::SubagentProgress { .. } | AgentEvent::TeamProgress { .. } => {}
+            // 团队编排进度：`SubAgentBarState` 只有单个代理的概念，没有"阶段/成员"
+            // 这一层，硬塞进去会把两种东西画成一种。留到有对应结构再接。
+            AgentEvent::TeamProgress { .. } => {}
             AgentEvent::Error {
                 message, turn_id, ..
             } => {
@@ -452,6 +496,18 @@ fn spinner_char() -> char {
     SPINNER_FRAMES[((ms / 150) % SPINNER_FRAMES.len() as u128) as usize]
 }
 
+/// 最后一个 turn 的用户输入的第一行，用作转录区顶上的 sticky header。
+/// 合成 turn（`push_note` 在第一条消息之前建的那个）没有 `UserPrompt` 块，
+/// 自然返回 `None`。
+fn current_prompt(turns: &[Turn]) -> Option<String> {
+    turns.iter().rev().find_map(|t| {
+        t.blocks.iter().find_map(|b| match b {
+            Block::UserPrompt(text) => Some(first_line(text)),
+            _ => None,
+        })
+    })
+}
+
 fn find_or_create_turn<'a>(turns: &'a mut Vec<Turn>, turn_id: &str) -> &'a mut Turn {
     if let Some(idx) = turns.iter().position(|t| t.id == turn_id) {
         return &mut turns[idx];
@@ -480,6 +536,59 @@ fn push_note(turns: &mut Vec<Turn>, message: String) {
     if let Some(turn) = turns.last_mut() {
         turn.blocks.push(Block::Note(message));
     }
+}
+
+/// 按 id/label 找子代理，没有就建一个（`SubagentProgress` 的第一次出现就是"它开始了"，
+/// 不需要另一个 spawn 事件）。
+fn sub_agent<'a>(agents: &'a mut Vec<SubAgentInfo>, id: &str) -> &'a mut SubAgentInfo {
+    if let Some(idx) = agents.iter().position(|a| a.id == id) {
+        return &mut agents[idx];
+    }
+    agents.push(SubAgentInfo {
+        id: id.to_string(),
+        state: SubAgentState::Running,
+        tokens: 0,
+        started: Instant::now(),
+        outcome: None,
+    });
+    agents.last_mut().unwrap()
+}
+
+fn first_line(text: &str) -> String {
+    text.lines().next().unwrap_or_default().to_string()
+}
+
+/// `TodoWrite` 的入参 → 任务清单区。
+///
+/// 只认这一个工具名，和 diff 那边的"按内容认"相反：待办清单是这个工具**私有的**
+/// 数据结构（`{"todos":[{content,status,active_form}]}`），不是一种通用输出格式，
+/// 别的工具凑巧有个 `todos` 字段也不该被当成清单。
+fn parse_todos(input: &serde_json::Value) -> Option<Vec<TaskItem>> {
+    let todos = input.get("todos")?.as_array()?;
+    Some(
+        todos
+            .iter()
+            .filter_map(|t| {
+                let status = match t.get("status").and_then(|s| s.as_str())? {
+                    "in_progress" => ItemStatus::Running,
+                    "completed" => ItemStatus::Done,
+                    _ => ItemStatus::Pending,
+                };
+                // 进行中的那条用 `active_form`（"Running tests" 这种现在进行时），
+                // 这正是模型写这个字段的用意；其余用 `content`。
+                let active_form = t.get("active_form").and_then(|s| s.as_str());
+                let content = t.get("content").and_then(|s| s.as_str());
+                let label = match (status, active_form) {
+                    (ItemStatus::Running, Some(f)) if !f.is_empty() => f,
+                    _ => content?,
+                };
+                Some(TaskItem {
+                    status,
+                    label: label.to_string(),
+                })
+            })
+            .collect(),
+    )
 }
 
 fn summarize_input(input: &serde_json::Value) -> String {
@@ -527,9 +636,18 @@ fn render(state: &DomainState) -> FrameState {
 
     FrameState {
         transcript: TranscriptState {
-            header: HeaderState {
-                text: None,
-                source: HeaderSource::None,
+            // 转录区顶上钉住"当前在回答哪个问题"。滚回历史时它是唯一还告诉你
+            // 上下文的东西；取最后一个 turn 的用户输入，多行只取第一行——这条
+            // 是一行高的固定区域。
+            header: match current_prompt(&state.turns) {
+                Some(text) => HeaderState {
+                    text: Some(text),
+                    source: HeaderSource::UserPrompt,
+                },
+                None => HeaderState {
+                    text: None,
+                    source: HeaderSource::None,
+                },
             },
             body: TranscriptBodyState {
                 scroll: ScrollState {
@@ -547,7 +665,9 @@ fn render(state: &DomainState) -> FrameState {
             status_line: StatusLineState {
                 content: state.status.clone(),
             },
-            task_list: TaskListState { items: vec![] },
+            task_list: TaskListState {
+                items: state.tasks.clone(),
+            },
         },
         composer: ComposerState {
             app_info: AppInfoLineState { text: None },
@@ -575,10 +695,13 @@ fn render(state: &DomainState) -> FrameState {
                 .sub_agents
                 .iter()
                 .map(|a| SubAgentStatus {
-                    name: a.agent_id.clone(),
+                    name: a.id.clone(),
                     state: a.state,
-                    token_usage: 0,
-                    elapsed_or_status: a.elapsed_or_status.clone(),
+                    token_usage: a.tokens,
+                    elapsed_or_status: a
+                        .outcome
+                        .clone()
+                        .unwrap_or_else(|| format!("{}s", a.started.elapsed().as_secs())),
                 })
                 .collect(),
         },
@@ -859,6 +982,120 @@ mod tests {
                 LineKind::DiffOld | LineKind::DiffNew | LineKind::DiffContext
             )),
             "没有 diff 表头就不该出现 diff 行"
+        );
+    }
+
+    /// 子代理条的数据只能从 `SubagentProgress` 来：Core 从不发 `AgentSpawned`/
+    /// `AgentCompleted`（全仓只有同名的 telemetry payload），用量也只在转发过来的
+    /// `TurnComplete` 里。以前这条事件被整个丢掉，于是子代理条永远是空的。
+    #[test]
+    fn subagent_progress_drives_the_bar_including_token_usage() {
+        let (r, rx) = reducer();
+        let turn_id = r.begin_turn("查一下".into());
+
+        let forwarded = |inner: AgentEvent| AgentEvent::SubagentProgress {
+            agent_label: "explore#3f2a1b7c".into(),
+            agent_session_id: "s1".into(),
+            agent_type: Some("explore".into()),
+            parent_session_id: "p1".into(),
+            parent_turn: 1,
+            event: Box::new(inner),
+        };
+
+        // 第一次出现就等于"它开始了"——不需要另一个 spawn 事件。
+        r.apply_event(forwarded(AgentEvent::TextDelta {
+            text: "looking".into(),
+            turn_id: turn_id.clone(),
+        }));
+        let bar = frame(&rx).sub_agent_bar.agents;
+        assert_eq!(bar.len(), 1);
+        assert_eq!(bar[0].name, "explore#3f2a1b7c");
+        assert_eq!(bar[0].state, SubAgentState::Running);
+
+        r.apply_event(forwarded(AgentEvent::TurnComplete {
+            stop_reason: "end_turn".into(),
+            api_calls: 1,
+            tool_calls: 2,
+            usage: base::interface::model::Usage {
+                input_tokens: 120,
+                output_tokens: 30,
+            },
+            turn_id,
+        }));
+        let bar = frame(&rx).sub_agent_bar.agents;
+        assert_eq!(bar[0].state, SubAgentState::Done);
+        assert_eq!(bar[0].token_usage, 150, "用量来自转发过来的 TurnComplete");
+        assert_eq!(bar[0].elapsed_or_status, "end_turn");
+    }
+
+    /// 待办清单区的数据来自 `TodoWrite` 的入参——Core 没有"清单变了"这种事件。
+    #[test]
+    fn todo_write_fills_the_task_list() {
+        let (r, rx) = reducer();
+        let turn_id = r.begin_turn("做三件事".into());
+        r.apply_event(AgentEvent::ToolUse {
+            id: "t1".into(),
+            name: "TodoWrite".into(),
+            input: serde_json::json!({"todos": [
+                {"content": "看代码", "status": "completed", "active_form": "看代码中"},
+                {"content": "跑测试", "status": "in_progress", "active_form": "跑测试中"},
+                {"content": "提交", "status": "pending", "active_form": ""},
+            ]}),
+            turn_id: turn_id.clone(),
+        });
+
+        let items = frame(&rx).operation_status.task_list.items;
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].status, ItemStatus::Done);
+        assert_eq!(items[0].label, "看代码");
+        assert_eq!(items[1].status, ItemStatus::Running);
+        assert_eq!(items[1].label, "跑测试中", "进行中的那条用 active_form");
+        assert_eq!(items[2].status, ItemStatus::Pending);
+
+        // 每次调用全量替换，空列表就等于收起这块区域。
+        r.apply_event(AgentEvent::ToolUse {
+            id: "t2".into(),
+            name: "TodoWrite".into(),
+            input: serde_json::json!({"todos": []}),
+            turn_id,
+        });
+        assert!(frame(&rx).operation_status.task_list.items.is_empty());
+    }
+
+    /// 别的工具凑巧带个 `todos` 字段不该被当成清单。
+    #[test]
+    fn only_the_todo_tool_touches_the_task_list() {
+        let (r, rx) = reducer();
+        let turn_id = r.begin_turn("q".into());
+        r.apply_event(AgentEvent::ToolUse {
+            id: "t1".into(),
+            name: "Bash".into(),
+            input: serde_json::json!({"todos": [{"content": "x", "status": "pending"}]}),
+            turn_id,
+        });
+        assert!(frame(&rx).operation_status.task_list.items.is_empty());
+    }
+
+    /// 转录顶上钉住"当前在回答哪个问题"，多行只取第一行。
+    #[test]
+    fn the_header_sticks_the_current_prompt() {
+        let (r, rx) = reducer();
+        assert_eq!(frame(&rx).transcript.header.text, None);
+
+        r.begin_turn("第一个问题".into());
+        assert_eq!(
+            frame(&rx).transcript.header.text.as_deref(),
+            Some("第一个问题")
+        );
+        assert_eq!(
+            frame(&rx).transcript.header.source,
+            HeaderSource::UserPrompt
+        );
+
+        r.begin_turn("第二个问题\n还有第二行".into());
+        assert_eq!(
+            frame(&rx).transcript.header.text.as_deref(),
+            Some("第二个问题")
         );
     }
 

@@ -26,6 +26,26 @@ pub fn default_bindings() -> Vec<Keybinding> {
         bind("Ctrl+W", "editor.delete-word", "Delete previous word"),
         bind("Ctrl+K", "editor.kill-to-eol", "Kill to end of line"),
         bind("Ctrl+L", "editor.redraw", "Redraw screen"),
+        // ---- 光标移动 ----
+        //
+        // Up/Down 不在这里：它们已经被上面的 `editor.history.*` 占了（`Resolver`
+        // 取第一条匹配的绑定），行间移动挂在那两个 action 上，由 app 按上下文分派
+        // ——补全弹窗开着时移动选中项，否则移动光标。
+        bind("Left", "editor.cursor.left", "Move cursor left"),
+        bind("Right", "editor.cursor.right", "Move cursor right"),
+        bind("Alt+Left", "editor.cursor.word-left", "Move back one word"),
+        bind(
+            "Alt+Right",
+            "editor.cursor.word-right",
+            "Move forward one word",
+        ),
+        bind("Home", "editor.cursor.line-start", "Move to start of line"),
+        bind("End", "editor.cursor.line-end", "Move to end of line"),
+        bind(
+            "Delete",
+            "editor.delete-forward",
+            "Delete the character under the cursor",
+        ),
         // ---- repl / TUI ----
         bind("Ctrl+C", "repl.cancel", "Cancel current turn"),
         bind("Ctrl+D", "repl.exit", "Exit (when input is empty)"),

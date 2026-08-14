@@ -19,6 +19,26 @@
 > `RuleSetPermission`，不再自己实现 `Permission`。同理，`ApprovalOption` 的三档
 > "允许"不再统一塌成 `Permit`，而是分别映射到 `PermitAlways { scope }`。
 
+> **后续更新 2（粘合层落地之后补齐的 FrameState 空位）**
+>
+> 本文只把粘合层接到"转录 + 状态行 + 权限 + 用量"这几处，`FrameState` 另外几个
+> 字段当时留了默认值。它们现在也接上了，记录数据来源，免得下次又被当成"没接线"：
+>
+> - **子代理条**：键是 `SubagentProgress.agent_label`，不是 `AgentSpawned.agent_id`
+>   ——全仓搜下来 Core **从不发** `AgentSpawned`/`AgentCompleted`（只有同名的
+>   telemetry payload），子代理唯一的实时信号就是 `SubagentProgress`；`token_usage`
+>   来自它转发的子代理 `TurnComplete.usage`。那两个变体仍照接，以防哪天真发。
+> - **任务清单区**：来自 `TodoWrite` 工具调用的 **input**（`{"todos":[…]}`）。Core
+>   没有"清单变了"这类事件，清单是那个工具私有的数据结构，所以这里只认这一个工具名
+>   （和 diff 渲染的"按内容认"相反）。
+> - **转录 header**：钉住最后一个 turn 的用户输入第一行（`HeaderSource::UserPrompt`），
+>   滚回历史时用来交代上下文。
+> - **composer 行内编辑**：`EditorState.cursor` 从"恒等于 draft 长度"变成真光标；
+>   渲染侧用反色压在字符上而不是插一个块，避免行内移动时整行左右抖。
+>
+> `TeamProgress` 仍未接：`SubAgentBarState` 没有"阶段/成员"这一层，硬塞会把两种
+> 东西画成一种，留到有对应结构再说。
+
 ## 现状核查（只读探索结论）
 
 - `crates/tui` 当前是纯渲染库：`lib.rs`/`frame_state.rs` 顶部注释明确写着"zero AttaCore dependency"，`Cargo.toml` 也确实不依赖任何 `core/crates/*`。整个仓库（`core/` 之外）没有任何 `main.rs`/`[[bin]]`——**目前没有可运行的程序，TUI 与 Core 之间完全没有接线**，与需求文档"从零设计"的前提一致。

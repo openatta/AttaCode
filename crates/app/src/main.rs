@@ -4,9 +4,12 @@
 //! UI-local composer state (draft/cursor/completion selection). Everything Core-related
 //! goes through `bridge::EngineHandle` — this file never touches an AttaCore type directly.
 //!
-//! Composer editing here is intentionally minimal (append/backspace at end of the
-//! draft, no mid-line cursor movement) — this task establishes the event-loop wiring
-//! end to end; richer text editing is follow-up work, not an architecture concern.
+//! Composer editing lives in the `impl LocalUi` block near the bottom: insert/delete
+//! at the cursor, char/word/line motion, kill-to-end. `cursor` is a byte index into
+//! `draft` and is always on a char boundary; the renderer indexes the same way, so
+//! neither side converts. Still missing: prompt history recall (the `editor.history.*`
+//! actions are bound but currently drive completion selection and line motion),
+//! selection, and undo.
 
 use bridge::{BootstrapConfig, BridgeCommand, EngineHandle};
 use crossterm::event::{
@@ -104,6 +107,8 @@ impl Args {
 /// `FrameState` snapshot right before each render.
 struct LocalUi {
     draft: String,
+    /// 光标在 `draft` 里的字节下标，恒在字符边界上。见下面的 `impl LocalUi` 编辑块。
+    cursor: usize,
     /// Latest slash-command list from `bridge::commands` — Core's own live
     /// `CommandRegistry`, refreshed when the engine reports the skill catalog changed.
     commands: Vec<CompletionCandidate>,
@@ -132,6 +137,7 @@ impl LocalUi {
     fn new(commands: Vec<CompletionCandidate>) -> Self {
         Self {
             draft: String::new(),
+            cursor: 0,
             commands,
             completion_selected: 0,
             completion_dismissed: false,
@@ -375,24 +381,29 @@ fn dispatch_action(
     match action {
         "editor.submit" if completion_active => accept_completion(local),
         "editor.submit" => return submit(local, handle, snapshot),
-        "editor.newline" => {
-            local.draft.push('\n');
-            local.note_draft_changed();
-        }
+        "editor.newline" => local.insert('\n'),
         "editor.clear" => {
             local.draft.clear();
+            local.cursor = 0;
             local.note_draft_changed();
         }
-        "editor.delete-word" => {
-            delete_previous_word(&mut local.draft);
-            local.note_draft_changed();
-        }
-        // 光标恒在草稿末尾（见文件头注释），"删到行尾"没有可删的东西。写出来是为了
-        // 和"忘了接"区分开——等编辑器支持行内移动之后这里才有活干。
-        "editor.kill-to-eol" => {}
+        "editor.delete-word" => local.delete_word_before(),
+        "editor.kill-to-eol" => local.kill_to_line_end(),
+        "editor.delete-forward" => local.delete_forward(),
+        "editor.cursor.left" => local.move_char(-1),
+        "editor.cursor.right" => local.move_char(1),
+        "editor.cursor.word-left" => local.move_word(-1),
+        "editor.cursor.word-right" => local.move_word(1),
+        "editor.cursor.line-start" => local.cursor = local.line_start(),
+        "editor.cursor.line-end" => local.cursor = local.line_end(),
         "editor.redraw" => local.redraw_requested = true,
+        // Up/Down 一键三义，按当前上下文取一个：补全弹窗开着时移动选中项；
+        // 否则草稿是多行的话在行间移动光标；再否则留给将来的历史回溯（action
+        // 名就是为它起的，功能还没做）。
         "editor.history.prev" if completion_active => move_completion_selection(local, -1),
         "editor.history.next" if completion_active => move_completion_selection(local, 1),
+        "editor.history.prev" => local.move_line(-1),
+        "editor.history.next" => local.move_line(1),
         "repl.scroll-up" => {
             local.scroll_up(snapshot.transcript.body.entries.len());
         }
@@ -502,6 +513,7 @@ fn submit(local: &mut LocalUi, handle: &dyn EngineHandle, snapshot: &tui::FrameS
         return true;
     }
     let text = std::mem::take(&mut local.draft);
+    local.cursor = 0;
     local.note_draft_changed();
     // 发了新消息就跳回底部——不然自己刚发的那句在视口外，看着像没发出去。
     local.scroll_offset = None;
@@ -536,27 +548,157 @@ fn respond(
     local.approval_selected = 0;
 }
 
-/// `Ctrl+W`：删掉末尾的一个词，连同它前面的空白。已经在词中间时只删这个词。
-fn delete_previous_word(draft: &mut String) {
-    let trimmed = draft.trim_end_matches(char::is_whitespace);
-    let cut = trimmed
-        .rfind(char::is_whitespace)
-        .map(|i| i + trimmed[i..].chars().next().map_or(1, char::len_utf8))
-        .unwrap_or(0);
-    draft.truncate(cut);
-}
-
 fn insert_char(key: KeyEvent, local: &mut LocalUi) {
     match key.code {
-        CtKeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-            local.draft.push(c);
-            local.note_draft_changed();
-        }
-        CtKeyCode::Backspace => {
-            local.draft.pop();
-            local.note_draft_changed();
-        }
+        CtKeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => local.insert(c),
+        CtKeyCode::Backspace => local.delete_backward(),
         _ => {}
+    }
+}
+
+/// 草稿的行内编辑。
+///
+/// `cursor` 是**字节**下标，恒落在字符边界上（下面每个改动都按字符走）——渲染那边
+/// 也按字节切分（`tui::regions::composer::editor_lines`），两边用同一套坐标就不用
+/// 来回换算，也不用把宽字符拆成两半。
+impl LocalUi {
+    fn insert(&mut self, c: char) {
+        self.draft.insert(self.cursor, c);
+        self.cursor += c.len_utf8();
+        self.note_draft_changed();
+    }
+
+    /// Backspace：删光标**前**一个字符。
+    fn delete_backward(&mut self) {
+        let Some(prev) = self.draft[..self.cursor].chars().next_back() else {
+            return;
+        };
+        self.cursor -= prev.len_utf8();
+        self.draft.remove(self.cursor);
+        self.note_draft_changed();
+    }
+
+    /// Delete：删光标**上**的那个字符，光标不动。
+    fn delete_forward(&mut self) {
+        if self.draft[self.cursor..].chars().next().is_some() {
+            self.draft.remove(self.cursor);
+            self.note_draft_changed();
+        }
+    }
+
+    /// `Ctrl+W`：往前删一个词，连同词前的空白。光标停在删除处。
+    fn delete_word_before(&mut self) {
+        let target = self.word_boundary(-1);
+        if target != self.cursor {
+            self.draft.replace_range(target..self.cursor, "");
+            self.cursor = target;
+            self.note_draft_changed();
+        }
+    }
+
+    /// `Ctrl+K`：从光标删到**本行**行尾（多行草稿里不越过 `\n`）。已经在行尾时
+    /// 把那个换行本身删掉，也就是把下一行接上来——readline 的老习惯。
+    fn kill_to_line_end(&mut self) {
+        let end = self.line_end();
+        let cut = if end == self.cursor {
+            self.next_boundary()
+        } else {
+            end
+        };
+        if cut != self.cursor {
+            self.draft.replace_range(self.cursor..cut, "");
+            self.note_draft_changed();
+        }
+    }
+
+    fn move_char(&mut self, delta: isize) {
+        self.cursor = if delta < 0 {
+            self.prev_boundary()
+        } else {
+            self.next_boundary()
+        };
+    }
+
+    fn move_word(&mut self, delta: isize) {
+        self.cursor = self.word_boundary(delta);
+    }
+
+    /// 行间移动，尽量保持列（按字符数算，不是字节）。已经在首/末行时不动。
+    fn move_line(&mut self, delta: isize) {
+        let start = self.line_start();
+        let column = self.draft[start..self.cursor].chars().count();
+        let target_start = if delta < 0 {
+            if start == 0 {
+                return;
+            }
+            self.draft[..start - 1] // -1 跳过上一行末尾那个 '\n'
+                .rfind('\n')
+                .map(|i| i + 1)
+                .unwrap_or(0)
+        } else {
+            let end = self.line_end();
+            if end == self.draft.len() {
+                return;
+            }
+            end + 1
+        };
+        let target_line = &self.draft[target_start..];
+        let target_line = &target_line[..target_line.find('\n').unwrap_or(target_line.len())];
+        let offset = target_line
+            .char_indices()
+            .nth(column)
+            .map(|(i, _)| i)
+            .unwrap_or(target_line.len());
+        self.cursor = target_start + offset;
+    }
+
+    fn line_start(&self) -> usize {
+        self.draft[..self.cursor]
+            .rfind('\n')
+            .map(|i| i + 1)
+            .unwrap_or(0)
+    }
+
+    fn line_end(&self) -> usize {
+        self.draft[self.cursor..]
+            .find('\n')
+            .map(|i| self.cursor + i)
+            .unwrap_or(self.draft.len())
+    }
+
+    fn prev_boundary(&self) -> usize {
+        self.draft[..self.cursor]
+            .chars()
+            .next_back()
+            .map(|c| self.cursor - c.len_utf8())
+            .unwrap_or(0)
+    }
+
+    fn next_boundary(&self) -> usize {
+        self.draft[self.cursor..]
+            .chars()
+            .next()
+            .map(|c| self.cursor + c.len_utf8())
+            .unwrap_or(self.cursor)
+    }
+
+    /// 往 `delta` 方向的词边界。词的定义就是"非空白的一段"：往前先跳过空白再跳过
+    /// 词身，往后反过来——和 `Ctrl+W` 一直以来的语义一致。
+    fn word_boundary(&self, delta: isize) -> usize {
+        if delta < 0 {
+            let head = &self.draft[..self.cursor];
+            let trimmed = head.trim_end_matches(char::is_whitespace);
+            trimmed
+                .rfind(char::is_whitespace)
+                .map(|i| i + trimmed[i..].chars().next().map_or(1, char::len_utf8))
+                .unwrap_or(0)
+        } else {
+            let tail = &self.draft[self.cursor..];
+            let skipped = tail.len() - tail.trim_start_matches(char::is_whitespace).len();
+            let rest = &tail[skipped..];
+            let word = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            self.cursor + skipped + word
+        }
     }
 }
 
@@ -605,12 +747,13 @@ fn accept_completion(local: &mut LocalUi) {
         return;
     };
     local.draft = format!("{} ", candidate.name);
+    local.cursor = local.draft.len();
     local.note_draft_changed();
 }
 
 fn merge(mut frame: tui::FrameState, local: &LocalUi) -> tui::FrameState {
     frame.composer.content.editor.draft = local.draft.clone();
-    frame.composer.content.editor.cursor = local.draft.len();
+    frame.composer.content.editor.cursor = local.cursor;
     // bridge 每帧都把 `auto_follow` 置回 true（它不知道用户往上翻了），滚动位置在这里
     // 覆盖。夹一次是防转录变短之后 offset 悬空。
     if let Some(offset) = local.scroll_offset {
@@ -676,6 +819,8 @@ mod tests {
         ];
         let mut local = LocalUi::new(commands);
         local.draft = draft.to_string();
+        // 光标放末尾——用户敲出这段草稿之后就是这个状态。
+        local.cursor = local.draft.len();
         local
     }
 
@@ -813,12 +958,37 @@ mod tests {
 
         let mut local = with_page(10);
         local.draft = "git commit".into();
+        local.cursor = local.draft.len();
         press(&mut local, CtKeyCode::Char('w'), KeyModifiers::CONTROL);
         assert_eq!(local.draft, "git ", "Ctrl+W 没接上");
 
         let mut local = with_page(10);
         press(&mut local, CtKeyCode::Char('l'), KeyModifiers::CONTROL);
         assert!(local.redraw_requested, "Ctrl+L 没接上");
+
+        // 光标键：同样走真实 Resolver，确认没被 `editor.*` 里别的绑定抢掉。
+        let mut local = with_page(10);
+        local.draft = "git commit".into();
+        local.cursor = local.draft.len();
+        press(&mut local, CtKeyCode::Left, KeyModifiers::NONE);
+        assert_eq!(local.cursor, 9, "Left 没接上");
+        press(&mut local, CtKeyCode::Right, KeyModifiers::NONE);
+        assert_eq!(local.cursor, 10, "Right 没接上");
+        press(&mut local, CtKeyCode::Home, KeyModifiers::NONE);
+        assert_eq!(local.cursor, 0, "Home 没接上");
+        press(&mut local, CtKeyCode::Delete, KeyModifiers::NONE);
+        assert_eq!(local.draft, "it commit", "Delete 没接上");
+        press(&mut local, CtKeyCode::End, KeyModifiers::NONE);
+        assert_eq!(local.cursor, local.draft.len(), "End 没接上");
+        press(&mut local, CtKeyCode::Left, KeyModifiers::ALT);
+        assert_eq!(local.cursor, 3, "Alt+Left 没接上");
+
+        // 没有补全弹窗时 Up/Down 走行间移动（有弹窗时移动的是选中项，另有测试）。
+        let mut local = with_page(10);
+        local.draft = "first\nsecond".into();
+        local.cursor = local.draft.len();
+        press(&mut local, CtKeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(local.cursor, 5, "Up 没走到上一行");
     }
 
     #[test]
@@ -1041,24 +1211,128 @@ mod tests {
 
     // ── 编辑键 ──
 
-    #[test]
-    fn delete_previous_word_takes_the_word_and_its_leading_space() {
-        let mut s = String::from("git commit -m");
-        delete_previous_word(&mut s);
-        assert_eq!(s, "git commit ");
-        delete_previous_word(&mut s);
-        assert_eq!(s, "git ");
-        delete_previous_word(&mut s);
-        assert_eq!(s, "");
-        delete_previous_word(&mut s);
-        assert_eq!(s, "", "空草稿上再删一次不该 panic");
+    /// 草稿 + 光标。`|` 标出光标位置，测试里读写都用这一种写法。
+    fn editing(draft_with_caret: &str) -> LocalUi {
+        let cursor = draft_with_caret.find('|').expect("需要用 | 标出光标");
+        let mut local = local_with("");
+        local.draft = draft_with_caret.replace('|', "");
+        local.cursor = cursor;
+        local
+    }
+
+    fn caret(local: &LocalUi) -> String {
+        let mut s = local.draft.clone();
+        s.insert(local.cursor, '|');
+        s
     }
 
     #[test]
-    fn delete_previous_word_handles_trailing_whitespace_and_multibyte() {
-        let mut s = String::from("重构 这个模块   ");
-        delete_previous_word(&mut s);
-        assert_eq!(s, "重构 ");
+    fn typing_and_deleting_happen_at_the_cursor_not_at_the_end() {
+        let mut local = editing("git |commit");
+        local.insert('x');
+        assert_eq!(caret(&local), "git x|commit");
+        local.delete_backward();
+        assert_eq!(caret(&local), "git |commit");
+        local.delete_forward();
+        assert_eq!(caret(&local), "git |ommit");
+    }
+
+    #[test]
+    fn cursor_moves_by_whole_characters_across_multibyte_text() {
+        let mut local = editing("重构模块|");
+        local.move_char(-1);
+        assert_eq!(caret(&local), "重构模|块");
+        local.move_char(-1);
+        assert_eq!(caret(&local), "重构|模块");
+        local.move_char(1);
+        assert_eq!(caret(&local), "重构模|块");
+        // 头尾夹住，不会走出草稿。
+        for _ in 0..10 {
+            local.move_char(-1);
+        }
+        assert_eq!(caret(&local), "|重构模块");
+        local.delete_backward();
+        assert_eq!(caret(&local), "|重构模块", "行首退格是空操作");
+    }
+
+    #[test]
+    fn word_motion_and_word_delete_work_from_the_cursor() {
+        let mut local = editing("git commit -m|");
+        local.move_word(-1);
+        assert_eq!(caret(&local), "git commit |-m");
+        local.move_word(-1);
+        assert_eq!(caret(&local), "git |commit -m");
+        local.move_word(1);
+        assert_eq!(caret(&local), "git commit| -m");
+
+        let mut local = editing("git commit |-m");
+        local.delete_word_before();
+        assert_eq!(caret(&local), "git |-m", "只删光标前那个词，后面的不动");
+    }
+
+    #[test]
+    fn delete_word_before_takes_trailing_whitespace_and_multibyte_words() {
+        let mut local = editing("重构 这个模块   |");
+        local.delete_word_before();
+        assert_eq!(caret(&local), "重构 |");
+        local.delete_word_before();
+        assert_eq!(caret(&local), "|");
+        local.delete_word_before();
+        assert_eq!(caret(&local), "|", "空草稿上再删一次不该 panic");
+    }
+
+    #[test]
+    fn kill_to_end_stops_at_the_line_break_then_joins_lines() {
+        let mut local = editing("first |line\nsecond");
+        local.kill_to_line_end();
+        assert_eq!(caret(&local), "first |\nsecond", "不该越过换行");
+        local.kill_to_line_end();
+        assert_eq!(caret(&local), "first |second", "已经在行尾时把下一行接上来");
+    }
+
+    #[test]
+    fn home_and_end_are_line_wise_not_draft_wise() {
+        let mut local = editing("first\nse|cond\nthird");
+        local.cursor = local.line_start();
+        assert_eq!(caret(&local), "first\n|second\nthird");
+        local.cursor = local.line_end();
+        assert_eq!(caret(&local), "first\nsecond|\nthird");
+    }
+
+    #[test]
+    fn vertical_motion_keeps_the_column_and_clamps_on_short_lines() {
+        let mut local = editing("longest line\nab\nanother line|");
+        local.move_line(-1);
+        assert_eq!(
+            caret(&local),
+            "longest line\nab|\nanother line",
+            "短行夹到行尾"
+        );
+        local.move_line(-1);
+        assert_eq!(
+            caret(&local),
+            "lo|ngest line\nab\nanother line",
+            "回到原来的列"
+        );
+        local.move_line(-1);
+        assert_eq!(
+            caret(&local),
+            "lo|ngest line\nab\nanother line",
+            "首行再往上不动"
+        );
+    }
+
+    /// 光标在中间时提交，整段草稿都要发出去，光标复位。
+    #[test]
+    fn submitting_from_mid_draft_sends_the_whole_draft() {
+        let mut local = editing("hello |world");
+        let handle = FakeHandle::new();
+        assert!(submit(&mut local, &handle, &frame_without_approval()));
+        assert!(matches!(
+            handle.commands().as_slice(),
+            [BridgeCommand::Submit { text }] if text == "hello world"
+        ));
+        assert_eq!(local.cursor, 0);
     }
 
     // ── 权限对话框 ──
