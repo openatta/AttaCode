@@ -401,7 +401,9 @@ fn dispatch_action(
 ) -> bool {
     let completion_active = compute_completion(local).is_some();
     match action {
-        "editor.submit" if completion_active => accept_completion(local),
+        "editor.submit" if completion_active && !completion_already_typed(local) => {
+            accept_completion(local)
+        }
         "editor.submit" => return submit(local, handle, snapshot),
         "editor.newline" => local.insert('\n'),
         "editor.clear" => {
@@ -450,6 +452,25 @@ fn dispatch_action(
         _ => {}
     }
     true
+}
+
+/// header 钉的那句（最后一条用户输入）此刻在视口里看得见吗？
+///
+/// 看得见就不用钉——sticky header 的意义是"滚远了还知道在答哪个问题"。
+/// 跟随模式下视口是最后一屏，滚动模式下是 `[offset, offset+高度)`。
+fn prompt_is_visible(frame: &tui::FrameState, local: &LocalUi) -> bool {
+    let entries = &frame.transcript.body.entries;
+    let Some(idx) = entries
+        .iter()
+        .rposition(|e| e.kind == tui::frame_state::LineKind::UserPrompt)
+    else {
+        return true; // 没有 prompt，也就没什么可钉的
+    };
+    let page = local.viewport_lines.max(1);
+    match local.scroll_offset {
+        Some(offset) => idx >= offset && idx < offset + page,
+        None => idx + page >= entries.len(),
+    }
 }
 
 /// 转录里的用户输入，按出现顺序——resume 之后用它续上输入历史。
@@ -826,6 +847,21 @@ fn compute_completion(local: &LocalUi) -> Option<CompletionPopupState> {
     })
 }
 
+/// 选中的候选就是已经打完的那条命令——这时 Enter 该**提交**，不是再补一次。
+///
+/// 不加这条判断的话，打全 `/model` 再回车只会把草稿补成 `/model `（多个空格），
+/// 得按第二次才提交；更糟的是接着打的字会续在同一条草稿上，看起来像"回车没反应"。
+/// 真机跑一遍才发现——这条路径所有单测都是"打一半"的前缀，从没打全过。
+fn completion_already_typed(local: &LocalUi) -> bool {
+    let Some(popup) = compute_completion(local) else {
+        return false;
+    };
+    popup
+        .candidates
+        .get(popup.selected)
+        .is_some_and(|c| local.draft == c.name)
+}
+
 fn move_completion_selection(local: &mut LocalUi, delta: i32) {
     let Some(popup) = compute_completion(local) else {
         return;
@@ -856,6 +892,13 @@ fn merge(mut frame: tui::FrameState, local: &LocalUi) -> tui::FrameState {
         let total = frame.transcript.body.entries.len();
         frame.transcript.body.auto_follow = false;
         frame.transcript.body.scroll.offset = offset.min(total.saturating_sub(1));
+    }
+    // 顶上那条 sticky header 只在它钉的那句**已经看不见**时才留着。bridge 无条件
+    // 给出当前 prompt（它不知道视口多高、滚到哪了），可见的时候留着就是同一句话
+    // 在屏幕上出现两次。这一步只有 app 做得了：视口高度和滚动位置都在这边。
+    if prompt_is_visible(&frame, local) {
+        frame.transcript.header.text = None;
+        frame.transcript.header.source = tui::frame_state::HeaderSource::None;
     }
     // 选中的块可能已经不在了（`/clear` 之类），这时当作没选中——本地下标只是个
     // 光标，块的存在与否是 bridge 说了算的。
@@ -1263,6 +1306,46 @@ mod tests {
         ));
     }
 
+    /// 真机跑出来的坑：打全一条命令再回车，应该提交，而不是把弹窗里的同一条
+    /// 再"补"一次（补出来是 `/model ` 带个空格，还得再按一次回车）。
+    #[test]
+    fn enter_submits_when_the_command_is_already_fully_typed() {
+        let mut local = local_with("/model");
+        assert!(compute_completion(&local).is_some(), "弹窗应该开着");
+        assert!(completion_already_typed(&local));
+
+        let handle = FakeHandle::new();
+        dispatch_action(
+            "editor.submit",
+            &mut local,
+            &handle,
+            &frame_without_approval(),
+        );
+        assert!(
+            matches!(handle.commands().as_slice(), [BridgeCommand::Note { .. }]),
+            "应该提交（/model 无参 → 报当前模型），而不是补全；实际: {:?}",
+            handle.commands()
+        );
+        assert_eq!(local.draft, "", "提交后草稿清空");
+    }
+
+    /// 只打了一半时 Enter 仍然是"补全"。
+    #[test]
+    fn enter_still_completes_a_partially_typed_command() {
+        let mut local = local_with("/mod");
+        assert!(!completion_already_typed(&local));
+
+        let handle = FakeHandle::new();
+        dispatch_action(
+            "editor.submit",
+            &mut local,
+            &handle,
+            &frame_without_approval(),
+        );
+        assert_eq!(local.draft, "/model ");
+        assert!(handle.commands().is_empty(), "补全不该发命令给 bridge");
+    }
+
     #[test]
     fn local_commands_show_up_in_the_completion_popup() {
         let popup = compute_completion(&local_with("/mod")).expect("应该有候选");
@@ -1502,6 +1585,50 @@ mod tests {
         assert_eq!(local.cursor, 5);
         local.up();
         assert_eq!(local.draft, "历史里的", "已经在首行，这次才翻历史");
+    }
+
+    /// sticky header 只在它钉的那句滚出视口之后才出现，否则同一句话在屏幕上
+    /// 出现两次（真机跑一眼就看出来了）。
+    #[test]
+    fn the_sticky_header_hides_while_its_prompt_is_still_on_screen() {
+        let mut local = local_with("");
+        local.viewport_lines = 3;
+        let mut frame = frame_without_approval();
+        frame.transcript.header = tui::frame_state::HeaderState {
+            text: Some("问题".into()),
+            source: tui::frame_state::HeaderSource::UserPrompt,
+        };
+        frame.transcript.body.entries = vec![
+            TranscriptEntry {
+                kind: LineKind::UserPrompt,
+                text: "问题".into(),
+                block_id: None,
+            },
+            TranscriptEntry {
+                kind: LineKind::AssistantText,
+                text: "答案".into(),
+                block_id: None,
+            },
+        ];
+
+        assert_eq!(
+            merge(frame.clone(), &local).transcript.header.text,
+            None,
+            "prompt 就在屏幕上，不该再钉一份"
+        );
+
+        // 回答变长，prompt 被挤出视口 → header 该出现了。
+        for i in 0..10 {
+            frame.transcript.body.entries.push(TranscriptEntry {
+                kind: LineKind::AssistantText,
+                text: format!("续{i}"),
+                block_id: None,
+            });
+        }
+        assert_eq!(
+            merge(frame, &local).transcript.header.text.as_deref(),
+            Some("问题")
+        );
     }
 
     /// resume 起手时输入历史接着上次——从转录里恢复出来的用户输入读。

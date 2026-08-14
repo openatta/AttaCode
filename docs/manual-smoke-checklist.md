@@ -3,6 +3,35 @@
 单元测试覆盖不到的东西：raw mode 下的渲染、和真 API 的时序、按键在真实终端里的编码。
 每次动了渲染/事件循环/装配之后跑一遍这份清单。
 
+## 先自动过一遍（不需要 API key）
+
+`scripts/pty_drive.py` 在一个真 pty 里跑 attacode、按脚本喂键、把终端输出回放成
+一屏一屏的文本。没有 API key 也能跑——用一个假 token 起来，除了"真的调模型"以外
+的部分都能验（渲染、按键、编辑、补全、本地命令、错误路径、干净退出）。
+
+```sh
+cargo build -p app
+cat > /tmp/keys.txt <<'KEYS'
+2.0		起手
+0.5	/model\r	提交 /model
+1.5	hello\r	提交一句（假 token → 错误行）
+7.0	\x15\x04	清空后 Ctrl+D 退出
+KEYS
+ANTHROPIC_AUTH_TOKEN=sk-fake TERM=xterm-256color \
+  python3 scripts/pty_drive.py --cols 96 --rows 20 -- ./target/debug/attacode < /tmp/keys.txt
+```
+
+每行 `延迟秒 <TAB> 要发的字节 <TAB> 标签`；`\xHH` 走转义，其余字符原样发。输出是
+每一步按键**之前**的屏幕，屏幕没变化的步骤自动跳过。
+
+两个已经踩过的坑，别重复踩：
+- **别用 `script(1)` 造 pty**——stdin 是管道时它给的窗口大小是 0x0，ratatui 一个字符
+  都不画，看起来像"程序启动后白屏"，其实是量具坏了。
+- 回放要按**东亚宽字符占两格**算，否则每个汉字都会让后面的列错位，屏幕上多出重影。
+
+下面清单里带 🤖 的项目 pty 脚本已经能覆盖，人工跑时可以略过；其余的（流式、工具、
+权限、resume 往返）必须真 API + 真终端。
+
 **准备**
 
 ```sh
@@ -30,18 +59,18 @@ RUST_LOG=debug cargo run -p bridge --example smoke   # 出问题时看 Core 的 
 cargo run -p app
 ```
 
-- [ ] 进入 alt screen，底部有输入框、状态栏显示模型名和 cwd
-- [ ] 输入框光标是那个块（`█`），闪不闪都行，但必须在 `> ` 后面
-- [ ] `Ctrl+D`（空草稿）能退出，终端恢复正常、没有残留的 raw mode（试着敲几个字看回显）
+- [ ] 🤖 进入 alt screen，底部有输入框、状态栏显示模型名和 cwd
+- [ ] 🤖 输入框光标是那个块（`█`），闪不闪都行，但必须在 `> ` 后面
+- [ ] 🤖 `Ctrl+D`（空草稿）能退出（退出码 0），终端恢复正常、没有残留的 raw mode
 
 ## 2. 一轮普通问答
 
 发一句 `用一句话解释 Rust 的所有权`。
 
-- [ ] 用户输入立刻回显（不等 API）
+- [ ] 🤖 用户输入立刻回显（不等 API）
 - [ ] assistant 文本**流式**长出来，不是一次性整段出现
 - [ ] 状态行有 spinner + 走字的秒数 + token 计数
-- [ ] 转录顶部出现 sticky header，钉着你刚才那句问题
+- [ ] 转录顶部出现 sticky header，钉着你刚才那句问题 —— **只在那句已经滚出视口时**；还看得见时不该重复显示 🤖
 - [ ] 结束后 spinner 消失，footer 的累计用量增加
 
 ## 3. 工具调用 + 折叠 + diff
@@ -87,20 +116,20 @@ cargo run -p app
 
 打一段 `git commit -m 修一下中文注释`，然后：
 
-- [ ] `←`/`→` 逐字符移动；中文一次跨一个字，不会卡在半个字上
+- [ ] 🤖 `←`/`→` 逐字符移动；中文一次跨一个字，不会卡在半个字上
 - [ ] `Alt+←`/`Alt+→` 按词跳
-- [ ] `Home`/`End` 到行首/行尾
-- [ ] 光标移到中间时打字**插在光标处**，后面的文字不左右抖
-- [ ] `Delete` 删光标上的字符，`Backspace` 删前一个
-- [ ] `Ctrl+W` 从光标往前删一个词；`Ctrl+K` 删到行尾
+- [ ] 🤖 `Home`/`End` 到行首/行尾
+- [ ] 🤖 光标移到中间时打字**插在光标处**，后面的文字不左右抖
+- [ ] 🤖 `Delete` 删光标上的字符，`Backspace` 删前一个
+- [ ] 🤖 `Ctrl+W` 从光标往前删一个词；`Ctrl+K` 删到行尾
 - [ ] `Shift+Enter` 插换行（输入框长高），`Up`/`Down` 在行间移动且保持列
 - [ ] `Ctrl+U` 清空，`Ctrl+L` 重画屏幕
 
 ## 8. slash 命令 / 补全 / 模型
 
-- [ ] 打 `/` 弹出补全，里面既有 Core 的（`/help` `/compact` …）也有本地的（`/model` `/quit`）
-- [ ] `↑`/`↓` 选，`Enter` 补全（不是提交），`Esc` 关掉且不动草稿
-- [ ] `/model` 回车 → 转录里报当前模型
+- [ ] 🤖 打 `/` 弹出补全，里面既有 Core 的（`/help` `/compact` …）也有本地的（`/model` `/quit`）
+- [ ] 🤖 `↑`/`↓` 选，`Enter` 补全（不是提交），`Esc` 关掉且不动草稿；**已经打全的命令按 Enter 应该直接提交**
+- [ ] 🤖 `/model` 回车 → 转录里报当前模型
 - [ ] `/model claude-sonnet-5` → 状态栏立刻换，转录留一条 note；下一轮真的用新模型（看 smoke 或日志）
 - [ ] `/help` 转发给 Core 并有回应
 - [ ] `/quit` 退出
@@ -119,8 +148,8 @@ cargo run -p app -- --continue   # 或 --resume <session-id>
 
 ## 10. 异常与收尾
 
-- [ ] 故意把 `ANTHROPIC_AUTH_TOKEN` 改错 → 启动报错清楚，不是 panic 或空白屏
-- [ ] 断网发一句 → 转录里是红色 Error 行，TUI 不卡死，还能继续输入
+- [ ] 🤖 不设 `ANTHROPIC_AUTH_TOKEN` → 启动报错清楚（退出码 1），不是 panic 或空白屏
+- [ ] 🤖 凭据/网络出错发一句 → 转录里是红色 Error 行，TUI 不卡死，还能继续输入
 - [ ] 终端窗口拉宽/拉窄 → 布局跟着变，不错位
 - [ ] 退出后 `~/.atta/sessions/<项目>/` 下有本次会话的 jsonl，内容不是空的
 

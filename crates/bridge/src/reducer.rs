@@ -525,10 +525,13 @@ fn restore_turns(messages: Vec<base::message::Message>) -> Vec<Turn> {
             Message::User { content } => {
                 for block in content {
                     match block {
-                        ContentBlock::Text { text, .. } => turns.push(Turn {
-                            id: format!("restored-{}", turns.len()),
-                            blocks: vec![Block::UserPrompt(text)],
-                        }),
+                        ContentBlock::Text { text, .. } => match user_text(&text) {
+                            Some(text) => turns.push(Turn {
+                                id: format!("restored-{}", turns.len()),
+                                blocks: vec![Block::UserPrompt(text)],
+                            }),
+                            None => continue,
+                        },
                         ContentBlock::ToolResult {
                             tool_use_id,
                             content,
@@ -586,6 +589,23 @@ fn restore_turns(messages: Vec<base::message::Message>) -> Vec<Turn> {
         }
     }
     turns
+}
+
+/// 一条历史 `user` 消息里**真正是用户打的**那部分，没有就是 `None`。
+///
+/// Core 会往对话里塞给模型读的上下文——CLAUDE.md、git status、各种提醒——用
+/// `<system-reminder>` 包着，在 jsonl 里和用户敲的字一样是 `user` 消息，
+/// `project_messages` 也照样投影出来。恢复转录时必须滤掉：resume 之后第一屏
+/// 全是那坨 CLAUDE.md，真正的对话被挤到看不见（真机跑一次就发现了）。
+/// 顺带也会污染输入历史——`crates/app` 的历史正是从恢复出来的用户输入里读的。
+fn user_text(text: &str) -> Option<String> {
+    // 提醒块可能整条就是它，也可能跟在真话后面；截到标记为止。
+    let head = match text.find("<system-reminder>") {
+        Some(at) => &text[..at],
+        None => text,
+    };
+    let head = head.trim();
+    (!head.is_empty()).then(|| head.to_string())
 }
 
 /// 把工具结果回填到它的工具块上。找不到对应块时落成一条 note——和实时链路里
@@ -1309,6 +1329,39 @@ mod tests {
             f.transcript.header.text.as_deref(),
             Some("读一下 Cargo.toml")
         );
+    }
+
+    /// Core 塞进对话的 `<system-reminder>` 上下文在 jsonl 里也是 `user` 消息。
+    /// 恢复时必须滤掉：不滤的话 resume 的第一屏全是 CLAUDE.md，真对话被挤没。
+    #[test]
+    fn injected_context_is_not_restored_as_a_user_prompt() {
+        use base::message::{ContentBlock, Message};
+
+        let text = |t: &str| ContentBlock::Text {
+            text: t.into(),
+            cache_control: None,
+        };
+        let history = vec![
+            Message::User {
+                content: vec![text(
+                    "<system-reminder>\n# claudeMd\n一大坨…\n</system-reminder>",
+                )],
+            },
+            Message::User {
+                content: vec![text("\n<system-reminder>M .gitignore</system-reminder>")],
+            },
+            // 真话后面跟一段提醒：留前半截。
+            Message::User {
+                content: vec![text(
+                    "真正的问题\n<system-reminder>别忘了…</system-reminder>",
+                )],
+            },
+        ];
+
+        let (_r, rx) = Reducer::build("m".into(), "/tmp".into(), None, history);
+        let entries = frame(&rx).transcript.body.entries;
+        let texts: Vec<&str> = entries.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(texts, vec!["真正的问题"]);
     }
 
     /// 恢复出来的 turn 用 `restored-N` 做 id，之后的实时事件按自己的 turn_id
