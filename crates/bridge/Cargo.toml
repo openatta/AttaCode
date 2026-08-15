@@ -31,7 +31,9 @@ url         = { workspace = true }
 # 只有 `commands` 的单测需要它——生产路径上技能目录完全由 Core 的
 # `CommandRegistry` 持有，bridge 不再自己装配 `SkillManager`。
 skills    = { workspace = true }
-tokio     = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# `test-util` 给的是假时钟（`time::advance`）——状态行的 500ms tick 靠它测，
+# 不然只能 sleep 真实时间，慢且 flaky。
+tokio     = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 tracing-subscriber = { workspace = true }
 anyhow    = { workspace = true }
 tempfile  = { workspace = true }

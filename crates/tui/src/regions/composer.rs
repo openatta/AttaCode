@@ -356,7 +356,7 @@ fn render_approval_tabs(frame: &mut Frame, area: Rect, state: &ApprovalState) {
     }
     lines.push(Line::from(""));
     let footer = if state.pending.len() > 1 {
-        "Enter=confirm  Esc=deny  Ctrl-Tab=next"
+        "Enter=confirm  Esc=deny  Tab=next"
     } else {
         "Enter=confirm  Esc=deny"
     };

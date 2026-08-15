@@ -126,6 +126,29 @@ run "选中竖条：画在所有行上" crates/tui/src/regions/transcript.rs \
   '(Some(id), Some(sel)) => id == sel,' '(Some(_), Some(_)) => true,' tui
 run "layout：正文高度算错一行" crates/tui/src/layout.rs 'area.height' 'area.height + 1' tui
 
+# ── 新补的那几层 ──
+run "权限 tab：Tab 切了但快照不跟着切" crates/app/src/main.rs \
+  'approval.active_idx = local
+                .approval_active
+                .min(approval.pending.len().saturating_sub(1));' \
+  'approval.active_idx = 0;' app
+run "权限 tab：切换后不复位选项高亮" crates/app/src/main.rs \
+  'local.approval_active = step(local.approval_active, 1, pending);
+            local.approval_selected = 0;' \
+  'local.approval_active = step(local.approval_active, 1, pending);' app
+run "光标：允许落在字符中间" crates/app/src/main.rs \
+  'self.cursor -= prev.len_utf8();' 'self.cursor -= 1;' app
+run "tick：状态行不再刷新" crates/bridge/src/reducer.rs \
+  'refresh_running_status(&mut state);
+        self.broadcast(&state);
+    }
+
+    /// 用户对某个待确认请求做出决定' \
+  'return;
+    }
+
+    /// 用户对某个待确认请求做出决定' bridge
+
 # ── keybindings ──
 run "键位：Alt+Up 改绑到滚动" crates/keybindings/src/defaults.rs \
   'bind(

@@ -15,8 +15,6 @@ use tui::FrameState;
 pub enum BridgeError {
     #[error("engine is no longer running (input channel closed)")]
     EngineStopped,
-    #[error("no pending approval with prompt_id {0}")]
-    UnknownPrompt(String),
 }
 
 /// `app` 层可下发给 bridge 的命令集合。风格上与 `runtime::InputMessage` 对齐。

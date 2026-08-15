@@ -9,8 +9,11 @@ use crate::commands::CommandCatalog;
 use base::interface::event::AgentEvent;
 use runtime::agent::EventReceiver;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+// 不是 `std::time::Instant`：这个认 tokio 的假时钟，于是"状态行秒数在走"
+// 能用 `time::advance` 验，不必 sleep 真实时间（见本文件的 ticker 测试）。
 use tokio::sync::watch;
+use tokio::time::Instant;
 use tui::frame_state::*;
 
 const FOLD_LINE_THRESHOLD: usize = 8;
@@ -1015,41 +1018,92 @@ mod tests {
         assert_eq!(assistant[0].text, "Hello");
     }
 
-    #[test]
-    fn tool_use_and_result_pair_by_id() {
-        let (r, rx) = reducer();
-        let turn_id = r.begin_turn("q".into());
-        r.apply_event(AgentEvent::ToolUse {
-            id: "t1".into(),
-            name: "Read".into(),
-            input: serde_json::json!({"path": "a.rs"}),
-            turn_id: turn_id.clone(),
-        });
-        r.apply_event(AgentEvent::ToolResult {
-            id: "t1".into(),
-            name: "Read".into(),
-            content: "line1".into(),
-            is_error: Some(false),
-            turn_id,
-        });
-        let f = frame(&rx);
-        let heading = f
+    /// `spawn` 起的那两个后台 task 从来没被测过——所有测试都直接调 `apply_event`，
+    /// 把"事件真的从通道流进来、快照真的广播出去"这一段整个绕开了。这里走真链路：
+    /// 往 `EventReceiver` 里塞事件，从 `watch` 那头等广播。
+    #[tokio::test]
+    async fn spawn_consumes_the_event_channel_and_broadcasts_snapshots() {
+        let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (catalog, _cmds) = crate::commands::CommandCatalog::new(Arc::new(
+            runtime::commands::CommandRegistry::new(),
+        ));
+        let (r, mut frame_rx) =
+            Reducer::spawn(event_rx, "m".into(), "/tmp".into(), catalog, Vec::new());
+
+        let turn_id = r.begin_turn("问".into());
+        event_tx
+            .send(AgentEvent::TextDelta {
+                text: "答".into(),
+                turn_id,
+            })
+            .unwrap();
+
+        // 等的是"答出现了"，不是"广播了一次"——`begin_turn` 自己就会广播一次，
+        // 只等一次 `changed()` 会拿到那一帧然后误判。
+        let texts = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let texts: Vec<String> = frame_rx
+                    .borrow()
+                    .transcript
+                    .body
+                    .entries
+                    .iter()
+                    .map(|e| e.text.clone())
+                    .collect();
+                if texts.len() >= 2 {
+                    return texts;
+                }
+                frame_rx.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("事件应该被后台 task 消费并广播");
+        assert_eq!(texts, vec!["问", "答"]);
+    }
+
+    /// 事件通道关掉之后后台 task 就该收工，不该空转——`Agent` 退出时就是这条路。
+    #[tokio::test]
+    async fn the_event_task_ends_when_the_channel_closes() {
+        let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (catalog, _cmds) = crate::commands::CommandCatalog::new(Arc::new(
+            runtime::commands::CommandRegistry::new(),
+        ));
+        let (r, frame_rx) =
+            Reducer::spawn(event_rx, "m".into(), "/tmp".into(), catalog, Vec::new());
+        drop(event_tx);
+        tokio::task::yield_now().await;
+        // 通道关了，reducer 本身照常可用（app 还要靠它显示最后那一屏）。
+        r.note("engine gone".into());
+        assert!(frame_rx
+            .borrow()
             .transcript
             .body
             .entries
             .iter()
-            .find(|e| e.kind == LineKind::ToolHeading)
-            .unwrap();
-        assert_eq!(heading.block_id.as_deref(), Some("t1"));
-        let result = f
-            .transcript
-            .body
-            .entries
-            .iter()
-            .find(|e| e.kind == LineKind::ToolResultOk)
-            .unwrap();
-        assert_eq!(result.text, "line1");
-        assert_eq!(result.block_id.as_deref(), Some("t1"));
+            .any(|e| e.text == "engine gone"));
+    }
+
+    /// 状态行的秒数靠 500ms 的 tick 走字，不靠事件。这条走 tokio 的假时钟：
+    /// 不 sleep 真实时间，也就不会因为机器慢而 flaky。
+    #[tokio::test(start_paused = true)]
+    async fn the_ticker_keeps_the_elapsed_time_moving_without_any_events() {
+        let (_event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (catalog, _cmds) = crate::commands::CommandCatalog::new(Arc::new(
+            runtime::commands::CommandRegistry::new(),
+        ));
+        let (r, frame_rx) =
+            Reducer::spawn(event_rx, "m".into(), "/tmp".into(), catalog, Vec::new());
+        r.begin_turn("跑一个长任务".into());
+
+        let elapsed = |f: &FrameState| match &f.operation_status.status_line.content {
+            Some(StatusContent::TurnRunning { elapsed_secs, .. }) => *elapsed_secs,
+            other => panic!("状态行应该是 TurnRunning，实际: {other:?}"),
+        };
+        assert_eq!(elapsed(&frame_rx.borrow()), 0);
+
+        tokio::time::advance(Duration::from_secs(3)).await;
+        tokio::task::yield_now().await;
+        assert!(elapsed(&frame_rx.borrow()) >= 3, "3 秒之后状态行的秒数没动");
     }
 
     /// 需求场景 5：上一轮还在跑的时候又提交一句。
@@ -1133,6 +1187,14 @@ mod tests {
         };
         assert_eq!(of("t1"), vec!["read 的结果"], "t1 拿到了别人的结果");
         assert_eq!(of("t2"), vec!["grep 的结果"], "t2 拿到了别人的结果");
+
+        // 每个块的标题行也挂着自己的 block_id——展开/折叠和块选择都靠它。
+        let headings: Vec<Option<&str>> = entries
+            .iter()
+            .filter(|e| e.kind == LineKind::ToolHeading)
+            .map(|e| e.block_id.as_deref())
+            .collect();
+        assert_eq!(headings, vec![Some("t1"), Some("t2")]);
     }
 
     /// `Edit` 的结果是"一段摘要 + 一段 unified diff"。摘要保持普通工具结果的样子，

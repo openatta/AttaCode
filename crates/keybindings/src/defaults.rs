@@ -5,8 +5,10 @@
 //! - `editor.*` — input area: cursor, delete, history nav, submit
 //! - `repl.*` — REPL/TUI controls: cancel, exit, scroll, clear
 //! - `ask.*` — ask-dialog navigation: select / confirm / deny
-//! - `transcript.*` — transcript block interaction (fold/expand)
-//! - `slash.*` — fast-path slash commands
+//! - `transcript.*` — transcript block interaction (select / fold / expand)
+//!
+//! 曾经列过一个 `slash.*` 命名空间，从来没有过绑定——slash 命令是打出来的，
+//! 不是按键触发的，已经删掉。
 
 use crate::parser::{KeyCode, Shortcut};
 use crate::{Keybinding, KeybindingSource};
@@ -82,6 +84,11 @@ pub fn default_bindings() -> Vec<Keybinding> {
         bind("Up", "ask.prev", "Previous option in ask-dialog"),
         bind("Down", "ask.next", "Next option in ask-dialog"),
         bind("Enter", "ask.confirm", "Confirm current ask-dialog choice"),
+        bind(
+            "Tab",
+            "ask.next-request",
+            "Switch to the next pending approval",
+        ),
         bind("y", "ask.yes-shortcut", "Quick-yes in ask-dialog"),
         bind("n", "ask.no-shortcut", "Quick-no in ask-dialog"),
     ]
@@ -116,40 +123,6 @@ pub fn unmappable_shortcuts() -> Vec<Shortcut> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::KeyCode;
-
-    #[test]
-    fn defaults_include_ctrl_c_cancel() {
-        let bs = default_bindings();
-        let cancel = bs.iter().find(|b| b.action == "repl.cancel").unwrap();
-        assert_eq!(cancel.chord.len(), 1);
-        assert!(cancel.chord[0].has_ctrl());
-        assert_eq!(cancel.chord[0].key, KeyCode::Char('c'));
-        assert_eq!(cancel.source, KeybindingSource::Default);
-    }
-
-    #[test]
-    fn defaults_include_kill_to_eol() {
-        let bs = default_bindings();
-        let kte = bs
-            .iter()
-            .find(|b| b.action == "editor.kill-to-eol")
-            .unwrap();
-        assert_eq!(kte.chord.len(), 1);
-        assert!(kte.chord[0].has_ctrl());
-        assert_eq!(kte.chord[0].key, KeyCode::Char('k'));
-    }
-
-    #[test]
-    fn defaults_include_f5_toggle_expand() {
-        let bs = default_bindings();
-        let toggle = bs
-            .iter()
-            .find(|b| b.action == "transcript.toggle-expand")
-            .unwrap();
-        assert_eq!(toggle.chord.len(), 1);
-        assert_eq!(toggle.chord[0].key, KeyCode::Function(5));
-    }
 
     #[test]
     fn all_defaults_have_descriptions() {
@@ -202,6 +175,7 @@ mod tests {
             "PageUp = repl.scroll-up",
             "Right = editor.cursor.right",
             "Shift+Enter = editor.newline",
+            "Tab = ask.next-request",
             "Up = ask.prev",
             "Up = editor.history.prev",
             "n = ask.no-shortcut",

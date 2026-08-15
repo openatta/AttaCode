@@ -7,9 +7,9 @@
 //! Composer editing lives in the `impl LocalUi` block near the bottom: insert/delete
 //! at the cursor, char/word/line motion, kill-to-end. `cursor` is a byte index into
 //! `draft` and is always on a char boundary; the renderer indexes the same way, so
-//! neither side converts. Still missing: prompt history recall (the `editor.history.*`
-//! actions are bound but currently drive completion selection and line motion),
-//! selection, and undo.
+//! neither side converts. `editor.history.*`（Up/Down）一键三义，按上下文分派：
+//! 补全弹窗 → 移动选中项；多行草稿 → 行间移动；到边界 → 翻输入历史。
+//! 还缺的是选区和 undo。
 
 use bridge::{BootstrapConfig, BridgeCommand, EngineHandle, Resume, DEFAULT_MODEL};
 use crossterm::event::{
@@ -126,6 +126,9 @@ struct LocalUi {
     /// 权限对话框里高亮的选项下标。和补全选择一样是纯 UI-本地状态：bridge 只知道
     /// 有哪些选项，不知道光标停在哪一项。渲染前由 `merge` 覆盖进快照。
     approval_selected: usize,
+    /// 同时有多个待确认请求时，正在看第几个（Tab 切换）。同样是 UI-本地的：
+    /// bridge 只维护待确认队列本身。渲染前由 `merge` 夹进合法范围。
+    approval_active: usize,
     /// 转录滚动位置：`None` = 跟住底部（新内容自动滚进来），`Some(n)` = 冻在
     /// "跳过前 n 条"的位置不动。滚动位置同样是 UI-本地的——bridge 每帧都会把
     /// `auto_follow` 置回 true，由 `merge` 按这个字段覆盖。
@@ -158,6 +161,7 @@ impl LocalUi {
             completion_selected: 0,
             completion_dismissed: false,
             approval_selected: 0,
+            approval_active: 0,
             scroll_offset: None,
             selected_block: None,
             history: Vec::new(),
@@ -318,8 +322,17 @@ fn dispatch_key(
     // 有待批准的权限请求时，键盘整体归对话框——`FrameState` 那边 composer 已经是
     // `locked`，路由不跟着改的话 Enter 会把草稿提交给一个正卡在权限检查上的引擎。
     if let Some(req) = active_approval(snapshot) {
+        let pending = snapshot
+            .composer
+            .content
+            .approval
+            .as_ref()
+            .map(|a| a.pending.len())
+            .unwrap_or(1);
         return match outcome {
-            ResolveOutcome::Action(action) => dispatch_approval_action(&action, local, handle, req),
+            ResolveOutcome::Action(action) => {
+                dispatch_approval_action(&action, local, handle, req, pending)
+            }
             // 对话框开着时普通字符没有去处（composer 锁着），直接丢。
             _ => true,
         };
@@ -352,8 +365,15 @@ fn dispatch_approval_action(
     local: &mut LocalUi,
     handle: &dyn EngineHandle,
     req: &ApprovalRequest,
+    pending: usize,
 ) -> bool {
     match action {
+        // 多个请求排队时切下一个。渲染那边早就画了 tab 条，但一直没有键能切——
+        // `active_idx` 恒为 0，后面的请求只能等前面的答完才看得见。
+        "ask.next-request" => {
+            local.approval_active = step(local.approval_active, 1, pending);
+            local.approval_selected = 0;
+        }
         "editor.history.prev" | "ask.prev" => {
             local.approval_selected = step(local.approval_selected, -1, req.options.len())
         }
@@ -912,6 +932,10 @@ fn merge(mut frame: tui::FrameState, local: &LocalUi) -> tui::FrameState {
     });
     match &mut frame.composer.content.approval {
         Some(approval) => {
+            // 请求答掉一个就少一个，本地下标可能悬空——夹回去。
+            approval.active_idx = local
+                .approval_active
+                .min(approval.pending.len().saturating_sub(1));
             let active = approval.active_idx;
             if let Some(req) = approval.pending.get_mut(active) {
                 // 越界夹回 0：选项数是 bridge 说了算的，本地下标只是个光标。
@@ -1063,11 +1087,11 @@ mod tests {
         assert_eq!(local.scroll_offset, None);
     }
 
-    /// 这几个键在 `default_bindings()` 里都绑好了，缺的一直是 `dispatch_action`
-    /// 里的分支。走真实 `Resolver` 打一遍，顺带确认它们没像 `ask.*` 那样被同键的
+    /// 走真实 `Resolver` 把键打一遍——绑定表和 `dispatch_action` 的分支是两处，
+    /// 单独看都对、接不上的情况真发生过。顺带确认它们没像 `ask.*` 那样被同键的
     /// 别的动作抢先匹配掉。
     #[test]
-    fn the_newly_handled_keys_actually_reach_their_handlers() {
+    fn keys_reach_their_handlers_through_the_real_resolver() {
         let handle = FakeHandle::new();
         let mut snapshot = frame_without_approval();
         snapshot.transcript.body.entries = (0..100)
@@ -1704,6 +1728,160 @@ mod tests {
         assert_eq!(user_prompts(&frame), vec!["上次问的"]);
     }
 
+    /// 多个待确认请求排队时，Tab 切到下一个。
+    ///
+    /// 渲染那边早就画了 tab 条，但一直没有键能切，`active_idx` 恒为 0——后面的
+    /// 请求只能等前面的答完才看得见。这是审计用例覆盖时发现的**功能**缺口，
+    /// 不是测试缺口。
+    #[test]
+    fn tab_switches_between_pending_approvals() {
+        let mut local = local_with("");
+        let handle = FakeHandle::new();
+        let two = |a: usize| ApprovalState {
+            pending: vec![
+                ApprovalRequest {
+                    prompt_id: "p1".into(),
+                    tool_name: "Bash".into(),
+                    message: "第一个".into(),
+                    options: vec![ApprovalOption::PermitOnce, ApprovalOption::Deny],
+                    selected_option: 0,
+                },
+                ApprovalRequest {
+                    prompt_id: "p2".into(),
+                    tool_name: "Write".into(),
+                    message: "第二个".into(),
+                    options: vec![ApprovalOption::PermitOnce, ApprovalOption::Deny],
+                    selected_option: 0,
+                },
+            ],
+            active_idx: a,
+            view_mode: ApprovalViewMode::TabView,
+        };
+
+        // 先把第一个的选项挪一格，切 tab 之后要复位（不然会带着上一个的高亮）。
+        local.approval_selected = 1;
+        dispatch_approval_action(
+            "ask.next-request",
+            &mut local,
+            &handle,
+            &two(0).pending[0],
+            2,
+        );
+        assert_eq!(local.approval_active, 1);
+        assert_eq!(local.approval_selected, 0, "切 tab 之后选项高亮要复位");
+
+        let mut frame = frame_without_approval();
+        frame.composer.content.approval = Some(two(0));
+        let merged = merge(frame, &local);
+        let approval = merged.composer.content.approval.unwrap();
+        assert_eq!(approval.active_idx, 1, "快照要跟着切");
+        assert_eq!(approval.pending[1].prompt_id, "p2");
+
+        // 环回去。
+        dispatch_approval_action(
+            "ask.next-request",
+            &mut local,
+            &handle,
+            &two(1).pending[1],
+            2,
+        );
+        assert_eq!(local.approval_active, 0);
+    }
+
+    /// 答掉一个之后队列变短，本地下标可能悬空——夹回去，别越界。
+    #[test]
+    fn merge_clamps_the_active_approval_after_one_is_answered() {
+        let mut local = local_with("");
+        local.approval_active = 1;
+        let mut frame = frame_without_approval();
+        frame.composer.content.approval = Some(ApprovalState {
+            pending: vec![ApprovalRequest {
+                prompt_id: "p2".into(),
+                tool_name: "Write".into(),
+                message: "只剩一个了".into(),
+                options: vec![ApprovalOption::Deny],
+                selected_option: 0,
+            }],
+            active_idx: 1,
+            view_mode: ApprovalViewMode::TabView,
+        });
+        let merged = merge(frame, &local);
+        assert_eq!(merged.composer.content.approval.unwrap().active_idx, 0);
+    }
+
+    // ── 编辑器不变量（随机操作序列）──
+
+    /// 一个确定性的小 PRNG。不拉 `rand`/`proptest` 依赖：这里只需要"每次跑都一样、
+    /// 但看起来乱"的一串数，随机数质量无所谓；确定性反而是优点——挂了能原样复现。
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self, n: usize) -> usize {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (self.0 >> 33) as usize % n
+        }
+    }
+
+    /// 随便怎么敲，编辑器都不能崩，`cursor` 也不能落到字符中间。
+    ///
+    /// 这两条是所有行内编辑操作共同的前提（`draft.insert/remove` 落在非边界上直接
+    /// panic），单独给每个操作写用例覆盖不到组合出来的状态。用固定种子跑几千步。
+    #[test]
+    fn any_sequence_of_edits_keeps_the_cursor_on_a_char_boundary() {
+        let charset = ['a', '重', '\n', ' ', '构', 'Z', '，'];
+        for seed in [1u64, 42, 9999] {
+            let mut rng = Lcg(seed);
+            let mut local = local_with("");
+            for step in 0..2000 {
+                match rng.next(11) {
+                    0 => local.insert(charset[rng.next(charset.len())]),
+                    1 => local.delete_backward(),
+                    2 => local.delete_forward(),
+                    3 => local.move_char(-1),
+                    4 => local.move_char(1),
+                    5 => local.move_word(-1),
+                    6 => local.move_word(1),
+                    7 => local.cursor = local.line_start(),
+                    8 => local.cursor = local.line_end(),
+                    9 => local.delete_word_before(),
+                    _ => local.kill_to_line_end(),
+                }
+                assert!(
+                    local.draft.is_char_boundary(local.cursor),
+                    "seed {seed} 第 {step} 步之后 cursor={} 落在了字符中间: {:?}",
+                    local.cursor,
+                    local.draft
+                );
+                assert!(
+                    local.cursor <= local.draft.len(),
+                    "seed {seed} 第 {step} 步之后 cursor 越界"
+                );
+            }
+        }
+    }
+
+    /// 行间移动同样不能把光标搁在字符中间——保列时是按字符数算的，容易在
+    /// 多字节行之间算歪。
+    #[test]
+    fn vertical_motion_also_keeps_the_cursor_on_a_char_boundary() {
+        let mut rng = Lcg(7);
+        let mut local = local_with("");
+        local.draft = "abc\n重构模块\nx\n，，，\nlonger line here".into();
+        local.cursor = 0;
+        for step in 0..500 {
+            match rng.next(4) {
+                0 => local.move_line(-1),
+                1 => local.move_line(1),
+                2 => local.move_char(1),
+                _ => local.move_char(-1),
+            }
+            assert!(
+                local.draft.is_char_boundary(local.cursor),
+                "第 {step} 步之后 cursor={} 落在了字符中间",
+                local.cursor
+            );
+        }
+    }
+
     /// 光标在中间时提交，整段草稿都要发出去，光标复位。
     #[test]
     fn submitting_from_mid_draft_sends_the_whole_draft() {
@@ -1789,9 +1967,9 @@ mod tests {
         let handle = FakeHandle::new();
         let req = approval_request();
 
-        dispatch_approval_action("editor.history.next", &mut local, &handle, &req);
-        dispatch_approval_action("editor.history.next", &mut local, &handle, &req);
-        dispatch_approval_action("editor.submit", &mut local, &handle, &req);
+        dispatch_approval_action("editor.history.next", &mut local, &handle, &req, 1);
+        dispatch_approval_action("editor.history.next", &mut local, &handle, &req, 1);
+        dispatch_approval_action("editor.submit", &mut local, &handle, &req, 1);
 
         assert_eq!(handle.decisions(), vec![ApprovalOption::PermitProject]);
         assert_eq!(local.approval_selected, 0, "下一个请求应该从头开始");
@@ -1803,11 +1981,11 @@ mod tests {
         let handle = FakeHandle::new();
         let req = approval_request();
 
-        dispatch_approval_action("ask.prev", &mut local, &handle, &req);
+        dispatch_approval_action("ask.prev", &mut local, &handle, &req, 1);
         assert_eq!(local.approval_selected, 3, "从第一项往上应该绕到最后一项");
 
-        dispatch_approval_action("ask.yes-shortcut", &mut local, &handle, &req);
-        dispatch_approval_action("ask.no-shortcut", &mut local, &handle, &req);
+        dispatch_approval_action("ask.yes-shortcut", &mut local, &handle, &req, 1);
+        dispatch_approval_action("ask.no-shortcut", &mut local, &handle, &req, 1);
         assert_eq!(
             handle.decisions(),
             vec![ApprovalOption::PermitOnce, ApprovalOption::Deny]
@@ -1818,7 +1996,7 @@ mod tests {
     fn escape_denies_rather_than_leaving_the_tool_call_hanging() {
         let mut local = local_with("");
         let handle = FakeHandle::new();
-        dispatch_approval_action("repl.dismiss", &mut local, &handle, &approval_request());
+        dispatch_approval_action("repl.dismiss", &mut local, &handle, &approval_request(), 1);
         assert_eq!(handle.decisions(), vec![ApprovalOption::Deny]);
     }
 
