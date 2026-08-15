@@ -163,6 +163,15 @@ run "对话框挤不下时不裁剪（回到修之前，按键提示被切掉）
   'Paragraph::new(fit_card(head, body, tail, inner.height)),' \
   'Paragraph::new({ let mut all = head; all.extend(body); all.extend(tail); all }),' tui
 
+run "子代理：收尾括号无条件写 Done（洗白失败）" crates/bridge/src/reducer.rs \
+  'a.state = match outcome.as_str() {
+                    "failed" => SubAgentState::Failed,
+                    _ => SubAgentState::Done,
+                };' \
+  'a.state = SubAgentState::Done;' bridge
+run "子代理：收尾括号覆盖掉子代理自己的 stop_reason" crates/bridge/src/reducer.rs \
+  'a.outcome.get_or_insert(outcome);' 'a.outcome = Some(outcome);' bridge
+
 # ── keybindings ──
 run "键位：Alt+Up 改绑到滚动" crates/keybindings/src/defaults.rs \
   'bind(

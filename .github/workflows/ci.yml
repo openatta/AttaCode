@@ -26,6 +26,14 @@ jobs:
         with:
           submodules: recursive
 
+      # `git submodule update` 把 core/ 留在 detached HEAD 上——这是子模块的常态，
+      # 但 AttaCore 有个测试（frozen::tests::detects_git_repo_in_a_real_repo）断言
+      # `git symbolic-ref --short HEAD` 能出东西，detached 时它必挂。跟我们的代码
+      # 无关，纯粹是那个测试假设了"HEAD 接在分支上"。
+      # 已报给 AttaCore（见 scripts/core-issues.md），那边改完这一步就能删。
+      - name: Attach the submodule HEAD to a branch (AttaCore test workaround)
+        run: git -C core checkout -B ci-detached-head-workaround HEAD
+
       # rustup is preinstalled on GitHub-hosted runners; we just need to
       # ensure stable + components are present.
       - name: Configure Rust toolchain

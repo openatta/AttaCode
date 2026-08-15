@@ -24,10 +24,16 @@
 > 本文只把粘合层接到"转录 + 状态行 + 权限 + 用量"这几处，`FrameState` 另外几个
 > 字段当时留了默认值。它们现在也接上了，记录数据来源，免得下次又被当成"没接线"：
 >
-> - **子代理条**：键是 `SubagentProgress.agent_label`，不是 `AgentSpawned.agent_id`
->   ——全仓搜下来 Core **从不发** `AgentSpawned`/`AgentCompleted`（只有同名的
->   telemetry payload），子代理唯一的实时信号就是 `SubagentProgress`；`token_usage`
->   来自它转发的子代理 `TurnComplete.usage`。那两个变体仍照接，以防哪天真发。
+> - **子代理条**：键是那个 `agent_label`，`AgentSpawned.agent_id` /
+>   `AgentCompleted.agent_id` / `SubagentProgress.agent_label` 三者同值，落一行。
+>   三种事件分工不同：spawn/complete 是父时间线上的括号，`SubagentProgress` 是子代理
+>   自己那条流被转发过来；`token_usage` **只能**从后者拿（括号里没有 token 数）。
+>   `AgentCompleted` **最后到**，且带的是委派层面的判词（`completed`/`failed`/
+>   `cancelled`），所以只拿它定状态、不拿它覆盖已有的 outcome 文本——屏幕上
+>   `end_turn` 比 `completed` 有信息量，而无条件写 `Done` 会把失败的子代理洗白。
+>
+>   > AttaCore v0.1.1 之前那两个变体是**声明了没人发**的死 API，边界只能从
+>   > `agent_label` 反推。反推那条路留着：`SubagentProgress` 先到就先建行。
 > - **任务清单区**：来自 `TodoWrite` 工具调用的 **input**（`{"todos":[…]}`）。Core
 >   没有"清单变了"这类事件，清单是那个工具私有的数据结构，所以这里只认这一个工具名
 >   （和 diff 渲染的"按内容认"相反）。

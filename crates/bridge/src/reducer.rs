@@ -90,12 +90,17 @@ struct PendingApproval {
 
 /// 子代理条上的一行。
 ///
-/// **键是 `SubagentProgress.agent_label`**（`explore#3f2a1b7c` 那种），不是
-/// `AgentSpawned.agent_id`：全仓搜下来 Core 根本没有发过 `AgentSpawned`/
-/// `AgentCompleted`（只有同名的 telemetry payload），子代理唯一的实时信号就是
-/// `SubagentProgress` —— 它把子代理自己的事件流原样转发到父通道上。用量也只能
-/// 从这里来：转发过来的 `TurnComplete` 里带子代理这一轮的 `usage`。
-/// 那两个变体仍然照接，万一哪天 Core 真发了，它们按 `agent_id` 落到同一张表里。
+/// **键是那个 `agent_label`**（`explore#3f2a1b7c` 那种）。三种事件共用它：
+/// `AgentSpawned.agent_id` / `AgentCompleted.agent_id` / `SubagentProgress.agent_label`
+/// 是同一个串，所以不用额外记账就能落到同一行上。
+///
+/// 三者分工不同，缺一不可：spawn/complete 是**父时间线**上的括号（这里开始委派、
+/// 这里结束），`SubagentProgress` 是子代理自己那条流被原样转发过来。用量只能从
+/// 后者拿——转发过来的 `TurnComplete` 里带子代理这一轮的 `usage`，括号里没有。
+///
+/// > AttaCore v0.1.1 之前 spawn/complete 是**声明了但没人发**的死变体（同名的
+/// > telemetry payload 是另一条通道），子代理边界只能从 `agent_label` 反推。
+/// > 现在真发了，反推那条路留着也无妨：`SubagentProgress` 先到就先建行。
 struct SubAgentInfo {
     id: String,
     state: SubAgentState,
@@ -434,12 +439,23 @@ impl Reducer {
             AgentEvent::AgentSpawned { agent_id, .. } => {
                 sub_agent(&mut state.sub_agents, &agent_id);
             }
+            // 这一对是**父时间线**上的括号，`agent_id` 和 `SubagentProgress` 的
+            // `agent_label` 是同一个串，所以两边落在同一行上。
+            //
+            // `AgentCompleted` **最后到**，而它带的 outcome 是委派层面的判词
+            // （`completed`/`failed`/`cancelled`），比子代理自己那条 `stop_reason`
+            // 粗。所以这里只用它定**状态**，不拿它覆盖已经有的 outcome 文本——
+            // 屏幕上 `end_turn` 比 `completed` 有信息量。失败/取消必须照实标出来：
+            // 无条件写 Done 会把一个刚 Failed 的子代理抹成正常结束。
             AgentEvent::AgentCompleted {
                 agent_id, outcome, ..
             } => {
                 let a = sub_agent(&mut state.sub_agents, &agent_id);
-                a.state = SubAgentState::Done;
-                a.outcome = Some(outcome);
+                a.state = match outcome.as_str() {
+                    "failed" => SubAgentState::Failed,
+                    _ => SubAgentState::Done,
+                };
+                a.outcome.get_or_insert(outcome);
             }
             // 子代理把自己的整条事件流转发到父通道上。这里只取子代理条要的三件事，
             // 不把子代理的文本灌进父转录——那是另一个层级的内容，混在一起会让
@@ -1420,9 +1436,12 @@ mod tests {
         );
     }
 
-    /// 子代理条的数据只能从 `SubagentProgress` 来：Core 从不发 `AgentSpawned`/
-    /// `AgentCompleted`（全仓只有同名的 telemetry payload），用量也只在转发过来的
-    /// `TurnComplete` 里。以前这条事件被整个丢掉，于是子代理条永远是空的。
+    /// 用量**只能**从 `SubagentProgress` 来：父时间线上的 spawn/complete 括号里
+    /// 没有 token 数，只有转发过来的 `TurnComplete` 带子代理这一轮的 `usage`。
+    /// 以前这条事件被整个丢掉，于是子代理条永远是空的。
+    ///
+    /// 这里故意不发 `AgentSpawned` —— `SubagentProgress` 先到就得先建行（真跑时
+    /// 两条来自不同的发送点，谁先到不该由我们赌）。
     #[test]
     fn subagent_progress_drives_the_bar_including_token_usage() {
         let (r, rx) = reducer();
@@ -1461,6 +1480,106 @@ mod tests {
         assert_eq!(bar[0].state, SubAgentState::Done);
         assert_eq!(bar[0].token_usage, 150, "用量来自转发过来的 TurnComplete");
         assert_eq!(bar[0].elapsed_or_status, "end_turn");
+    }
+
+    /// AttaCore v0.1.1 起 `AgentSpawned`/`AgentCompleted` 真的会发了。这条钉的是
+    /// 三种事件按**真实顺序**（spawn → progress → complete）走完，落在同一行上，
+    /// 而且最后那条括号**不会把已有的 outcome 覆盖掉**：`end_turn` 是子代理自己的
+    /// stop_reason，比委派层面的 `completed` 有信息量，屏幕上要留前者。
+    #[test]
+    fn the_spawn_complete_bracket_and_the_forwarded_stream_land_on_one_row() {
+        let (r, rx) = reducer();
+        let turn_id = r.begin_turn("查一下".into());
+        let label = "explore#3f2a1b7c";
+
+        r.apply_event(AgentEvent::AgentSpawned {
+            agent_id: label.into(),
+            parent_turn: 1,
+            turn_id: "s1".into(),
+        });
+        let bar = frame(&rx).sub_agent_bar.agents;
+        assert_eq!(bar.len(), 1, "spawn 自己就该把行建出来");
+        assert_eq!(bar[0].name, label);
+
+        r.apply_event(AgentEvent::SubagentProgress {
+            agent_label: label.into(),
+            agent_session_id: "s1".into(),
+            agent_type: Some("explore".into()),
+            parent_session_id: "p1".into(),
+            parent_turn: 1,
+            event: Box::new(AgentEvent::TurnComplete {
+                stop_reason: "end_turn".into(),
+                api_calls: 1,
+                tool_calls: 2,
+                usage: base::interface::model::Usage {
+                    input_tokens: 120,
+                    output_tokens: 30,
+                },
+                turn_id,
+            }),
+        });
+
+        r.apply_event(AgentEvent::AgentCompleted {
+            agent_id: label.into(),
+            outcome: "completed".into(),
+            turn_id: "s1".into(),
+        });
+
+        let bar = frame(&rx).sub_agent_bar.agents;
+        assert_eq!(bar.len(), 1, "三种事件是同一个 label，不该分成两行");
+        assert_eq!(bar[0].state, SubAgentState::Done);
+        assert_eq!(bar[0].token_usage, 150);
+        assert_eq!(
+            bar[0].elapsed_or_status, "end_turn",
+            "委派层面的 completed 不该盖掉子代理自己的 stop_reason"
+        );
+    }
+
+    /// 失败的子代理必须照实标成 Failed。
+    ///
+    /// `AgentCompleted` 是**最后到**的那条，无条件写 `Done` 就会把一个刚报错的
+    /// 子代理抹成正常结束——屏幕上看不出出过事。这在 Core 真发这对事件之前是
+    /// 摸不到的死路径，所以以前没人发现。
+    #[test]
+    fn a_failed_sub_agent_is_not_whitewashed_by_the_closing_bracket() {
+        let (r, rx) = reducer();
+        let turn_id = r.begin_turn("查一下".into());
+        let label = "explore#deadbeef";
+
+        r.apply_event(AgentEvent::AgentSpawned {
+            agent_id: label.into(),
+            parent_turn: 1,
+            turn_id: "s1".into(),
+        });
+        r.apply_event(AgentEvent::SubagentProgress {
+            agent_label: label.into(),
+            agent_session_id: "s1".into(),
+            agent_type: Some("explore".into()),
+            parent_session_id: "p1".into(),
+            parent_turn: 1,
+            event: Box::new(AgentEvent::Error {
+                code: "turn_error".into(),
+                message: "delegation depth limit reached\n还有第二行".into(),
+                turn_id,
+            }),
+        });
+        assert_eq!(
+            frame(&rx).sub_agent_bar.agents[0].state,
+            SubAgentState::Failed
+        );
+
+        r.apply_event(AgentEvent::AgentCompleted {
+            agent_id: label.into(),
+            outcome: "failed".into(),
+            turn_id: "s1".into(),
+        });
+
+        let bar = frame(&rx).sub_agent_bar.agents;
+        assert_eq!(bar[0].state, SubAgentState::Failed, "收尾括号不许洗白失败");
+        assert_eq!(
+            bar[0].elapsed_or_status, "delegation depth limit reached",
+            "留着报错原文的第一行，别换成 failed"
+        );
     }
 
     /// 待办清单区的数据来自 `TodoWrite` 的入参——Core 没有"清单变了"这种事件。
