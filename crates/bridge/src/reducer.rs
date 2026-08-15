@@ -1052,6 +1052,45 @@ mod tests {
         assert_eq!(result.block_id.as_deref(), Some("t1"));
     }
 
+    /// 需求场景 5：上一轮还在跑的时候又提交一句。
+    ///
+    /// 排队本身是 Core 的语义（`Agent::run` 是串行 `recv → process_turn`），
+    /// 这里守的是**转录别串行错乱**：后到的第一轮增量必须落回第一轮那个块，
+    /// 而不是追加到刚开的新 turn 上。以前这条路径一个测试都没有。
+    #[test]
+    fn a_second_prompt_while_the_first_turn_is_still_streaming() {
+        let (r, rx) = reducer();
+        let first = r.begin_turn("第一句".into());
+        r.apply_event(AgentEvent::TextDelta {
+            text: "第一轮答".into(),
+            turn_id: first.clone(),
+        });
+        // 还没等到 TurnComplete 就又发了一句。
+        let second = r.begin_turn("第二句".into());
+        // 第一轮的后续增量这时才到。
+        r.apply_event(AgentEvent::TextDelta {
+            text: "案".into(),
+            turn_id: first,
+        });
+        r.apply_event(AgentEvent::TextDelta {
+            text: "第二轮答案".into(),
+            turn_id: second,
+        });
+
+        let texts: Vec<String> = frame(&rx)
+            .transcript
+            .body
+            .entries
+            .iter()
+            .map(|e| e.text.clone())
+            .collect();
+        assert_eq!(
+            texts,
+            vec!["第一句", "第一轮答案", "第二句", "第二轮答案"],
+            "两轮的内容不能串在一起"
+        );
+    }
+
     /// 并发的两次工具调用：结果按 `id` 各回各家。
     ///
     /// 原来只有"一个工具块"的测试——那种情况下"按 id 配对"和"谁在前给谁"行为

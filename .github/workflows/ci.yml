@@ -19,7 +19,12 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
+      # **必须**带上 submodule：整个 workspace 的依赖都是 `path = "core/crates/*"`，
+      # core/ 是空目录的话 cargo 连清单都读不出来，`cargo test` 一步都走不到。
+      # 这一行从初始提交起就漏了，等于 CI 从来没真正跑过。
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       # rustup is preinstalled on GitHub-hosted runners; we just need to
       # ensure stable + components are present.
