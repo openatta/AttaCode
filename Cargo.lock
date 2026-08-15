@@ -224,6 +224,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-util",
+ "tools",
  "tracing",
  "tracing-subscriber",
  "tui",

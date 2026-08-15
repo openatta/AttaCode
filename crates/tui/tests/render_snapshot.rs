@@ -207,8 +207,6 @@ fn an_open_approval_dialog_locks_the_composer() {
         active_idx: 0,
         view_mode: ApprovalViewMode::TabView,
     });
-    // 终端要够高：对话框 + 输入框 + footer 抢的是同一片纵向空间，
-    // 12 行时对话框自己的提示行会被裁掉（见下面那条窄屏用例）。
     let screen = draw_at(&f, W, 16).join("\n");
     for expected in [
         "│Bash:",
@@ -219,6 +217,36 @@ fn an_open_approval_dialog_locks_the_composer() {
         assert!(screen.contains(expected), "缺 {expected:?}:\n{screen}");
     }
     assert!(!screen.contains('█'), "锁住时不该画光标:\n{screen}");
+}
+
+/// 终端矮到放不下整张卡片时，**先砍说明文字**——选项和按键提示必须活下来，
+/// 否则用户面对一个不知道怎么答的对话框。被砍的地方留个 `…`。
+#[test]
+fn a_cramped_approval_dialog_keeps_the_options_and_the_key_hint() {
+    let mut f = base();
+    f.composer.content.editor.locked = true;
+    f.composer.content.approval = Some(ApprovalState {
+        pending: vec![ApprovalRequest {
+            prompt_id: "p1".into(),
+            tool_name: "Bash".into(),
+            message: (1..=8)
+                .map(|i| format!("说明第{i}行"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            options: vec![ApprovalOption::PermitOnce, ApprovalOption::Deny],
+            selected_option: 0,
+        }],
+        active_idx: 0,
+        view_mode: ApprovalViewMode::TabView,
+    });
+    let screen = draw_at(&f, W, 12).join("\n");
+    for expected in ["Bash:", "❯ Yes", "No", "Enter=confirm  Esc=deny", "…"] {
+        assert!(screen.contains(expected), "缺 {expected:?}:\n{screen}");
+    }
+    assert!(
+        !screen.contains("说明第8行"),
+        "挤不下时该砍的是说明文字:\n{screen}"
+    );
 }
 
 /// 多个待确认请求：顶上出现 tab 条，当前那个高亮，提示里给出切换键。

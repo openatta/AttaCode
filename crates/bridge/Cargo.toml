@@ -15,6 +15,7 @@ model       = { workspace = true }
 runtime     = { workspace = true }
 scene       = { workspace = true }
 permissions = { workspace = true }
+tools       = { workspace = true }
 compaction  = { workspace = true }
 history     = { workspace = true }
 session     = { workspace = true }

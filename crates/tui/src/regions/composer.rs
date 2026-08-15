@@ -328,14 +328,16 @@ fn render_approval_tabs(frame: &mut Frame, area: Rect, state: &ApprovalState) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let mut lines = vec![Line::from(Span::styled(
+    let head = vec![Line::from(Span::styled(
         format!("{}:", req.tool_name),
         Style::default().add_modifier(Modifier::BOLD),
     ))];
+    let mut body: Vec<Line<'static>> = Vec::new();
     for l in req.message.lines() {
-        lines.push(Line::from(format!("  {l}")));
+        body.push(Line::from(format!("  {l}")));
     }
-    lines.push(Line::from(""));
+    body.push(Line::from(""));
+    let mut tail: Vec<Line<'static>> = Vec::new();
     for (i, opt) in req.options.iter().enumerate() {
         let marker = if i == req.selected_option {
             "❯ "
@@ -349,22 +351,57 @@ fn render_approval_tabs(frame: &mut Frame, area: Rect, state: &ApprovalState) {
         } else {
             Style::default()
         };
-        lines.push(Line::from(Span::styled(
+        tail.push(Line::from(Span::styled(
             format!("  {marker}{}", opt.label()),
             style,
         )));
     }
-    lines.push(Line::from(""));
+    tail.push(Line::from(""));
     let footer = if state.pending.len() > 1 {
         "Enter=confirm  Esc=deny  Tab=next"
     } else {
         "Enter=confirm  Esc=deny"
     };
-    lines.push(Line::from(Span::styled(
+    tail.push(Line::from(Span::styled(
         format!("  {footer}"),
         Style::default().fg(COLOR_SECONDARY),
     )));
-    frame.render_widget(Paragraph::new(lines), inner);
+    frame.render_widget(
+        Paragraph::new(fit_card(head, body, tail, inner.height)),
+        inner,
+    );
+}
+
+/// 高度不够时**先砍说明文字**，别砍选项和最后那行按键提示。
+///
+/// 原来是把整卡片交给 `Paragraph` 从下往上截——终端矮一点，被截掉的正好是
+/// "Enter=confirm  Esc=deny" 那行，于是用户面对一个不知道怎么答的对话框。
+/// 选项和提示是**操作说明**，说明文字是上下文：挤的时候后者让路，并留一个 `…`
+/// 说明这里被截了（而不是假装消息就这么短）。
+fn fit_card(
+    head: Vec<Line<'static>>,
+    body: Vec<Line<'static>>,
+    tail: Vec<Line<'static>>,
+    height: u16,
+) -> Vec<Line<'static>> {
+    let height = height as usize;
+    let must = head.len() + tail.len();
+    let mut out = head;
+    if must + body.len() <= height {
+        out.extend(body);
+    } else {
+        // 给说明文字留下的行数（最后一行用来放省略号）。
+        let room = height.saturating_sub(must);
+        if room > 0 {
+            out.extend(body.into_iter().take(room - 1));
+            out.push(Line::from(Span::styled(
+                "  …",
+                Style::default().fg(COLOR_SECONDARY),
+            )));
+        }
+    }
+    out.extend(tail);
+    out
 }
 
 fn render_approval_list(frame: &mut Frame, area: Rect, state: &ApprovalState) {

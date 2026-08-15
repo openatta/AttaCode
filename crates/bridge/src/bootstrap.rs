@@ -262,6 +262,21 @@ pub async fn build_agent(config: &BootstrapConfig) -> Result<BuiltEngine, Bootst
     let scene: Arc<dyn base::interface::scene::AgentScene> =
         Arc::new(scene::scene::coding::CodingScene);
 
+    // 工具注册表。**不注册的后果是静默的**：`Builder::build()` 自己只挂上
+    // `Agent`/`Skill`/`Cron*`/`Task*` 那几个，Read/Write/Edit/Bash/Grep/Glob/
+    // TodoWrite 全都不在。而场景的 system prompt 照旧告诉模型"你有这些工具"，
+    // 于是模型开开心心调 `Read`，拿回一句 `Tool not found: Read`，然后自己想办法
+    // 绕（派子代理去读文件）。没有报错、没有警告，只有"这个 agent 怎么这么笨"。
+    // 真跑第一条读文件的提示词就撞上了。
+    //
+    // `register_web_search` 单独一步：选哪个 search provider 要看解析完的
+    // settings（端点 + 凭据），所以 `register_builtin_tools` 里放不下。场景的
+    // 工具白名单和注册表取交集，不注册就是"模型根本看不到"。
+    // 和 `core/daemon/src/session_pool.rs` 的装配顺序一致。
+    let tools = Arc::new(base::tool::InMemoryToolRegistry::new());
+    tools::register_builtin_tools(&tools);
+    tools::register_web_search(&tools, &settings);
+
     // 权限门。默认模式是"没有规则命中就问"——工具自判允许的调用（只读工具、项目内的
     // Write/Edit）照旧静默通过，其余会走 `PermissionOutcome::Prompt` →
     // `AgentEvent::PermissionPrompt` → TUI 对话框 → `InputMessage::PermissionResponse`。
@@ -305,6 +320,7 @@ pub async fn build_agent(config: &BootstrapConfig) -> Result<BuiltEngine, Bootst
         .model(model)
         .permission(permission)
         .session_id(session_id.clone())
+        .tools(tools)
         .settings(settings);
     // 有落盘后端时，`SessionManager` 每个 turn 结束增量追加一次 jsonl；没有就纯内存
     // （`Builder` 的默认行为），进程一退全丢。顺带一提，会话记忆边车

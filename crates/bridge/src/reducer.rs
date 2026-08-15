@@ -29,6 +29,9 @@ pub struct Reducer {
     /// （`EventReceiver` 是 mpsc，分不出第二个订阅方），所以这件事只能挂在这里。
     /// 单测里为 `None`——它们不关心补全弹窗。
     commands: Option<Arc<CommandCatalog>>,
+    /// 打点（`ATTACODE_TRACE=<路径>` 才开）。挂在这里是因为这里是 `FrameState`
+    /// 唯一的产地——每一帧都要经过 `broadcast`，一个都漏不掉。
+    trace: Option<crate::trace::Trace>,
 }
 
 struct DomainState {
@@ -160,6 +163,7 @@ impl Reducer {
             state: Mutex::new(initial),
             frame_tx,
             commands,
+            trace: crate::trace::Trace::from_env(),
         });
         (reducer, frame_rx)
     }
@@ -169,6 +173,24 @@ impl Reducer {
     #[cfg(test)]
     pub(crate) fn build_for_test() -> (Arc<Self>, watch::Receiver<FrameState>) {
         Self::build("test-model".into(), "/tmp".into(), None, Vec::new())
+    }
+
+    /// 给 app 用：把**真正要渲染的那一帧**记一笔。
+    ///
+    /// bridge 这边打的点只到"Core 给了什么"为止——选中块、滚动位置、草稿、补全
+    /// 弹窗都是 app 在 `merge` 里覆盖上去的，bridge 根本看不见。只打 bridge 那一
+    /// 侧的话，报告会把"块选中态从没有过内容"报成红的，而屏幕上明明标着竖条。
+    pub fn trace_render(&self, frame: &FrameState) {
+        if let Some(trace) = &self.trace {
+            trace.record("render", frame);
+        }
+    }
+
+    /// 给 app 用：记一次按键（诊断用，`ATTACODE_TRACE` 没开就是空操作）。
+    pub fn trace_key(&self, key: &str, outcome: &str) {
+        if let Some(trace) = &self.trace {
+            trace.record_key(key, outcome);
+        }
     }
 
     /// 用户提交文本：立即回显为一个新 turn（UserPrompt 块），返回生成的 turn_id
@@ -267,6 +289,8 @@ impl Reducer {
     }
 
     fn apply_event(&self, event: AgentEvent) {
+        // 打点要的事件名。在 `match` 消费掉 `event` 之前先取出来。
+        let event_name = event_name(&event);
         let mut state = self.state.lock().unwrap();
         match event {
             AgentEvent::TextDelta { text, turn_id } => {
@@ -456,11 +480,20 @@ impl Reducer {
                 state.status = None;
             }
         }
-        self.broadcast(&state);
+        self.broadcast_as(&event_name, &state);
     }
 
     fn broadcast(&self, state: &DomainState) {
-        let _ = self.frame_tx.send(render(state));
+        self.broadcast_as("local", state)
+    }
+
+    /// 广播一帧，并打一个点。`what` 是触发它的事件名，只给打点看。
+    fn broadcast_as(&self, what: &str, state: &DomainState) {
+        let frame = render(state);
+        if let Some(trace) = &self.trace {
+            trace.record(what, &frame);
+        }
+        let _ = self.frame_tx.send(frame);
     }
 }
 
@@ -689,6 +722,32 @@ fn push_note(turns: &mut Vec<Turn>, message: String) {
     }
 }
 
+/// 事件的类型名，只给打点用。`AgentEvent` 没有 `Display`，也不该为了打点给它加。
+fn event_name(event: &AgentEvent) -> String {
+    let name = match event {
+        AgentEvent::TextDelta { .. } => "TextDelta",
+        AgentEvent::ThinkingDelta { .. } => "ThinkingDelta",
+        AgentEvent::ToolUse { name, .. } => return format!("ToolUse:{name}"),
+        AgentEvent::ToolResult { name, .. } => return format!("ToolResult:{name}"),
+        AgentEvent::PermissionPrompt { .. } => "PermissionPrompt",
+        AgentEvent::TurnComplete { .. } => "TurnComplete",
+        AgentEvent::SystemInit { .. } => "SystemInit",
+        AgentEvent::System { .. } => "System",
+        AgentEvent::CompactAction { .. } => "CompactAction",
+        AgentEvent::SessionChanged { .. } => "SessionChanged",
+        AgentEvent::SessionPersisted { .. } => "SessionPersisted",
+        AgentEvent::SkillsChanged { .. } => "SkillsChanged",
+        AgentEvent::AgentSpawned { .. } => "AgentSpawned",
+        AgentEvent::AgentCompleted { .. } => "AgentCompleted",
+        AgentEvent::SubagentProgress { event, .. } => {
+            return format!("SubagentProgress({})", event_name(event))
+        }
+        AgentEvent::TeamProgress { .. } => "TeamProgress",
+        AgentEvent::Error { .. } => "Error",
+    };
+    name.to_string()
+}
+
 /// 按 id/label 找子代理，没有就建一个（`SubagentProgress` 的第一次出现就是"它开始了"，
 /// 不需要另一个 spawn 事件）。
 fn sub_agent<'a>(agents: &'a mut Vec<SubAgentInfo>, id: &str) -> &'a mut SubAgentInfo {
@@ -903,17 +962,19 @@ fn push_block_entries(entries: &mut Vec<TranscriptEntry>, block: &Block) {
                     });
                 }
                 for (i, line) in lines.iter().enumerate() {
+                    let kind = kind(i, line);
                     entries.push(TranscriptEntry {
-                        kind: kind(i, line),
-                        text: line.to_string(),
+                        kind,
+                        text: strip_diff_marker(kind, line),
                         block_id: Some(id.clone()),
                     });
                 }
             } else {
                 for (i, line) in lines[..FOLD_LINE_THRESHOLD].iter().enumerate() {
+                    let kind = kind(i, line);
                     entries.push(TranscriptEntry {
-                        kind: kind(i, line),
-                        text: line.to_string(),
+                        kind,
+                        text: strip_diff_marker(kind, line),
                         block_id: Some(id.clone()),
                     });
                 }
@@ -940,6 +1001,29 @@ fn diff_section_start(lines: &[&str]) -> Option<usize> {
     lines
         .windows(2)
         .position(|w| w[0].starts_with("--- ") && w[1].starts_with("+++ "))
+}
+
+/// 一行 diff 去掉行首那个标记之后的文本。
+///
+/// 渲染那边按 `LineKind` 自己加前缀（`DiffOld` → `  - `，`DiffNew` → `  + `），
+/// 原文里的 `-`/`+` 再留着就成了 `- -GREETING = "hello"`——真跑一次一眼看见。
+/// 上下文行同理：unified diff 的上下文以一个空格开头，去掉之后才和加减行对齐。
+fn strip_diff_marker(kind: LineKind, line: &str) -> String {
+    match kind {
+        // 表头两行本身要连标记一起留着——`--- a.rs (before)` 去掉一个 `-` 就成了
+        // `-- a.rs`，反而看不懂。
+        LineKind::DiffContext if line.starts_with("--- ") || line.starts_with("+++ ") => {
+            line.to_string()
+        }
+        LineKind::DiffOld | LineKind::DiffNew | LineKind::DiffContext => {
+            let mut chars = line.chars();
+            match chars.next() {
+                Some('-') | Some('+') | Some(' ') => chars.as_str().to_string(),
+                _ => line.to_string(),
+            }
+        }
+        _ => line.to_string(),
+    }
 }
 
 /// 单行的展示类别。`diff_from` 之前的行是工具自己的摘要（"Applied 1 edit …"），

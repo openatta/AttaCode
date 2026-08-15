@@ -50,6 +50,13 @@ pub trait EngineHandle: Send + Sync {
     /// 当前可用的 slash 命令列表——直接来自 `Agent` 自己那份实时 `CommandRegistry`，
     /// 就是提交后 Core 真正会解析的那一套（见 `crate::commands`）。
     fn subscribe_commands(&self) -> watch::Receiver<Vec<CompletionCandidate>>;
+
+    /// 诊断用：把**即将渲染的那一帧**记进 `ATTACODE_TRACE`（没开就是空操作）。
+    /// 默认什么都不做，测试里的假 handle 不必理会。
+    fn trace_render(&self, _frame: &FrameState) {}
+
+    /// 诊断用：记一次按键和它解析出来的 action。
+    fn trace_key(&self, _key: &str, _outcome: &str) {}
 }
 
 /// `EngineHandle` 的具体实现：持有 `InputSender`（转发给 `runtime::Agent`）
@@ -170,6 +177,14 @@ impl EngineHandle for BridgeHandle {
 
     fn subscribe_commands(&self) -> watch::Receiver<Vec<CompletionCandidate>> {
         self.commands_rx.clone()
+    }
+
+    fn trace_render(&self, frame: &FrameState) {
+        self.reducer.trace_render(frame);
+    }
+
+    fn trace_key(&self, key: &str, outcome: &str) {
+        self.reducer.trace_key(key, outcome);
     }
 }
 

@@ -272,6 +272,8 @@ async fn run(
 
     loop {
         let snapshot = merge(frame_rx.borrow().clone(), &local);
+        // 打点看到的必须是**合并之后**这一帧：选中块/滚动/草稿都是这一步才加上的。
+        handle.trace_render(&snapshot);
         if std::mem::take(&mut local.redraw_requested) {
             terminal.clear()?;
         }
@@ -319,6 +321,10 @@ fn dispatch_key(
     snapshot: &tui::FrameState,
 ) -> bool {
     let outcome = resolver.on_key(&key);
+    handle.trace_key(
+        &format!("{:?}+{:?}", key.modifiers, key.code),
+        &format!("{outcome:?}"),
+    );
     // 有待批准的权限请求时，键盘整体归对话框——`FrameState` 那边 composer 已经是
     // `locked`，路由不跟着改的话 Enter 会把草稿提交给一个正卡在权限检查上的引擎。
     if let Some(req) = active_approval(snapshot) {
@@ -1128,6 +1134,20 @@ mod tests {
         let mut local = with_page(10);
         press(&mut local, CtKeyCode::Char('l'), KeyModifiers::CONTROL);
         assert!(local.redraw_requested, "Ctrl+L 没接上");
+
+        // Ctrl+C：真跑时发现取消从来没生效过，先在进程内钉死"键 → 命令"这一段，
+        // 好把问题定位到底是分派没接上还是键根本没送到。
+        let mut local = with_page(10);
+        press(&mut local, CtKeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(
+            handle
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| matches!(c, BridgeCommand::CancelTurn)),
+            "Ctrl+C 没变成 CancelTurn"
+        );
 
         // 光标键：同样走真实 Resolver，确认没被 `editor.*` 里别的绑定抢掉。
         let mut local = with_page(10);

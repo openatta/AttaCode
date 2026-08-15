@@ -9,6 +9,7 @@ pub mod commands;
 pub mod handle;
 pub mod permission;
 pub mod reducer;
+pub mod trace;
 
 pub use bootstrap::{BootstrapConfig, BootstrapError, Resume, DEFAULT_MODEL};
 pub use handle::{BridgeCommand, BridgeError, BridgeHandle, EngineHandle};
