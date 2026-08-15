@@ -1631,6 +1631,60 @@ mod tests {
         );
     }
 
+    /// 边界：prompt 正好在视口最上面一行时**还看得见**，再多一行才该钉 header。
+    /// 变异测试把 `>=` 改成 `>` 时全绿，说明原来只测了"明显在里面/明显在外面"。
+    #[test]
+    fn header_visibility_is_exact_at_the_viewport_edge() {
+        let mut local = local_with("");
+        local.viewport_lines = 3;
+        let entry = |kind, text: &str| TranscriptEntry {
+            kind,
+            text: text.into(),
+            block_id: None,
+        };
+        let mut frame = frame_without_approval();
+        // 3 条 = 正好一屏，prompt 在最上面一行 → 还看得见。
+        frame.transcript.body.entries = vec![
+            entry(LineKind::UserPrompt, "问题"),
+            entry(LineKind::AssistantText, "答1"),
+            entry(LineKind::AssistantText, "答2"),
+        ];
+        assert!(prompt_is_visible(&frame, &local), "视口最上面一行仍算可见");
+
+        frame
+            .transcript
+            .body
+            .entries
+            .push(entry(LineKind::AssistantText, "答3"));
+        assert!(!prompt_is_visible(&frame, &local), "被顶出去了就该钉");
+    }
+
+    /// 滚动模式下按 `[offset, offset+高度)` 判断，别退化成只看跟随模式。
+    #[test]
+    fn header_visibility_follows_the_scroll_offset() {
+        let mut local = local_with("");
+        local.viewport_lines = 2;
+        let mut frame = frame_without_approval();
+        frame.transcript.body.entries = (0..10)
+            .map(|i| TranscriptEntry {
+                kind: if i == 4 {
+                    LineKind::UserPrompt
+                } else {
+                    LineKind::AssistantText
+                },
+                text: format!("行{i}"),
+                block_id: None,
+            })
+            .collect();
+
+        local.scroll_offset = Some(4); // 视口 = 行4..行6，prompt 就在第一行
+        assert!(prompt_is_visible(&frame, &local));
+        local.scroll_offset = Some(6); // prompt 在视口上方
+        assert!(!prompt_is_visible(&frame, &local));
+        local.scroll_offset = Some(0); // prompt 在视口下方
+        assert!(!prompt_is_visible(&frame, &local));
+    }
+
     /// resume 起手时输入历史接着上次——从转录里恢复出来的用户输入读。
     #[test]
     fn history_is_seeded_from_a_restored_transcript() {

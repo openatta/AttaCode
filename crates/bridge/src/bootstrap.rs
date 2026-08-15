@@ -580,6 +580,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resolved.as_deref(), Some(newer.to_string().as_str()));
+
+        // 上面那条断言**证明力有限**：`list_recent_sessions(1)` 只返回一条，取
+        // first 还是 last 都一样（变异测试实测：把 first 换成 last，测试照样绿）。
+        // `--continue` 的正确性其实整个押在 store 的排序上，那就直接钉排序。
+        let ordered = store.list_recent_sessions(5).await.unwrap();
+        assert_eq!(ordered.len(), 2);
+        assert_eq!(
+            ordered.first().map(|(id, _)| id.to_string()).as_deref(),
+            Some(newer.to_string().as_str()),
+            "store 必须按 mtime 倒序"
+        );
     }
 
     /// 没有任何历史时 `--continue` 不是错误——正常开新会话。

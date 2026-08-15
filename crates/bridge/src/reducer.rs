@@ -161,6 +161,13 @@ impl Reducer {
         (reducer, frame_rx)
     }
 
+    /// 给 `handle` 的测试用：一个不接 `Agent`、也不带命令目录的空归约器。
+    /// 放在这里而不是那边，是因为 `build` 是私有的（外面只该走 `spawn`）。
+    #[cfg(test)]
+    pub(crate) fn build_for_test() -> (Arc<Self>, watch::Receiver<FrameState>) {
+        Self::build("test-model".into(), "/tmp".into(), None, Vec::new())
+    }
+
     /// 用户提交文本：立即回显为一个新 turn（UserPrompt 块），返回生成的 turn_id
     /// 供调用方送入 `InputMessage::User`。
     pub fn begin_turn(&self, text: String) -> String {
@@ -1043,6 +1050,50 @@ mod tests {
             .unwrap();
         assert_eq!(result.text, "line1");
         assert_eq!(result.block_id.as_deref(), Some("t1"));
+    }
+
+    /// 并发的两次工具调用：结果按 `id` 各回各家。
+    ///
+    /// 原来只有"一个工具块"的测试——那种情况下"按 id 配对"和"谁在前给谁"行为
+    /// 一样，配对逻辑其实没被验证过（变异测试把 `id` 比较删掉，全绿）。
+    #[test]
+    fn tool_results_go_to_their_own_call_when_several_are_in_flight() {
+        let (r, rx) = reducer();
+        let turn_id = r.begin_turn("并行读两个文件".into());
+        for (id, name) in [("t1", "Read"), ("t2", "Grep")] {
+            r.apply_event(AgentEvent::ToolUse {
+                id: id.into(),
+                name: name.into(),
+                input: serde_json::json!({}),
+                turn_id: turn_id.clone(),
+            });
+        }
+        // 结果**乱序**回来——真实情况就是谁先跑完谁先回。
+        r.apply_event(AgentEvent::ToolResult {
+            id: "t2".into(),
+            name: "Grep".into(),
+            content: "grep 的结果".into(),
+            is_error: Some(false),
+            turn_id: turn_id.clone(),
+        });
+        r.apply_event(AgentEvent::ToolResult {
+            id: "t1".into(),
+            name: "Read".into(),
+            content: "read 的结果".into(),
+            is_error: Some(false),
+            turn_id,
+        });
+
+        let entries = frame(&rx).transcript.body.entries;
+        let of = |id: &str| -> Vec<String> {
+            entries
+                .iter()
+                .filter(|e| e.block_id.as_deref() == Some(id) && e.kind == LineKind::ToolResultOk)
+                .map(|e| e.text.clone())
+                .collect()
+        };
+        assert_eq!(of("t1"), vec!["read 的结果"], "t1 拿到了别人的结果");
+        assert_eq!(of("t2"), vec!["grep 的结果"], "t2 拿到了别人的结果");
     }
 
     /// `Edit` 的结果是"一段摘要 + 一段 unified diff"。摘要保持普通工具结果的样子，

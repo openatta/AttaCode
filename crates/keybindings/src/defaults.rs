@@ -157,4 +157,85 @@ mod tests {
             assert!(b.description.is_some(), "{} missing description", b.action);
         }
     }
+
+    /// 整张默认键位表钉死。
+    ///
+    /// 以前只挑了三条具体绑定断言，于是"把 `Alt+Up` 从块选择改绑到滚动"这种改动
+    /// 测试一声不吭（变异测试实测：全绿）。整表比对之后，任何一条绑定被改键/改名/
+    /// 删掉都会红，改的人必须顺手改这里，也就顺手确认了自己是故意的。
+    ///
+    /// 注意大小写：`Shortcut::render()` 把字符键渲染成小写（`Ctrl+c`），而 DSL
+    /// 解析时接受 `Ctrl+U`。这里跟渲染走。
+    #[test]
+    fn the_default_binding_table_is_pinned() {
+        let mut actual: Vec<String> = default_bindings()
+            .iter()
+            .map(|b| {
+                let keys: Vec<String> = b.chord.iter().map(|s| s.render()).collect();
+                format!("{} = {}", keys.join(" "), b.action)
+            })
+            .collect();
+        actual.sort();
+
+        let mut expected: Vec<String> = [
+            "Alt+Down = transcript.select-next",
+            "Alt+Left = editor.cursor.word-left",
+            "Alt+Right = editor.cursor.word-right",
+            "Alt+Up = transcript.select-prev",
+            "Ctrl+c = repl.cancel",
+            "Ctrl+d = repl.exit",
+            "Ctrl+k = editor.kill-to-eol",
+            "Ctrl+l = editor.redraw",
+            "Ctrl+u = editor.clear",
+            "Ctrl+w = editor.delete-word",
+            "Delete = editor.delete-forward",
+            "Down = ask.next",
+            "Down = editor.history.next",
+            "End = editor.cursor.line-end",
+            "Enter = ask.confirm",
+            "Enter = editor.submit",
+            "Esc = repl.dismiss",
+            "F5 = transcript.toggle-expand",
+            "Home = editor.cursor.line-start",
+            "Left = editor.cursor.left",
+            "PageDown = repl.scroll-down",
+            "PageUp = repl.scroll-up",
+            "Right = editor.cursor.right",
+            "Shift+Enter = editor.newline",
+            "Up = ask.prev",
+            "Up = editor.history.prev",
+            "n = ask.no-shortcut",
+            "y = ask.yes-shortcut",
+        ]
+        .map(str::to_string)
+        .to_vec();
+        expected.sort();
+
+        assert_eq!(actual, expected);
+    }
+
+    /// 同一个键绑了多条时 `Resolver` 只认第一条，排在后面的在默认键位下**够不到**。
+    /// 这不是 bug（`ask.*` 由 app 在对话框上下文里另行分派），但必须是有意为之：
+    /// 把"够不到的绑定"整张列出来钉住，谁不小心把新绑定排到了同键老绑定后面，
+    /// 这条会告诉他。
+    #[test]
+    fn shadowed_bindings_are_exactly_the_ones_we_know_about() {
+        let mut seen: Vec<String> = Vec::new();
+        let mut shadowed: Vec<String> = Vec::new();
+        for b in &default_bindings() {
+            let key = b
+                .chord
+                .iter()
+                .map(|s| s.render())
+                .collect::<Vec<_>>()
+                .join(" ");
+            if seen.contains(&key) {
+                shadowed.push(b.action.clone());
+            } else {
+                seen.push(key);
+            }
+        }
+        shadowed.sort();
+        assert_eq!(shadowed, vec!["ask.confirm", "ask.next", "ask.prev"]);
+    }
 }
