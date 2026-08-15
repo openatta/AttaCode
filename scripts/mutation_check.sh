@@ -149,6 +149,20 @@ run "tick：状态行不再刷新" crates/bridge/src/reducer.rs \
 
     /// 用户对某个待确认请求做出决定' bridge
 
+# ── 真跑挖出来的两个致命问题（回归） ──
+run "工具注册表：只注册 web_search（等于没有文件工具）" crates/bridge/src/bootstrap.rs \
+  'tools::register_builtin_tools(&tools);' '' bridge
+run "diff：行首标记不去掉（屏幕上出现双重减号）" crates/bridge/src/reducer.rs \
+  'LineKind::DiffOld | LineKind::DiffNew | LineKind::DiffContext => {
+            let mut chars = line.chars();' \
+  'LineKind::DiffOld | LineKind::DiffNew | LineKind::DiffContext => {
+            #[allow(unreachable_code)]
+            return line.to_string();
+            let mut chars = line.chars();' bridge
+run "对话框挤不下时不裁剪（回到修之前，按键提示被切掉）" crates/tui/src/regions/composer.rs \
+  'Paragraph::new(fit_card(head, body, tail, inner.height)),' \
+  'Paragraph::new({ let mut all = head; all.extend(body); all.extend(tail); all }),' tui
+
 # ── keybindings ──
 run "键位：Alt+Up 改绑到滚动" crates/keybindings/src/defaults.rs \
   'bind(

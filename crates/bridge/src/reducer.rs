@@ -1332,6 +1332,64 @@ mod tests {
         );
     }
 
+    /// 只钉 `kind` 不钉 `text` 曾经放跑过一个真会被看见的 bug：渲染层按 kind
+    /// 自己画 `- ` / `+ `，而文本里原来那个标记还在，屏幕上就是 `- -    old();`。
+    /// 所以这里钉的是**送给渲染层的文本已经不含行首标记**。
+    ///
+    /// `--- a.rs (before)` / `+++ a.rs (after)` 是例外：那是表头不是内容，砍掉一个
+    /// `-` 会变成 `-- a.rs (before)`，反而看不懂——原样保留。
+    #[test]
+    fn diff_text_reaches_the_renderer_without_its_leading_marker() {
+        let (r, rx) = reducer();
+        let turn_id = r.begin_turn("改个字".into());
+        r.apply_event(AgentEvent::ToolUse {
+            id: "t1".into(),
+            name: "Edit".into(),
+            input: serde_json::json!({"file_path": "a.rs"}),
+            turn_id: turn_id.clone(),
+        });
+        r.apply_event(AgentEvent::ToolResult {
+            id: "t1".into(),
+            name: "Edit".into(),
+            content: "--- a.rs (before)\n\
+                      +++ a.rs (after)\n\
+                      @@ -1,3 +1,3 @@\n\
+                      \x20fn main() {\n\
+                      -    old();\n\
+                      +    new();\n"
+                .into(),
+            is_error: Some(false),
+            turn_id,
+        });
+
+        let f = frame(&rx);
+        let diff: Vec<(LineKind, &str)> = f
+            .transcript
+            .body
+            .entries
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.kind,
+                    LineKind::DiffOld | LineKind::DiffNew | LineKind::DiffContext
+                )
+            })
+            .map(|e| (e.kind, e.text.as_str()))
+            .collect();
+
+        assert_eq!(
+            diff,
+            vec![
+                (LineKind::DiffContext, "--- a.rs (before)"),
+                (LineKind::DiffContext, "+++ a.rs (after)"),
+                (LineKind::DiffContext, "@@ -1,3 +1,3 @@"),
+                (LineKind::DiffContext, "fn main() {"),
+                (LineKind::DiffOld, "    old();"),
+                (LineKind::DiffNew, "    new();"),
+            ]
+        );
+    }
+
     /// 只有成对的 `---`/`+++` 表头才算 diff。命令输出里一行 `-v` 开头的普通文本
     /// 不该被当成删除行涂红。
     #[test]

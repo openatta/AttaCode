@@ -158,6 +158,26 @@ fn discover_instruction_file(project_root: &Path) -> Option<PathBuf> {
     candidate.is_file().then_some(candidate)
 }
 
+/// 工具注册表。**不注册的后果是静默的**：`Builder::build()` 自己只挂上
+/// `Agent`/`Skill`/`Cron*`/`Task*` 那几个，Read/Write/Edit/Bash/Grep/Glob/
+/// TodoWrite 全都不在。而场景的 system prompt 照旧告诉模型"你有这些工具"，
+/// 于是模型开开心心调 `Read`，拿回一句 `Tool not found: Read`。
+///
+/// 后果比"agent 变笨"严重得多：读不了文件的模型会**派子代理**去读，子代理继承
+/// 同一个空注册表，于是它也读不了、于是它再派一个……真跑时就是这样无限委派到
+/// `stack overflow` 把进程干掉的。
+///
+/// `register_web_search` 单独一步：选哪个 search provider 要看解析完的 settings
+/// （端点 + 凭据），`register_builtin_tools` 里放不下。场景的工具白名单和注册表
+/// 取交集，不注册就是"模型根本看不到"。和 `core/daemon/src/session_pool.rs` 的
+/// 装配顺序一致。
+fn build_tool_registry(settings: &Settings) -> Arc<base::tool::InMemoryToolRegistry> {
+    let tools = Arc::new(base::tool::InMemoryToolRegistry::new());
+    tools::register_builtin_tools(&tools);
+    tools::register_web_search(&tools, settings);
+    tools
+}
+
 /// 会话转录的落盘后端。没有它 `SessionManager` 纯内存，进程一退整段对话就没了。
 ///
 /// 根目录用 `global_data_dir/sessions/`（**不是**场景目录）：`sessions` 和
@@ -262,20 +282,7 @@ pub async fn build_agent(config: &BootstrapConfig) -> Result<BuiltEngine, Bootst
     let scene: Arc<dyn base::interface::scene::AgentScene> =
         Arc::new(scene::scene::coding::CodingScene);
 
-    // 工具注册表。**不注册的后果是静默的**：`Builder::build()` 自己只挂上
-    // `Agent`/`Skill`/`Cron*`/`Task*` 那几个，Read/Write/Edit/Bash/Grep/Glob/
-    // TodoWrite 全都不在。而场景的 system prompt 照旧告诉模型"你有这些工具"，
-    // 于是模型开开心心调 `Read`，拿回一句 `Tool not found: Read`，然后自己想办法
-    // 绕（派子代理去读文件）。没有报错、没有警告，只有"这个 agent 怎么这么笨"。
-    // 真跑第一条读文件的提示词就撞上了。
-    //
-    // `register_web_search` 单独一步：选哪个 search provider 要看解析完的
-    // settings（端点 + 凭据），所以 `register_builtin_tools` 里放不下。场景的
-    // 工具白名单和注册表取交集，不注册就是"模型根本看不到"。
-    // 和 `core/daemon/src/session_pool.rs` 的装配顺序一致。
-    let tools = Arc::new(base::tool::InMemoryToolRegistry::new());
-    tools::register_builtin_tools(&tools);
-    tools::register_web_search(&tools, &settings);
+    let tools = build_tool_registry(&settings);
 
     // 权限门。默认模式是"没有规则命中就问"——工具自判允许的调用（只读工具、项目内的
     // Write/Edit）照旧静默通过，其余会走 `PermissionOutcome::Prompt` →
@@ -558,6 +565,42 @@ mod tests {
         assert!(written[0].to_string_lossy().ends_with(".jsonl"));
         // 场景目录不该有任何东西。
         assert_eq!(walk_files(&l.scene.join("sessions")).count(), 0);
+    }
+
+    /// 模型手上到底有哪些工具——这条是**真跑时崩过一次**才补上的回归测试。
+    ///
+    /// 不注册的表现不是报错，是场景 prompt 说有、注册表里没有：模型调 `Read`
+    /// 拿回 `Tool not found`，然后派子代理去读；子代理继承同一个空注册表，
+    /// 再派一个……一路递归到 stack overflow。所以这里钉的不是"注册了几个"，
+    /// 是**每一个会被 system prompt 承诺出去的工具都在**。
+    #[test]
+    fn the_registry_has_every_tool_the_coding_scene_promises() {
+        let l = layout();
+        let settings = resolve_settings(&l.config);
+        let registry = build_tool_registry(&settings);
+        let names: Vec<String> = registry
+            .list()
+            .iter()
+            .map(|t| t.name().to_string())
+            .collect();
+
+        for expected in [
+            "Read",
+            "Write",
+            "Edit",
+            "Bash",
+            "Grep",
+            "Glob",
+            "TodoWrite",
+            "NotebookEdit",
+            "WebFetch",
+            "ToolSearch",
+        ] {
+            assert!(
+                names.iter().any(|n| n == expected),
+                "{expected} 不在注册表里，模型调它会拿到 Tool not found。现有: {names:?}"
+            );
+        }
     }
 
     /// 往 store 里塞一个会话，返回它的 id。
