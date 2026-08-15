@@ -67,7 +67,14 @@ AttaCode 直接依赖 AttaCore 的以下 crate（全部走 `core/crates/*` 的 p
 > **注意：`core/` 在 workspace 目录内，那 16 个 crate 会被 cargo 自动吸收成本 workspace 的成员。**
 > 也就是说 core crate 里的 `xxx = { workspace = true }` 是拿**根 `Cargo.toml`** 的
 > `[workspace.dependencies]` 解析的。AttaCore 新增第三方依赖时，这里必须同步加，否则编译不过。
-> 附带好处：`cargo test --workspace` 会连 core 的测试一起跑。
+> 附带好处：`cargo test --workspace` 会连这 16 个 crate 的测试一起跑。
+>
+> 但**只有这 16 个**——被吸收的是"我们 path 依赖到的"，AttaCore 自己那些
+> `daemon` / `rpc_client` / `task` / `test_runner` / `attacored` 不在其中。要跑
+> AttaCore 全套得 `cd core` 再 `cargo test --workspace`，那是**另一个 workspace**，
+> 数字对不上不是测试丢了。（在 `core/` 里跑完忘了 `cd` 回来，接着跑的
+> `cargo test --workspace` 就悄悄跑了 AttaCore 的套件——测试数会变，但一个我们的
+> crate 都没测到。）
 
 ## 本地开发
 

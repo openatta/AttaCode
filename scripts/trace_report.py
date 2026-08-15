@@ -9,8 +9,13 @@
     scripts/trace_report.py /tmp/t.jsonl
 """
 import json
+import re
 import sys
 from collections import Counter
+
+# 单个可见字符、且只按了 Shift 或什么都没按 = 用户在打字，不是在按快捷键。
+# （大写字母带 SHIFT，一样是打字——漏掉它会让 "TODO" 这种输入混进快捷键统计。）
+TYPING = re.compile(r"^KeyModifiers\((0x0|SHIFT)\)\+Char\(")
 
 # 每个区块：怎么判断"这一帧它有内容"，以及没收到时该往哪儿看。
 REGIONS = [
@@ -27,21 +32,39 @@ REGIONS = [
 
 def main():
     path = sys.argv[1]
-    frames = []
+    frames, keys = [], []
     for line in open(path):
         line = line.strip()
-        if line:
-            frames.append(json.loads(line))
+        if not line:
+            continue
+        rec = json.loads(line)
+        # 一个文件里两种记录：帧和按键。按键那种只有 key/outcome，没有区块字段，
+        # 混进帧统计里会直接 KeyError。
+        (keys if rec.get("event") == "key" else frames).append(rec)
     if not frames:
-        print("打点文件是空的——是不是没设 ATTACODE_TRACE 就跑了？")
+        print("打点文件里一帧都没有——是不是没设 ATTACODE_TRACE 就跑了？")
         return 1
 
     last = frames[-1]
-    print(f"# 帧数 {len(frames)}")
+    print(f"# 帧 {len(frames)}  按键 {len(keys)}")
 
     print("\n## 收到的事件")
     for name, n in Counter(f["event"] for f in frames).most_common():
         print(f"  {n:5}  {name}")
+
+    if keys:
+        # 普通打字（无修饰键的可见字符）一定是 Unmatched——它就该落进草稿，不是
+        # 快捷键。全列出来只会把真正要看的东西刷下去，折成一行。
+        typing = [r for r in keys if TYPING.match(r["key"])]
+        rest = [r for r in keys if not TYPING.match(r["key"])]
+        print("\n## 按键")
+        if typing:
+            print(f"  {len(typing):5}  （普通输入，落进草稿）")
+        for (k, o), n in Counter((r["key"], r["outcome"]) for r in rest).most_common(15):
+            # 绑了却没分派出去的才是问题：解析成了 action 却看不到后续效果，
+            # 或者压根没解析出来而它本该是个快捷键。
+            mark = " ⚠️" if "none" in o.lower() or "unhandled" in o.lower() else ""
+            print(f"  {n:5}  {k:<40} → {o}{mark}")
 
     print("\n## 转录里出现过的行类型")
     kinds = Counter()
