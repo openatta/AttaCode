@@ -213,7 +213,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tui",
- "url",
 ]
 
 [[package]]

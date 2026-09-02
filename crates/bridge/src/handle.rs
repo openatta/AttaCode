@@ -143,12 +143,22 @@ impl BridgeHandle {
 
     /// 把答案交回给还在等的那个工具调用，并收走对话框。
     ///
-    /// 没人在等**不是错误**：turn 被取消时对话框和等待方是分头消失的，用户在那一瞬
-    /// 按下的回车理应落空，而不是让整个 UI 报错。`resolve_prompt` 照样跑，它是幂等的
-    /// ——保证屏幕上不会留下一个已经没有对家的框。
+    /// 没人在等**不是错误**：turn 被取消时对话框和等待方是分头消失的（问题先撤走，
+    /// 而 app 手上的快照可能还差一拍），用户在那一瞬按下的回车理应落空，而不该让
+    /// 整个 UI 报错。`resolve_prompt` 照样跑，它是幂等的——保证屏幕上不会留下一个
+    /// 已经没有对家的框。
+    ///
+    /// **但落空要说出来。** 自由文本那一档不锁 composer，所以那一行是用户真打出来
+    /// 的字；既没送到工具、也没当成普通消息发出去，一声不吭地消失是最坏的结果
+    /// ——人会以为自己发出去了。
     fn answer_question(&self, prompt_id: String, text: String) -> Result<(), BridgeError> {
-        self.questions.answer(&prompt_id, text);
+        let delivered = self.questions.answer(&prompt_id, text.clone());
         self.reducer.resolve_prompt(&prompt_id);
+        if !delivered {
+            self.reducer.note(format!(
+                "The question was withdrawn before this answer arrived, so it went nowhere: {text}"
+            ));
+        }
         Ok(())
     }
 }
@@ -454,16 +464,26 @@ mod tests {
         assert!(drain(&mut rx).is_empty());
     }
 
-    /// 没人在等的答案（问题刚被撤走、用户手慢了一步）不该把整个 UI 弄出错。
+    /// 没人在等的答案（问题刚被撤走、用户手慢了一步）不该把整个 UI 弄出错——
+    /// **但也不能一声不吭地消失**。
+    ///
+    /// 自由文本那一档不锁 composer，所以那一行是用户真打出来的字。既没送到工具、
+    /// 也没当成普通消息发出去、转录里还什么都没有的话，人会以为自己发出去了。
     #[test]
-    fn answering_a_question_nobody_is_waiting_on_is_not_an_error() {
-        let (handle, _rx, _frame) = handle();
+    fn an_answer_that_arrives_too_late_is_reported_instead_of_vanishing() {
+        let (handle, _rx, frame_rx) = handle();
         assert!(handle
             .dispatch(BridgeCommand::AnswerQuestion {
                 prompt_id: "gone".into(),
-                text: "x".into(),
+                text: "我打了半天的这一行".into(),
             })
             .is_ok());
+
+        let said = frame_rx.borrow().transcript.body.entries.clone();
+        assert!(
+            said.iter().any(|e| e.text.contains("我打了半天的这一行")),
+            "落空的答案得留在转录里让人看见: {said:?}"
+        );
     }
 
     /// 中断一次 turn ≠ 关掉会话。发成 `Shutdown` 的话用户按一次 Ctrl+C 引擎就没了。

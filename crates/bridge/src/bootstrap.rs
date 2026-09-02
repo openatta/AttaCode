@@ -266,7 +266,40 @@ async fn build_history_store(
 /// （`ConfigCredentials`）；而 `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY` 是
 /// AttaCode 一直以来唯一的入口，只认配置等于让所有老用户在一次升级里失去凭据。
 /// 顺序是"具体的压过笼统的"：一个人为某个 provider 专门写了 key，就是他要用的那个。
-struct SettingsThenEnv;
+///
+/// # 环境变量那一半有门
+///
+/// `ANTHROPIC_AUTH_TOKEN` 是 **api.anthropic.com 的**凭据。无条件回退等于：用户配了
+/// 一个 `openai_compatible` 的第三方 provider、忘了写 `api_key`，而 shell 里正好导着
+/// `ANTHROPIC_API_KEY`——于是我们把 Anthropic 的 token 发到那个第三方地址上去。本该
+/// 报一句 "missing api_key" 的地方，变成了一次静默的凭据外泄。
+///
+/// 所以只有两种 provider 拿得到它：
+///
+/// 1. **我们自己合成的那个内置 anthropic**（`settings.providers` 为空时）。
+///    `ANTHROPIC_BASE_URL` 和 `ANTHROPIC_AUTH_TOKEN` 同属一族，用同一族变量把端点
+///    指到别处是用户自己的明确选择——这也正是 0.2.3 之前唯一那条路的行为，不动它。
+/// 2. **`settings.json` 里 api_type 是 anthropic（或没写）且没有 `base_url` 的**，
+///    也就是 api.anthropic.com 本身。
+///
+/// 其余一律拿不到，`ConfigCredentials` 的 "missing api_key" 原样往上报。
+struct SettingsThenEnv {
+    /// 我们合成出来的那个 provider 的 id（`settings.providers` 为空时才有）。
+    synthesized: Option<String>,
+}
+
+impl SettingsThenEnv {
+    /// 这个 provider 能不能拿 `ANTHROPIC_*` 环境变量里的 key。
+    fn env_is_for(&self, provider_id: &str, config: &base::provider::ProviderConfig) -> bool {
+        if self.synthesized.as_deref() == Some(provider_id) {
+            return true;
+        }
+        // `api_type` 不写就是 anthropic（Core 的约定）。
+        let anthropic_protocol = config.api_type.as_deref().unwrap_or("anthropic") == "anthropic";
+        let default_endpoint = config.base_url.as_deref().unwrap_or("").is_empty();
+        anthropic_protocol && default_endpoint
+    }
+}
 
 impl base::interface::credentials::CredentialSource for SettingsThenEnv {
     fn api_key(
@@ -276,9 +309,13 @@ impl base::interface::credentials::CredentialSource for SettingsThenEnv {
     ) -> Result<base::interface::credentials::Secret, String> {
         base::interface::credentials::ConfigCredentials
             .api_key(provider_id, config)
-            .or_else(|_| {
-                base::interface::credentials::EnvCredentials::anthropic()
-                    .api_key(provider_id, config)
+            .or_else(|missing| {
+                if self.env_is_for(provider_id, config) {
+                    base::interface::credentials::EnvCredentials::anthropic()
+                        .api_key(provider_id, config)
+                } else {
+                    Err(missing)
+                }
             })
     }
 }
@@ -427,8 +464,11 @@ pub async fn build_agent(config: &BootstrapConfig) -> Result<BuiltEngine, Bootst
         settings.model.model_name = name;
     }
 
+    let credentials = SettingsThenEnv {
+        synthesized: settings.providers.is_empty().then(|| provider_id.clone()),
+    };
     let model = model::factory::builtin_registry()
-        .with_credentials(Arc::new(SettingsThenEnv))
+        .with_credentials(Arc::new(credentials))
         .build(&provider_id, &provider)
         .map_err(|e| {
             // 一个字都没配、环境变量也没设，那不是"provider 坏了"，是最常见的
@@ -499,7 +539,8 @@ pub async fn build_agent(config: &BootstrapConfig) -> Result<BuiltEngine, Bootst
     // `/doctor` 的内容。引擎自己一条检查都不注册（`HealthChecks` 初始为空，而空集合
     // 的报告是 `Ok`），所以不挂这些的话 `/doctor` 只会永远说"一切正常"。见
     // [`crate::doctor`]。
-    for check in crate::doctor::checks(&settings, store.is_some()) {
+    for check in crate::doctor::checks(&settings, Some((&provider_id, &provider)), store.is_some())
+    {
         builder = builder.health_check(check);
     }
     // 有落盘后端时，`SessionManager` 每个 turn 结束增量追加一次 jsonl；没有就纯内存
@@ -714,8 +755,67 @@ mod tests {
     fn a_providers_own_key_wins_over_the_environment() {
         use base::interface::credentials::CredentialSource;
         let cfg = provider("anthropic", None);
-        let key = SettingsThenEnv.api_key("deepseek", &cfg).unwrap();
+        let key = SettingsThenEnv { synthesized: None }
+            .api_key("deepseek", &cfg)
+            .unwrap();
         assert_eq!(key.expose(), "k");
+    }
+
+    /// **`ANTHROPIC_AUTH_TOKEN` 不能发给第三方端点。**
+    ///
+    /// 无条件回退的后果不是"少了个便利"，是一次静默的凭据外泄：用户配了个
+    /// `openai_compatible` 的 provider、忘了写 `api_key`，shell 里正好导着
+    /// `ANTHROPIC_API_KEY`，于是 Anthropic 的 token 被发到那个第三方地址上。
+    ///
+    /// 断言的是**门的判据**而不是真去读环境变量——测试进程的 env 是全局的，
+    /// 并行跑的时候改它就是在给别的测试下绊子。
+    #[test]
+    fn the_env_credential_is_only_offered_to_anthropics_own_endpoint() {
+        let third_party = base::provider::ProviderConfig {
+            api_type: Some("openai_compatible".into()),
+            base_url: Some("https://api.deepseek.com/v1".into()),
+            ..Default::default()
+        };
+        let anthropic_shim = base::provider::ProviderConfig {
+            api_type: Some("anthropic".into()),
+            base_url: Some("https://someone-elses-host.example/anthropic".into()),
+            ..Default::default()
+        };
+        let anthropic_proper = base::provider::ProviderConfig {
+            api_type: Some("anthropic".into()),
+            ..Default::default()
+        };
+
+        let gate = SettingsThenEnv { synthesized: None };
+        assert!(
+            !gate.env_is_for("deepseek", &third_party),
+            "别的协议、别的地址，绝不能拿 Anthropic 的 key"
+        );
+        assert!(
+            !gate.env_is_for("shim", &anthropic_shim),
+            "protocol 对得上但端点是别人的，一样不能拿"
+        );
+        assert!(
+            gate.env_is_for("main", &anthropic_proper),
+            "api.anthropic.com 本身当然可以"
+        );
+
+        // 我们自己合成的那个是唯一的例外：`ANTHROPIC_BASE_URL` 和
+        // `ANTHROPIC_AUTH_TOKEN` 同属一族，用同一族变量重定向是用户的明确选择，
+        // 也是 0.2.3 之前唯一那条路的行为。
+        let synthesized = SettingsThenEnv {
+            synthesized: Some("anthropic".into()),
+        };
+        let redirected = base::provider::ProviderConfig {
+            api_type: Some("anthropic".into()),
+            base_url: Some("https://deepseek.example/anthropic".into()),
+            ..Default::default()
+        };
+        assert!(synthesized.env_is_for("anthropic", &redirected));
+        assert!(
+            !synthesized.env_is_for("someone-else", &redirected),
+            "例外只给合成的那一个，不是给所有人"
+        );
     }
 
     /// 换了 protocol 就得换模型名，否则是拿着 Claude 的模型名去问 DeepSeek 要东西。

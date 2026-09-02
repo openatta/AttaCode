@@ -950,12 +950,11 @@ fn render(state: &DomainState) -> FrameState {
             view_mode: ApprovalViewMode::TabView,
         })
     };
-    // 自由文本那一档**不锁** composer——它要的答案就是用户在 composer 里打的那一行。
-    // 一并锁掉的话对话框会开着、输入框会死，而屏幕上没有任何一个键能推进它。
-    let locked = state
-        .pending_approvals
-        .iter()
-        .any(|p| p.answer_with == AnswerWith::Choose);
+    // 判据只有一个，在 `ApprovalState::locks_composer` 上。这里算出来的是**默认值**：
+    // `active_idx` 是 UI-本地状态（用户 Tab 到第几个），bridge 不知道，所以这一帧
+    // 先按 0 算，`crates/app` 的 `merge` 夹完 `active_idx` 之后会用同一个方法重算。
+    // 两处调的是同一个函数，不会各说各话。
+    let locked = approval.as_ref().is_some_and(|a| a.locks_composer());
 
     FrameState {
         transcript: TranscriptState {
@@ -1040,11 +1039,11 @@ fn render(state: &DomainState) -> FrameState {
 
 fn push_block_entries(entries: &mut Vec<TranscriptEntry>, block: &Block) {
     match block {
-        Block::UserPrompt(text) => entries.push(plain(LineKind::UserPrompt, text)),
-        Block::AssistantText(text) => entries.push(plain(LineKind::AssistantText, text)),
-        Block::Thinking(text) => entries.push(plain(LineKind::Thinking, text)),
-        Block::Note(text) => entries.push(plain(LineKind::Note, text)),
-        Block::Error(text) => entries.push(plain(LineKind::Error, text)),
+        Block::UserPrompt(text) => push_lines(entries, LineKind::UserPrompt, text),
+        Block::AssistantText(text) => push_lines(entries, LineKind::AssistantText, text),
+        Block::Thinking(text) => push_lines(entries, LineKind::Thinking, text),
+        Block::Note(text) => push_lines(entries, LineKind::Note, text),
+        Block::Error(text) => push_lines(entries, LineKind::Error, text),
         Block::Tool {
             id,
             name,
@@ -1154,6 +1153,29 @@ fn classify(idx: usize, line: &str, diff_from: Option<usize>, base: LineKind) ->
         Some(b'-') => LineKind::DiffOld,
         Some(b'+') => LineKind::DiffNew,
         _ => LineKind::DiffContext,
+    }
+}
+
+/// 一段文本 → 一行一条 entry。
+///
+/// **一条 entry 就是屏幕上的一行**，这是 `tui::regions::transcript::render_body` 的
+/// 前提（它按 `entries.take(视口高度)` 取，一条画一行）。而 ratatui 的 `Line` 对里面
+/// 的 `\n` 不是换行、是**直接吞掉**：`Line::from("aaa\nbbb")` 画出来是 `aaabbb`。
+///
+/// 所以带 `\n` 的文本塞进一条 entry，屏幕上得到的是一串挤在一起、再被宽度截断的字
+/// ——模型每一条带分段或列表的回答都是这样。工具结果那条路径一直是按行拆的
+/// （`result.text.lines()`），只有这五种文本块不是；正是这个不对称让它活了这么久。
+///
+/// 空串给一条空 entry 而不是零条：一个空的 note/error 仍然占一行，和以前一样。
+fn push_lines(entries: &mut Vec<TranscriptEntry>, kind: LineKind, text: &str) {
+    if text.is_empty() {
+        entries.push(plain(kind, ""));
+        return;
+    }
+    // `lines()` 而不是 `split('\n')`：前者认 `\r\n`，也不会为结尾那个换行多造一条
+    // 空行（流式文本经常以换行收尾）。段落之间的空行照样保留。
+    for line in text.lines() {
+        entries.push(plain(kind, line));
     }
 }
 
@@ -1320,6 +1342,92 @@ mod tests {
             watching.upgrade().is_none(),
             "没人看了之后归约器还被后台 task 攥着"
         );
+    }
+
+    /// **模型每一条带分段或列表的回答都栽在这里。** 一条 entry 是屏幕上的一行，
+    /// 而 ratatui 的 `Line` 会把里面的 `\n` 直接吞掉（不是换行，连空格都不给），
+    /// 于是整段答案挤成一串再被宽度截断。工具结果那条路径一直是按行拆的，只有
+    /// 这五种文本块不是。
+    #[test]
+    fn multi_line_text_becomes_one_entry_per_line() {
+        let (r, rx) = reducer();
+        let turn_id = r.begin_turn("q".into());
+        r.apply_event(AgentEvent::TextDelta {
+            text: "第一段。\n\n第二段。\n- 甲\n- 乙".into(),
+            turn_id,
+        });
+
+        let f = frame(&rx);
+        let said: Vec<&str> = f
+            .transcript
+            .body
+            .entries
+            .iter()
+            .filter(|e| e.kind == LineKind::AssistantText)
+            .map(|e| e.text.as_str())
+            .collect();
+        assert_eq!(said, ["第一段。", "", "第二段。", "- 甲", "- 乙"]);
+        assert!(
+            f.transcript
+                .body
+                .entries
+                .iter()
+                .all(|e| !e.text.contains('\n')),
+            "任何一条 entry 里都不该再有换行——它到屏幕上会被吞掉"
+        );
+    }
+
+    /// `/doctor` 的报告是多行的，必须真的画成多行。
+    ///
+    /// 这条把 `doctor::render` 和转录的行模型钉在一起：报告那边改成一行一条
+    /// （或者这边不再拆行）时，它会先挂。
+    #[test]
+    fn the_doctor_report_lands_as_one_entry_per_check() {
+        let settings = base::settings::Settings::defaults_for("m");
+        let report = base::interface::health::HealthChecks::from_vec(crate::doctor::checks(
+            &settings, None, true,
+        ))
+        .report();
+
+        let (r, rx) = reducer();
+        r.note(crate::doctor::render(&report));
+
+        let f = frame(&rx);
+        let notes: Vec<&str> = f
+            .transcript
+            .body
+            .entries
+            .iter()
+            .filter(|e| e.kind == LineKind::Note)
+            .map(|e| e.text.as_str())
+            .collect();
+        assert_eq!(
+            notes.len(),
+            report.checks.len() + 1,
+            "标题一行 + 每条检查一行，实际: {notes:#?}"
+        );
+        assert!(notes.iter().all(|t| !t.contains('\n')));
+        assert!(notes[0].starts_with("doctor:"));
+    }
+
+    /// 空文本仍然占一行，和以前一样；结尾的换行不该凭空多造一条空行（流式文本
+    /// 经常以换行收尾）。
+    #[test]
+    fn empty_and_trailing_newline_text_keep_their_shape() {
+        let (r, rx) = reducer();
+        r.note(String::new());
+        r.note("尾巴上有换行\n".into());
+
+        let f = frame(&rx);
+        let notes: Vec<&str> = f
+            .transcript
+            .body
+            .entries
+            .iter()
+            .filter(|e| e.kind == LineKind::Note)
+            .map(|e| e.text.as_str())
+            .collect();
+        assert_eq!(notes, ["", "尾巴上有换行"]);
     }
 
     #[test]

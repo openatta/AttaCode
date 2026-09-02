@@ -32,7 +32,6 @@ serde_json  = { workspace = true }
 thiserror   = { workspace = true }
 tracing     = { workspace = true }
 async-trait = { workspace = true }
-url         = { workspace = true }
 
 [dev-dependencies]
 # 只有 `commands` 的单测需要它——生产路径上技能目录完全由 Core 的

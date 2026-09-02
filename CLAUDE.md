@@ -131,13 +131,20 @@ cargo run -p bridge --example smoke
 anthropic provider，`base_url` 取 `ANTHROPIC_BASE_URL`。凭据先看 provider 自己的
 `api_key`，再看 `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY`。
 
-`/doctor` 把上面这些**实际生效成了什么**打出来（provider、模型、转录落没落盘、沙箱后端、
-权限模式和规则数）。三层 settings 合并之后的结果，人对着源文件是推不出来的。
+`/doctor` 把上面这些**实际生效成了什么**打出来（选中的 provider 和端点、模型、转录
+落没落盘、沙箱后端、权限模式和规则数）。三层 settings 合并之后的结果，人对着源文件
+是推不出来的。
+
+它还有第五条 `settings.unused`：**`Settings` 是全量的，daemon 消费一部分、我们消费
+另一部分，交集之外的字段用户写了也白写。** 今天落在外面的是 `scripts`（没有
+`script-host`）、`task_models`（没建 `TaskRouter`，子代理一律用会话模型）、`recorder`
+（record/replay 没接）。接不接是单独的排期，但静默是现在就能取消的——一个人写了
+`scripts` 然后发现脚本从没跑过，他会先去查自己的 JavaScript，那是最贵的一条排查路径。
 
 改了渲染/事件循环/装配之后，按 `docs/manual-smoke-checklist.md` 在真终端里过一遍
 ——那些东西单元测试验不了。
 
-## 两条 AttaCore 0.2.x 的边界，改之前先看
+## 三条容易踩回去的地方
 
 **沙箱是编译期 feature，我们显式打开了它。** `crates/bridge/Cargo.toml` 里的
 `base = { features = ["sandbox"] }`。AttaCore 0.2.1 起这个 feature 默认关（上游的理由：
@@ -151,6 +158,13 @@ anthropic provider，`base_url` 取 `ANTHROPIC_BASE_URL`。凭据先看 provider
 `sandbox.allow_write`。这条设置只能经由 `RuleSetPermission` 的 `sandbox` 字段抵达工具，
 也就是必须走 `RuleSetPermission::from_settings`（`bridge::permission::build` 就是这么做的）。
 换回 `RuleSetPermission::new` 的话，用户对着的就是一堵没有门的墙——而且不会有任何报错。
+
+**一条转录 entry 就是屏幕上的一行。** `tui::regions::transcript::render_body` 按
+`entries.take(视口高度)` 取，一条画一行；而 ratatui 的 `Line` 对里面的 `\n` 不是换行、
+是**直接吞掉**（`Line::from("aaa\nbbb")` 画出来是 `aaabbb`，连空格都不给）。所以任何
+多行文本进转录之前必须按行拆开——`bridge::reducer::push_lines` 就是那一步。工具结果
+那条路径一直是自己按行拆的，五种文本块曾经不是，症状是**模型每一条带分段或列表的
+回答都挤成一串再被宽度截断**。
 
 ## 已删除（不在 scope）
 

@@ -263,6 +263,24 @@ pub struct ApprovalState {
     pub view_mode: ApprovalViewMode,
 }
 
+impl ApprovalState {
+    /// 现在归谁答。`None` 只可能是 `active_idx` 越界——调用方夹过之后就不会。
+    pub fn active(&self) -> Option<&ApprovalRequest> {
+        self.pending.get(self.active_idx)
+    }
+
+    /// composer 该不该锁上。
+    ///
+    /// **这是那个唯一的判据。** 之前锁、键盘路由、弹窗可见性三处各自算了一遍：
+    /// 锁看的是"队列里有没有"、路由看的是"当前这条是不是"、渲染看的是"队列空不空"。
+    /// 三者一致时看不出问题，不一致时有三个症状——输入框画成灰的却能打字、排在
+    /// 问答题后面的权限请求永远 Tab 不到、`/resume` 列表从屏幕上消失却还吃着键盘。
+    /// 谁需要这个答案就调这里，别再各算各的。
+    pub fn locks_composer(&self) -> bool {
+        matches!(self.active(), Some(r) if r.answer_with == AnswerWith::Choose)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApprovalRequest {
     /// Opaque identifier the glue layer uses to route the user's decision back

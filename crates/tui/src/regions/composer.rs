@@ -2,7 +2,7 @@
 //! Z2.R2.S1 CompletionPopup floating + Z2.R2.S2 Approval stacked above Editor), Z2.R3 BottomRule.
 
 use crate::frame_state::{
-    AnswerWith, ApprovalRequest, ApprovalState, ApprovalViewMode, BottomRuleState,
+    AnswerWith, ApprovalRequest, ApprovalState, ApprovalViewMode, BottomRuleState, CompletionKind,
     CompletionPopupState, ComposerState, ContentState, EditorState, InputMode, TopRuleState,
 };
 use crate::regions::style::{self, separator_color, COLOR_ACCENT, COLOR_SECONDARY};
@@ -248,9 +248,67 @@ fn floor_boundary(s: &str, mut idx: usize) -> usize {
     idx
 }
 
+/// 弹窗最多占多少**内容**行（不含上下边框）。
+///
+/// 以前这里是 3（`(len + 2).min(5)` 减掉两条边框），而 `/resume` 一次给 20 条候选、
+/// 渲染又没有偏移量——第 4 条往后的高亮在屏幕外面走，回车换到一个用户**从没看见过**
+/// 的会话。数字本身不神圣，"看得见的和选得中的必须是同一批"才是。
+const MAX_POPUP_ROWS: usize = 10;
+
+/// 让 `selected` 落在窗口里的起始下标。
+///
+/// 单独拎出来是为了能直接测：这是"高亮跑到屏幕外"那个 bug 的全部所在。
+fn popup_window_start(selected: usize, len: usize, visible: usize) -> usize {
+    if len <= visible {
+        return 0;
+    }
+    // 选中项贴着窗口下沿往下推，贴着上沿往上推，中间不动。
+    let last_start = len - visible;
+    selected.saturating_sub(visible - 1).min(last_start)
+}
+
 fn render_completion_popup(frame: &mut Frame, editor_area: Rect, state: &CompletionPopupState) {
-    let h = (state.candidates.len() as u16 + 2).min(5);
-    let w = editor_area.width.min(60);
+    if state.candidates.is_empty() {
+        return;
+    }
+    // 会话那一档的 `name` 是裸的 BASE58 id，人看不出任何东西；真正有用的是
+    // `description`（什么时候 / 多少条 / 讲了什么）。所以那一档只画说明——反正
+    // 选中之后是按 id 切过去的，用户不需要读它。
+    let ids_are_noise = state.kind == CompletionKind::Session;
+    let row_text = |c: &crate::frame_state::CompletionCandidate| -> (String, String) {
+        if ids_are_noise {
+            (c.description.clone(), String::new())
+        } else {
+            (c.name.clone(), c.description.clone())
+        }
+    };
+
+    let visible = state.candidates.len().min(MAX_POPUP_ROWS);
+    // 上方放不下就少画几行，而不是把弹窗顶出屏幕。
+    let visible = visible.min(editor_area.y.saturating_sub(2) as usize).max(1);
+    let start = popup_window_start(state.selected, state.candidates.len(), visible);
+
+    let rows: Vec<(bool, String, String)> = state
+        .candidates
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(visible)
+        .map(|(i, c)| {
+            let (head, tail) = row_text(c);
+            (i == state.selected, head, tail)
+        })
+        .collect();
+
+    // **显示宽度，不是字符数。** 中日韩一个字占两列，按字符数算出来的框只有一半宽，
+    // 于是每一行都被截掉后半截——而截掉的正好是"这次会话讲了什么"那一段。
+    let widest = rows
+        .iter()
+        .map(|(_, head, tail)| head.width() + tail.width() + 6)
+        .max()
+        .unwrap_or(20);
+    let h = rows.len() as u16 + 2;
+    let w = editor_area.width.min(widest.max(20) as u16);
     let area = Rect {
         x: editor_area.x,
         y: editor_area.y.saturating_sub(h),
@@ -258,12 +316,10 @@ fn render_completion_popup(frame: &mut Frame, editor_area: Rect, state: &Complet
         height: h,
     };
     frame.render_widget(Clear, area);
-    let lines: Vec<Line<'static>> = state
-        .candidates
-        .iter()
-        .enumerate()
-        .map(|(i, c)| {
-            let selected = i == state.selected;
+
+    let lines: Vec<Line<'static>> = rows
+        .into_iter()
+        .map(|(selected, head, tail)| {
             let marker = if selected { "❯ " } else { "  " };
             let style = if selected {
                 Style::default()
@@ -273,15 +329,24 @@ fn render_completion_popup(frame: &mut Frame, editor_area: Rect, state: &Complet
                 Style::default()
             };
             Line::from(vec![
-                Span::styled(format!("{marker}{}", c.name), style),
-                Span::raw("  "),
-                Span::styled(c.description.clone(), Style::default().fg(COLOR_SECONDARY)),
+                Span::styled(format!("{marker}{head}"), style),
+                Span::raw(if tail.is_empty() { "" } else { "  " }),
+                Span::styled(tail, Style::default().fg(COLOR_SECONDARY)),
             ])
         })
         .collect();
-    let block = Block::default()
+    let mut block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(COLOR_ACCENT));
+    // 装不下的时候说一声在第几条。没有这个提示，一个 20 条的列表看起来和 10 条的
+    // 一模一样。
+    if state.candidates.len() > visible {
+        block = block.title(format!(
+            " {}/{} ",
+            state.selected + 1,
+            state.candidates.len()
+        ));
+    }
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
@@ -482,6 +547,84 @@ mod tests {
             height(&state, 80),
             1 /*top_rule*/ + 1 /*editor*/ + 1 /*bottom_rule*/
         );
+    }
+
+    /// **看得见的和选得中的必须是同一批。**
+    ///
+    /// 以前弹窗固定只画 3 行而 `/resume` 一次给 20 条，第 4 条往后的高亮在屏幕外面
+    /// 走，回车换到一个用户从没看见过的会话。
+    #[test]
+    fn the_window_always_contains_the_selected_row() {
+        for len in [1usize, 3, 10, 20] {
+            for selected in 0..len {
+                let visible = MAX_POPUP_ROWS.min(len);
+                let start = popup_window_start(selected, len, visible);
+                assert!(
+                    (start..start + visible).contains(&selected),
+                    "len={len} selected={selected} 落在了窗口 [{start}, {}) 外面",
+                    start + visible
+                );
+                assert!(
+                    start + visible <= len,
+                    "len={len} selected={selected} 窗口越过了列表末尾"
+                );
+            }
+        }
+    }
+
+    /// 装得下就不滚——列表短的时候不该莫名其妙从中间开始画。
+    #[test]
+    fn a_short_list_is_never_scrolled() {
+        assert_eq!(popup_window_start(2, 3, 10), 0);
+        assert_eq!(popup_window_start(0, 1, 10), 0);
+    }
+
+    #[test]
+    fn the_session_picker_shows_what_a_session_was_about_not_its_id() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let state = CompletionPopupState {
+            kind: CompletionKind::Session,
+            query: String::new(),
+            candidates: (0..20)
+                .map(|i| crate::frame_state::CompletionCandidate {
+                    name: format!("BASE58id{i:02}"),
+                    description: format!("2026-09-0{}  4 msgs  第{i}次会话", i % 9 + 1),
+                })
+                .collect(),
+            selected: 15,
+        };
+        let mut t = Terminal::new(TestBackend::new(70, 24)).unwrap();
+        t.draw(|f| {
+            let editor = Rect {
+                x: 0,
+                y: 20,
+                width: 70,
+                height: 3,
+            };
+            render_completion_popup(f, editor, &state);
+        })
+        .unwrap();
+        let buf = t.backend().buffer().clone();
+        let screen: String = (0..24)
+            .map(|y| {
+                (0..70)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // TestBackend 把双宽字符画成"字 + 一个占位空格"，所以比对前先把空格去掉。
+        let squeezed: String = screen.chars().filter(|c| *c != ' ').collect();
+        assert!(
+            squeezed.contains("第15次会话"),
+            "选中项必须完整出现在屏幕上（截断的正好是最有用的那一段）:\n{screen}"
+        );
+        assert!(
+            !squeezed.contains("BASE58id15"),
+            "裸 id 对人没有信息量，不该占着宽度:\n{screen}"
+        );
+        assert!(squeezed.contains("16/20"), "得说清楚在第几条:\n{screen}");
     }
 
     #[test]

@@ -308,6 +308,18 @@ impl LocalUi {
         self.completion_dismissed = false;
     }
 
+    /// 把本地状态和刚到的这一帧对齐。**在 `merge` 之前调**。
+    ///
+    /// 今天只做一件事：有待确认请求时收起 `/resume` 选择器。`merge` 只在没有请求时
+    /// 才画选择器，而键盘路由是按"当前这条是不是选择题"分的——两者不一致时，一道
+    /// 自由文本题会让选择器**从屏幕上消失却继续吃着键盘**，用户打字没反应，回车
+    /// 静默换了会话。收起来是唯一诚实的选择：屏幕上没有的东西不该能被操作。
+    fn reconcile(&mut self, frame: &tui::FrameState) {
+        if frame.composer.content.approval.is_some() {
+            self.close_picker();
+        }
+    }
+
     /// 打开 `/resume` 选择器。高亮位归零——上一次停在第几项和这一次的列表无关。
     fn open_picker(&mut self, candidates: Vec<CompletionCandidate>) {
         self.session_picker = Some(candidates);
@@ -336,7 +348,9 @@ async fn run(
     let mut keys = EventStream::new();
 
     loop {
-        let snapshot = merge(frame_rx.borrow().clone(), &local);
+        let frame = frame_rx.borrow().clone();
+        local.reconcile(&frame);
+        let snapshot = merge(frame, &local);
         // 打点看到的必须是**合并之后**这一帧：选中块/滚动/草稿都是这一步才加上的。
         handle.trace_render(&snapshot);
         if std::mem::take(&mut local.redraw_requested) {
@@ -434,7 +448,7 @@ fn dispatch_key(
     // 打字没有去处。
     if local.session_picker.is_some() {
         return match outcome {
-            ResolveOutcome::Action(action) => dispatch_picker_action(&action, local),
+            ResolveOutcome::Action(action) => dispatch_picker_action(&action, local, handle),
             _ => Flow::Continue,
         };
     }
@@ -459,7 +473,7 @@ fn dispatch_key(
 ///
 /// 和审批对话框认同样的两组 action 名，理由一样：`Resolver` 取第一条匹配的绑定，
 /// 而默认键位里 `editor.*` 占着 Up/Down/Enter。
-fn dispatch_picker_action(action: &str, local: &mut LocalUi) -> Flow {
+fn dispatch_picker_action(action: &str, local: &mut LocalUi, handle: &dyn EngineHandle) -> Flow {
     let len = local.session_picker.as_ref().map_or(0, Vec::len);
     match action {
         "editor.history.prev" | "ask.prev" => {
@@ -481,6 +495,12 @@ fn dispatch_picker_action(action: &str, local: &mut LocalUi) -> Flow {
             }
         }
         "repl.dismiss" | "repl.exit" => local.close_picker(),
+        // 列表开着的时候 turn 可能正在跑。中断它是合理动作，而且是**唯一**能停下
+        // 一个跑飞了的 turn 的办法——以前它落进下面那个 `_`，用户得先关掉列表
+        // 才按得动 Ctrl+C。
+        "repl.cancel" => {
+            let _ = handle.dispatch(BridgeCommand::CancelTurn);
+        }
         _ => {}
     }
     Flow::Continue
@@ -547,25 +567,24 @@ fn shortcut(
 }
 
 fn active_approval(snapshot: &tui::FrameState) -> Option<&ApprovalRequest> {
-    let approval = snapshot.composer.content.approval.as_ref()?;
-    approval.pending.get(approval.active_idx)
+    snapshot.composer.content.approval.as_ref()?.active()
 }
 
 /// 当前这条待办里**要用选的**那种。`None` 包括"没有待办"和"待办是道问答题"。
+///
+/// 判据来自 [`tui::frame_state::ApprovalState::locks_composer`]——和渲染那边锁不锁
+/// 输入框读的是同一个方法。这里自己写一遍 `== Choose` 就是在重新制造那个 bug。
 fn active_choice(snapshot: &tui::FrameState) -> Option<&ApprovalRequest> {
-    active_approval(snapshot).filter(|r| r.answer_with == AnswerWith::Choose)
+    let approval = snapshot.composer.content.approval.as_ref()?;
+    approval.locks_composer().then(|| approval.active())?
 }
 
-/// 当前正在等一行文字的那道问题。
+/// 当前**正在答的**那条，如果它是道自由文本题。
+///
+/// 取的是 active 那一条，不是队列里随便找一条 `Type`：队列 `[Type, Choose]` 而
+/// 用户 Tab 到了后面那个权限请求时，回车该确认权限，不该去答那道已经不在眼前的题。
 fn pending_typed_question(snapshot: &tui::FrameState) -> Option<&ApprovalRequest> {
-    snapshot
-        .composer
-        .content
-        .approval
-        .as_ref()?
-        .pending
-        .iter()
-        .find(|r| r.answer_with == AnswerWith::Type)
+    active_approval(snapshot).filter(|r| r.answer_with == AnswerWith::Type)
 }
 
 /// 在 `[0, len)` 内环绕移动。`len == 0` 时原地不动（没有选项可选）。
@@ -629,6 +648,15 @@ fn dispatch_action(
         // Esc 没有对话框/弹窗要关时，退出块选择——和它在别处"退出当前模式"的语义一致。
         "repl.dismiss" if local.selected_block.is_some() => {
             local.selected_block = None;
+        }
+        // 队列里排到下一个。以前这个 action 只在 `dispatch_approval_action` 里，而那个
+        // 函数只有 active 是选择题时才到得了——于是排在一道自由文本题后面的权限请求
+        // 永远 Tab 不到、永远答不了，一直挂到 300 秒超时被自动拒绝。
+        "ask.next-request" => {
+            if let Some(approval) = &snapshot.composer.content.approval {
+                local.approval_active = step(local.approval_active, 1, approval.pending.len());
+                local.approval_selected = 0;
+            }
         }
         "transcript.select-prev" => local.select_block(snapshot, -1),
         "transcript.select-next" => local.select_block(snapshot, 1),
@@ -1160,6 +1188,11 @@ fn merge(mut frame: tui::FrameState, local: &LocalUi) -> tui::FrameState {
                     0
                 };
             }
+            // bridge 那边按 `active_idx = 0` 算了一个默认值，真正的 active 是上面这行
+            // 夹出来的——用同一个方法重算一次。Tab 到一道自由文本题时输入框要解锁，
+            // Tab 回权限请求时要锁上。
+            let locks = approval.locks_composer();
+            frame.composer.content.editor.locked = locks;
         }
         None => {
             frame.composer.content.completion = session_popup(local).or(compute_completion(local))
@@ -2471,16 +2504,17 @@ mod tests {
     /// 选中一项要跑出这一层——换会话是把整个引擎重建，`run` 做不了。
     #[test]
     fn picking_a_session_asks_for_a_restart() {
+        let handle = FakeHandle::new();
         let mut local = local_with("");
         local.open_picker(candidates(&["aaa", "bbb"]));
 
         assert_eq!(
-            dispatch_picker_action("ask.next", &mut local),
+            dispatch_picker_action("ask.next", &mut local, &handle),
             Flow::Continue
         );
         assert_eq!(local.completion_selected, 1);
         assert_eq!(
-            dispatch_picker_action("ask.confirm", &mut local),
+            dispatch_picker_action("ask.confirm", &mut local, &handle),
             Flow::Resume("bbb".into())
         );
         assert!(local.session_picker.is_none(), "选完要关掉");
@@ -2489,10 +2523,11 @@ mod tests {
     /// Esc 关掉选择器，而不是恢复到某个会话。
     #[test]
     fn escape_closes_the_picker_without_switching() {
+        let handle = FakeHandle::new();
         let mut local = local_with("");
         local.open_picker(candidates(&["aaa"]));
         assert_eq!(
-            dispatch_picker_action("repl.dismiss", &mut local),
+            dispatch_picker_action("repl.dismiss", &mut local, &handle),
             Flow::Continue
         );
         assert!(local.session_picker.is_none());
@@ -2536,13 +2571,109 @@ mod tests {
     /// 空列表按回车只是关掉，不是"恢复到一个叫空串的会话"。
     #[test]
     fn confirming_an_empty_picker_switches_to_nothing() {
+        let handle = FakeHandle::new();
         let mut local = local_with("");
         local.open_picker(Vec::new());
         assert_eq!(
-            dispatch_picker_action("ask.confirm", &mut local),
+            dispatch_picker_action("ask.confirm", &mut local, &handle),
             Flow::Continue
         );
         assert!(local.session_picker.is_none());
+    }
+
+    /// 列表开着的时候 turn 可能正在跑，中断它是唯一能停下一个跑飞了的 turn 的办法。
+    #[test]
+    fn ctrl_c_still_interrupts_the_turn_while_the_picker_is_open() {
+        let mut local = local_with("");
+        let handle = FakeHandle::new();
+        local.open_picker(candidates(&["aaa"]));
+
+        dispatch_picker_action("repl.cancel", &mut local, &handle);
+
+        assert!(
+            handle
+                .commands()
+                .iter()
+                .any(|c| matches!(c, BridgeCommand::CancelTurn)),
+            "got: {:?}",
+            handle.commands()
+        );
+        assert!(local.session_picker.is_some(), "中断 turn 不该顺手关掉列表");
+    }
+
+    /// 待确认请求一到，选择器就得收起来。
+    ///
+    /// 不收的话：`merge` 只在没有请求时才画它，而键盘路由是按"当前这条是不是
+    /// 选择题"分的——一道自由文本题会让选择器**从屏幕上消失却继续吃着键盘**，
+    /// 用户打字没反应，回车静默换了会话。
+    #[test]
+    fn an_arriving_request_takes_the_picker_off_the_screen_and_off_the_keyboard() {
+        let mut local = local_with("");
+        local.open_picker(candidates(&["aaa", "bbb"]));
+
+        local.reconcile(&frame_with(question_request(AnswerWith::Type, Vec::new())));
+
+        assert!(local.session_picker.is_none());
+        assert!(session_popup(&local).is_none());
+    }
+
+    /// 队列 `[自由文本题, 权限请求]`：锁不锁输入框，看的是**当前正在答的那一条**。
+    ///
+    /// 之前三处各算各的：锁看"队列里有没有选择题"、路由看"当前这条是不是"。
+    /// 于是输入框画成灰的（说"不能打字"），而打字确实能打——UI 和行为互相打脸。
+    #[test]
+    fn locking_follows_the_active_request_not_the_whole_queue() {
+        let mut frame = frame_without_approval();
+        frame.composer.content.approval = Some(ApprovalState {
+            pending: vec![
+                question_request(AnswerWith::Type, Vec::new()),
+                approval_request(),
+            ],
+            active_idx: 0,
+            view_mode: ApprovalViewMode::TabView,
+        });
+
+        let mut local = local_with("");
+        let merged = merge(frame.clone(), &local);
+        assert!(
+            !merged.composer.content.editor.locked,
+            "当前这条是问答题，输入框该能用"
+        );
+        assert!(active_choice(&merged).is_none(), "键盘不该归对话框");
+
+        // Tab 到后面那个权限请求。
+        local.approval_active = 1;
+        let merged = merge(frame, &local);
+        assert!(
+            merged.composer.content.editor.locked,
+            "当前这条是权限请求，输入框该锁上"
+        );
+        assert!(active_choice(&merged).is_some(), "键盘该归对话框了");
+    }
+
+    /// 排在自由文本题后面的权限请求必须 Tab 得到。
+    ///
+    /// 以前 `ask.next-request` 只在 `dispatch_approval_action` 里，而那个函数只有
+    /// 当前这条是选择题时才到得了——于是那个权限请求永远答不了，一直挂到 300 秒
+    /// 超时被自动拒绝。
+    #[test]
+    fn a_permission_prompt_queued_behind_a_question_can_still_be_reached() {
+        let mut frame = frame_without_approval();
+        frame.composer.content.approval = Some(ApprovalState {
+            pending: vec![
+                question_request(AnswerWith::Type, Vec::new()),
+                approval_request(),
+            ],
+            active_idx: 0,
+            view_mode: ApprovalViewMode::TabView,
+        });
+        let mut local = local_with("");
+        let handle = FakeHandle::new();
+        let snapshot = merge(frame, &local);
+
+        dispatch_action("ask.next-request", &mut local, &handle, &snapshot);
+
+        assert_eq!(local.approval_active, 1, "Tab 该切到那个权限请求上");
     }
 
     fn candidates(ids: &[&str]) -> Vec<CompletionCandidate> {

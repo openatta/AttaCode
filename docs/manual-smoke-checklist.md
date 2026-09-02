@@ -98,6 +98,10 @@ cargo run -p app
 - [ ] 转录顶部出现 sticky header，钉着你刚才那句问题 —— **只在那句已经滚出视口时**；还看得见时不该重复显示 🤖
 - [ ] 结束后 spinner 消失，footer 的累计用量增加
 
+- [ ] 🤖 让模型回一段**带空行和列表**的话（"分三点说明 Rust 的所有权，每点之间空一行"）
+      → 转录里真的是分行分点的。挤成一长串再被宽度截断，就是转录的行模型塌了
+      （一条 entry = 屏幕一行，而 ratatui 的 `Line` 会把里面的 `\n` 直接吞掉）
+
 ## 3. 工具调用 + 折叠 + diff
 
 发一句 `读一下 Cargo.toml，然后把 README.md 里第一行的标题改成 AttaCode（改完再改回去）`。
@@ -151,6 +155,20 @@ Core 自带的 `Elicitation` 只认权限提问，所以我们换了自己那版
 - [ ] 答案以 `/` 开头（比如打 `/tmp 那个目录`）时照样是答案，不会被当成 slash 命令
 - [ ] 问题挂着的时候 `Ctrl+C` 中断 turn → 对话框跟着消失，输入框恢复可用
       （不消失的话它会一直占着 composer，人连字都打不了）
+- [ ] 中断的**同一瞬间**按回车提交一行 → 转录里有一句"这个问题已经撤走了，
+      这行答案没送出去"，而不是那一行凭空消失
+
+### 5.6 两种问题排在一起（这一段最容易回归）
+
+让模型在同一轮里先 `AskUserQuestion`（不带选项）再做一次要审批的写操作，凑出
+`[自由文本题, 权限请求]` 这个队列：
+
+- [ ] 当前是那道问答题时：输入框**没有变灰**，能打字
+- [ ] `Tab` 能切到后面那个权限请求（切过去之后输入框变灰）
+      ——切不过去的话它会一直挂到 300 秒超时被自动拒绝
+- [ ] 切回问答题，输入框又能用了
+- [ ] 队列里还有东西时打开 `/resume` → 列表根本不出现（有待确认请求时它会被收起来，
+      因为屏幕上没有的东西不该能被操作）
 
 ## 6. 取消
 
@@ -180,10 +198,16 @@ Core 自带的 `Elicitation` 只认权限提问，所以我们换了自己那版
 - [ ] 🤖 `/model` 回车 → 转录里报当前模型
 - [ ] `/model claude-sonnet-5` → 状态栏立刻换，转录留一条 note；下一轮真的用新模型（看 smoke 或日志）
 - [ ] `/help` 转发给 Core 并有回应
-- [ ] `/doctor` → 转录里一份四行的报告：`model.provider` / `history.store` / `sandbox` /
-      `permissions`，每行都说得出这次会话**实际**装成了什么
+- [ ] `/doctor` → 转录里一份**五行**的报告（`model.provider` / `history.store` /
+      `sandbox` / `permissions` / `settings.unused`），**每条各占一行**
+      ——挤成一串说明转录的行模型又塌了，见 `push_lines`
 - [ ] `/doctor` 的 `sandbox` 那行在 macOS 上是 `MacOSSandboxExec`（不是 `Unavailable`）
       ——是 `Unavailable` 就说明 `base/sandbox` 那个 feature 掉了，见 CLAUDE.md
+- [ ] `model.provider` 那行说得出**选中的 provider id**，端点被 `ANTHROPIC_BASE_URL`
+      改过时还会带上 `→ <url>`
+- [ ] 往 `.atta/settings.json` 里加一段 `"scripts": [...]` → `/doctor` 的
+      `settings.unused` 变成 `!`，并说清楚为什么不生效（这三段今天是接不上的，
+      但绝不该是静默的）
 - [ ] `/quit` 退出
 
 ## 9. 会话 resume
@@ -209,6 +233,11 @@ cargo run -p app -- --continue   # 或 --resume <session-id>
 - [ ] `/resume 一个关键词` → 只列内容里有这个词的会话
 - [ ] `/resume 一个绝对匹配不到的词` → 转录里一句 "nothing matches"，**不弹空列表**
 - [ ] 一个全新的空项目里 `/resume` → 一句 "no earlier sessions in this project"
+- [ ] 攒够 10 个以上会话再 `/resume` → **能一直往下翻到最后一条**，选中项始终在框里，
+      边框上有 `n/总数`（以前固定只画 3 行、没有滚动，第 4 条往后的高亮在屏幕外面走，
+      回车换到一个你从没看见过的会话）
+- [ ] 列表里看到的是"时间 / 条数 / 讲了什么"，**不是**一串 BASE58 id
+- [ ] turn 跑着的时候开 `/resume`，按 `Ctrl+C` → turn 被中断，**列表不关**
 
 ## 10. 异常与收尾
 
