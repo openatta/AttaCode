@@ -11,7 +11,7 @@
 //! 补全弹窗 → 移动选中项；多行草稿 → 行间移动；到边界 → 翻输入历史。
 //! 还缺的是选区和 undo。
 
-use bridge::{BootstrapConfig, BridgeCommand, EngineHandle, Resume, DEFAULT_MODEL};
+use bridge::{BootstrapConfig, BridgeCommand, EngineHandle, Resume, Session, DEFAULT_MODEL};
 use crossterm::event::{
     Event, EventStream, KeyCode as CtKeyCode, KeyEvent, KeyEventKind, KeyModifiers,
 };
@@ -24,7 +24,8 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io::stdout;
 use tokio_stream::StreamExt;
 use tui::frame_state::{
-    ApprovalOption, ApprovalRequest, CompletionCandidate, CompletionKind, CompletionPopupState,
+    AnswerWith, ApprovalOption, ApprovalRequest, CompletionCandidate, CompletionKind,
+    CompletionPopupState,
 };
 
 const USAGE: &str = "\
@@ -35,7 +36,7 @@ attacode — AttaCore 引擎的终端 UI
 选项:
   -m, --model <NAME>  这次运行用的模型（压过 ANTHROPIC_MODEL 和 settings.json）
   -c, --continue      接着本项目最近一次会话跑
-      --resume <ID>   接着指定的会话跑（id 见 ~/.atta/sessions/<项目>/）
+      --resume <ID>   接着指定的会话跑（不知道 id 就先进去，再用 /resume 挑）
   -h, --help          打印这段帮助
 ";
 
@@ -52,20 +53,64 @@ async fn main() -> anyhow::Result<()> {
         config.model_override = args.model;
     }
     config.resume = args.resume;
-    let (handle, cancel) = bridge::start(config).await?;
+
+    // **第一个引擎在进 raw mode 之前建。** 凭据不对、`--resume` 点了个不存在的 id、
+    // settings 坏了——这些都该在普通终端上报出来，而不是先闪一屏 alternate screen
+    // 再把话说完。
+    let session = bridge::start(config.clone()).await?;
 
     enable_raw_mode()?;
     let mut out = stdout();
     execute!(out, EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(out))?;
 
-    let result = run(&mut terminal, handle.as_ref()).await;
+    let result = sessions(&mut terminal, config, session).await;
 
-    cancel.cancel();
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     result
+}
+
+/// 一个接一个地跑会话，直到用户要退出。
+///
+/// `/resume` 换会话就是**换一个引擎**：模型的上下文、工具表、权限门、转录，整条链
+/// 都绑在一个 `runtime::Agent` 上，而 `Agent::run` 已经 `&mut self` 借走了它。所以
+/// 换会话在这里表现为"关掉这个，起一个新的"，而不是往运行中的引擎里塞一个新 id。
+///
+/// 终端的进出留在 `main`：换会话时屏幕不该闪一下。`LocalUi`（草稿、滚动、选中块）
+/// 跟着 `run` 一起重来，这是对的——那些状态说的是上一个会话的事。
+async fn sessions(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    mut config: BootstrapConfig,
+    mut session: Session,
+) -> anyhow::Result<()> {
+    loop {
+        let outcome = run(terminal, session.handle.as_ref()).await;
+        let Flow::Resume(id) = outcome? else {
+            // `run` 只会以 `Quit` / `Resume` 之一结束；其余的它自己就地处理了。
+            session.shutdown();
+            return Ok(());
+        };
+
+        let mut next_config = config.clone();
+        next_config.resume = Some(Resume::Id(id));
+        // **先把新的建起来，再关掉旧的。** 顺序反过来的话，新会话建不起来（文件被删了、
+        // 盘满了）就意味着用户按了一下 `/resume`，然后手上那个会话没了。这里换不过去
+        // 就留在原地，把原因写进转录。
+        match bridge::start(next_config.clone()).await {
+            Ok(next) => {
+                session.shutdown();
+                config = next_config;
+                session = next;
+            }
+            Err(e) => {
+                let _ = session.handle.dispatch(BridgeCommand::Note {
+                    text: format!("/resume failed, staying in this session: {e}"),
+                });
+            }
+        }
+    }
 }
 
 /// 命令行参数。手写解析而不是拉 `clap`：目前就这几个开关，一个依赖换不来这点便利。
@@ -120,6 +165,12 @@ struct LocalUi {
     /// `CommandRegistry`, refreshed when the engine reports the skill catalog changed.
     commands: Vec<CompletionCandidate>,
     completion_selected: usize,
+    /// `/resume` 选择器的候选，`None` = 没开。
+    ///
+    /// 和补全弹窗不同，这一份**不是**从 `draft` 推出来的：它是一次读盘的结果，
+    /// 推不出来，只能存着。高亮位复用 `completion_selected`——同一时刻两个列表不会
+    /// 都开着（选择器一开就霸占键盘，`draft` 也被清空了，补全的前提没了）。
+    session_picker: Option<Vec<CompletionCandidate>>,
     /// Esc closes the popup without touching `draft`; re-typing anything reopens it
     /// (see `note_draft_changed`).
     completion_dismissed: bool,
@@ -159,6 +210,7 @@ impl LocalUi {
             cursor: 0,
             commands,
             completion_selected: 0,
+            session_picker: None,
             completion_dismissed: false,
             approval_selected: 0,
             approval_active: 0,
@@ -255,12 +307,25 @@ impl LocalUi {
         self.completion_selected = 0;
         self.completion_dismissed = false;
     }
+
+    /// 打开 `/resume` 选择器。高亮位归零——上一次停在第几项和这一次的列表无关。
+    fn open_picker(&mut self, candidates: Vec<CompletionCandidate>) {
+        self.session_picker = Some(candidates);
+        self.completion_selected = 0;
+    }
+
+    fn close_picker(&mut self) {
+        self.session_picker = None;
+        self.completion_selected = 0;
+    }
 }
 
+/// 事件循环。返回它是**怎么**结束的——调用方靠这个区分"用户要退出"和"用户要换到
+/// 另一个会话"，后者要把整个引擎重建一遍。
 async fn run(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     handle: &dyn EngineHandle,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Flow> {
     let mut frame_rx = handle.subscribe();
     let mut commands_rx = handle.subscribe_commands();
     let mut resolver = Resolver::new(default_bindings());
@@ -303,31 +368,53 @@ async fn run(
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
-                if !dispatch_key(key, &mut resolver, &mut local, handle, &snapshot) {
-                    break;
+                match dispatch_key(key, &mut resolver, &mut local, handle, &snapshot) {
+                    Flow::Continue => {}
+                    Flow::Quit => break,
+                    // 读盘。放在这里而不是 `submit` 里，是因为只有这一层是 async 的
+                    // ——一个几百个会话的项目要读一会儿，同步做就是画面卡住。
+                    Flow::ListSessions(query) => {
+                        let found = handle.sessions(&query).await;
+                        if found.is_empty() {
+                            let _ = handle.dispatch(BridgeCommand::Note {
+                                text: if query.is_empty() {
+                                    "/resume: no earlier sessions in this project".into()
+                                } else {
+                                    format!("/resume: nothing matches `{query}`")
+                                },
+                            });
+                        } else {
+                            local.open_picker(found);
+                        }
+                    }
+                    // 换会话要把引擎整个重建，这一层做不到——交给 `main`。
+                    Flow::Resume(id) => return Ok(Flow::Resume(id)),
                 }
             }
         }
     }
-    Ok(())
+    Ok(Flow::Quit)
 }
 
-/// Returns `false` when the loop should exit.
+/// 一次按键 → 事件循环该干什么。
 fn dispatch_key(
     key: KeyEvent,
     resolver: &mut Resolver,
     local: &mut LocalUi,
     handle: &dyn EngineHandle,
     snapshot: &tui::FrameState,
-) -> bool {
+) -> Flow {
     let outcome = resolver.on_key(&key);
     handle.trace_key(
         &format!("{:?}+{:?}", key.modifiers, key.code),
         &format!("{outcome:?}"),
     );
-    // 有待批准的权限请求时，键盘整体归对话框——`FrameState` 那边 composer 已经是
+    // 有待批准的请求时，键盘整体归对话框——`FrameState` 那边 composer 已经是
     // `locked`，路由不跟着改的话 Enter 会把草稿提交给一个正卡在权限检查上的引擎。
-    if let Some(req) = active_approval(snapshot) {
+    //
+    // **自由文本那一档除外**：那种问题要的答案就是用户在 composer 里打出来的，
+    // 键盘必须留在编辑器上。它走下面的普通路径，由 `submit` 认出来送去答题。
+    if let Some(req) = active_choice(snapshot) {
         let pending = snapshot
             .composer
             .content
@@ -340,7 +427,15 @@ fn dispatch_key(
                 dispatch_approval_action(&action, local, handle, req, pending)
             }
             // 对话框开着时普通字符没有去处（composer 锁着），直接丢。
-            _ => true,
+            _ => Flow::Continue,
+        };
+    }
+    // 会话选择器开着时，键盘整体归它——它是个覆盖在 composer 上的列表，
+    // 打字没有去处。
+    if local.session_picker.is_some() {
+        return match outcome {
+            ResolveOutcome::Action(action) => dispatch_picker_action(&action, local),
+            _ => Flow::Continue,
         };
     }
     match outcome {
@@ -349,15 +444,46 @@ fn dispatch_key(
             if matches!(action.as_str(), "ask.yes-shortcut" | "ask.no-shortcut") =>
         {
             insert_char(key, local);
-            true
+            Flow::Continue
         }
         ResolveOutcome::Action(action) => dispatch_action(&action, local, handle, snapshot),
-        ResolveOutcome::Partial | ResolveOutcome::ChordCancelled => true,
+        ResolveOutcome::Partial | ResolveOutcome::ChordCancelled => Flow::Continue,
         ResolveOutcome::Unmatched(_) => {
             insert_char(key, local);
-            true
+            Flow::Continue
         }
     }
+}
+
+/// `/resume` 选择器开着时的键位。
+///
+/// 和审批对话框认同样的两组 action 名，理由一样：`Resolver` 取第一条匹配的绑定，
+/// 而默认键位里 `editor.*` 占着 Up/Down/Enter。
+fn dispatch_picker_action(action: &str, local: &mut LocalUi) -> Flow {
+    let len = local.session_picker.as_ref().map_or(0, Vec::len);
+    match action {
+        "editor.history.prev" | "ask.prev" => {
+            local.completion_selected = step(local.completion_selected, -1, len)
+        }
+        "editor.history.next" | "ask.next" => {
+            local.completion_selected = step(local.completion_selected, 1, len)
+        }
+        "editor.submit" | "ask.confirm" => {
+            let picked = local
+                .session_picker
+                .as_ref()
+                .and_then(|c| c.get(local.completion_selected))
+                .map(|c| c.name.clone());
+            local.close_picker();
+            // 选不出东西（空列表）时只是关掉，不是"恢复到一个叫空串的会话"。
+            if let Some(id) = picked {
+                return Flow::Resume(id);
+            }
+        }
+        "repl.dismiss" | "repl.exit" => local.close_picker(),
+        _ => {}
+    }
+    Flow::Continue
 }
 
 /// 权限对话框开着时的键位。
@@ -372,7 +498,7 @@ fn dispatch_approval_action(
     handle: &dyn EngineHandle,
     req: &ApprovalRequest,
     pending: usize,
-) -> bool {
+) -> Flow {
     match action {
         // 多个请求排队时切下一个。渲染那边早就画了 tab 条，但一直没有键能切——
         // `active_idx` 恒为 0，后面的请求只能等前面的答完才看得见。
@@ -387,27 +513,59 @@ fn dispatch_approval_action(
             local.approval_selected = step(local.approval_selected, 1, req.options.len())
         }
         "editor.submit" | "ask.confirm" => {
-            let choice = req
-                .options
-                .get(local.approval_selected)
-                .copied()
-                .unwrap_or(ApprovalOption::Deny);
-            respond(handle, local, req, choice);
+            // 选不出东西时什么都不做，而不是替用户拒绝：这个分支现在也服务模型的
+            // 提问，那里 `Deny` 根本不在选项里，凭空发一个等于替用户答了道没答过
+            // 的题。空选项列表在 `AnswerWith::Choose` 下本就不该出现（见
+            // `bridge::reducer::pending_from_question`），真出现了也该卡住而不是乱答。
+            if let Some(choice) = req.options.get(local.approval_selected).cloned() {
+                respond(handle, local, req, choice);
+            }
         }
-        "ask.yes-shortcut" => respond(handle, local, req, ApprovalOption::PermitOnce),
-        "ask.no-shortcut" | "repl.dismiss" => respond(handle, local, req, ApprovalOption::Deny),
+        // `y`/`n` 是权限门那道题的快捷键。模型的提问里没有这两个选项，按下去
+        // 应该什么都不发生——`shortcut` 只在选项表里真有它的时候才作数。
+        "ask.yes-shortcut" => shortcut(handle, local, req, ApprovalOption::PermitOnce),
+        "ask.no-shortcut" | "repl.dismiss" => shortcut(handle, local, req, ApprovalOption::Deny),
         // 权限检查把 turn 卡住了，中断它仍然是合理动作。
         "repl.cancel" => {
             let _ = handle.dispatch(BridgeCommand::CancelTurn);
         }
         _ => {}
     }
-    true
+    Flow::Continue
+}
+
+/// 只在 `option` 真的是这道题的选项之一时才回它。
+fn shortcut(
+    handle: &dyn EngineHandle,
+    local: &mut LocalUi,
+    req: &ApprovalRequest,
+    option: ApprovalOption,
+) {
+    if req.options.contains(&option) {
+        respond(handle, local, req, option);
+    }
 }
 
 fn active_approval(snapshot: &tui::FrameState) -> Option<&ApprovalRequest> {
     let approval = snapshot.composer.content.approval.as_ref()?;
     approval.pending.get(approval.active_idx)
+}
+
+/// 当前这条待办里**要用选的**那种。`None` 包括"没有待办"和"待办是道问答题"。
+fn active_choice(snapshot: &tui::FrameState) -> Option<&ApprovalRequest> {
+    active_approval(snapshot).filter(|r| r.answer_with == AnswerWith::Choose)
+}
+
+/// 当前正在等一行文字的那道问题。
+fn pending_typed_question(snapshot: &tui::FrameState) -> Option<&ApprovalRequest> {
+    snapshot
+        .composer
+        .content
+        .approval
+        .as_ref()?
+        .pending
+        .iter()
+        .find(|r| r.answer_with == AnswerWith::Type)
 }
 
 /// 在 `[0, len)` 内环绕移动。`len == 0` 时原地不动（没有选项可选）。
@@ -424,7 +582,7 @@ fn dispatch_action(
     local: &mut LocalUi,
     handle: &dyn EngineHandle,
     snapshot: &tui::FrameState,
-) -> bool {
+) -> Flow {
     let completion_active = compute_completion(local).is_some();
     match action {
         "editor.submit" if completion_active && !completion_already_typed(local) => {
@@ -464,7 +622,7 @@ fn dispatch_action(
         }
         "repl.exit" => {
             if local.draft.is_empty() {
-                return false;
+                return Flow::Quit;
             }
         }
         "repl.dismiss" if completion_active => local.completion_dismissed = true,
@@ -477,7 +635,7 @@ fn dispatch_action(
         "transcript.toggle-expand" => toggle_selected_block(local, snapshot, handle),
         _ => {}
     }
-    true
+    Flow::Continue
 }
 
 /// header 钉的那句（最后一条用户输入）此刻在视口里看得见吗？
@@ -543,11 +701,32 @@ fn toggle_selected_block(local: &LocalUi, snapshot: &tui::FrameState, handle: &d
     let _ = handle.dispatch(BridgeCommand::ToggleExpand { block_id });
 }
 
+/// 一次按键之后事件循环该干什么。
+///
+/// 取代原来那个 `bool`。`false` 只能说"停下来"，说不了"停下来，然后换到那个会话
+/// 去"——而 `/resume` 要的正是后者。两件要跑出这层的事（列会话、换会话）都得由
+/// `run` 的 async 上下文来做：列会话要读盘，换会话要重建整个引擎。
+#[derive(Debug, PartialEq, Eq)]
+enum Flow {
+    /// 接着跑。
+    Continue,
+    /// 收摊。
+    Quit,
+    /// 把这个查询的会话列表取回来，塞进选择器。空串 = 最近的几个。
+    ListSessions(String),
+    /// 换到这个会话去。
+    Resume(String),
+}
+
 /// app 自己处理、不转发给 Core 的 slash 命令。
 enum LocalCommand {
     Quit,
     /// `/model` 不带参数 = 报当前模型；带参数 = 切过去。
     Model(Option<String>),
+    /// `/doctor` —— 这次会话到底装成了什么样。见 `bridge::doctor`。
+    Doctor,
+    /// `/resume [关键词]` —— 打开会话选择器。空串 = 最近的几个。
+    Resume(String),
 }
 
 /// `/` 前缀的一次性分流。认出来的在本地处理，其余原样转发给 Core 解析——补全
@@ -564,6 +743,8 @@ fn local_command(text: &str) -> Option<LocalCommand> {
             let name = rest.trim();
             (!name.is_empty()).then(|| name.to_string())
         })),
+        "/doctor" => Some(LocalCommand::Doctor),
+        "/resume" => Some(LocalCommand::Resume(rest.trim().to_string())),
         _ => None,
     }
 }
@@ -575,6 +756,14 @@ fn local_command_candidates() -> Vec<CompletionCandidate> {
         (
             "/model",
             "Switch the model for this session  (args: [name])",
+        ),
+        (
+            "/doctor",
+            "Report how this session is wired: provider, transcript, sandbox, permissions",
+        ),
+        (
+            "/resume",
+            "Switch to an earlier session in this project  (args: [search text])",
         ),
         ("/quit", "Exit AttaCode"),
         ("/exit", "Exit AttaCode"),
@@ -588,9 +777,9 @@ fn local_command_candidates() -> Vec<CompletionCandidate> {
 }
 
 /// 返回 `false` 时调用方应退出事件循环。
-fn submit(local: &mut LocalUi, handle: &dyn EngineHandle, snapshot: &tui::FrameState) -> bool {
+fn submit(local: &mut LocalUi, handle: &dyn EngineHandle, snapshot: &tui::FrameState) -> Flow {
     if local.draft.is_empty() {
-        return true;
+        return Flow::Continue;
     }
     let text = std::mem::take(&mut local.draft);
     local.cursor = 0;
@@ -599,8 +788,22 @@ fn submit(local: &mut LocalUi, handle: &dyn EngineHandle, snapshot: &tui::FrameS
     // 发了新消息就跳回底部——不然自己刚发的那句在视口外，看着像没发出去。
     local.scroll_offset = None;
     local.selected_block = None;
+    // 模型正等着一行文字时，这一行就是答案，**不是**新一轮对话。
+    //
+    // 放在 slash 分流之前：一道"给这个分支起个名字"的问题，答案完全可能以 `/`
+    // 开头，把它当命令解析等于把用户的答案吃掉。用户想改主意就中断 turn
+    // （`repl.cancel`），那条路会把问题一起撤走。
+    if let Some(req) = pending_typed_question(snapshot) {
+        let _ = handle.dispatch(BridgeCommand::AnswerQuestion {
+            prompt_id: req.prompt_id.clone(),
+            text,
+        });
+        return Flow::Continue;
+    }
     let cmd = match local_command(&text) {
-        Some(LocalCommand::Quit) => return false,
+        Some(LocalCommand::Quit) => return Flow::Quit,
+        // 列表要读盘，这里做不了——交给 `run` 的 async 上下文。
+        Some(LocalCommand::Resume(query)) => return Flow::ListSessions(query),
         Some(LocalCommand::Model(Some(name))) => BridgeCommand::SetModel { name },
         Some(LocalCommand::Model(None)) => BridgeCommand::Note {
             text: format!(
@@ -608,10 +811,11 @@ fn submit(local: &mut LocalUi, handle: &dyn EngineHandle, snapshot: &tui::FrameS
                 snapshot.footer_hints.model
             ),
         },
+        Some(LocalCommand::Doctor) => BridgeCommand::Doctor,
         None => BridgeCommand::Submit { text },
     };
     let _ = handle.dispatch(cmd);
-    true
+    Flow::Continue
 }
 
 /// 回一个权限决定，并把选择位复位——下一个请求从第一项（"Yes"）开始，而不是
@@ -622,7 +826,7 @@ fn respond(
     req: &ApprovalRequest,
     decision: ApprovalOption,
 ) {
-    let _ = handle.dispatch(BridgeCommand::RespondPermission {
+    let _ = handle.dispatch(BridgeCommand::Respond {
         prompt_id: req.prompt_id.clone(),
         decision,
     });
@@ -849,6 +1053,11 @@ impl LocalUi {
 /// `local.commands` each time (mirrors how draft/cursor are already merged in) —
 /// bridge only supplies the raw candidate list, not the filtered/open-or-closed popup.
 fn compute_completion(local: &LocalUi) -> Option<CompletionPopupState> {
+    // 选择器开着时补全不该同时冒出来。它俩共用 `completion_selected`，两个都开
+    // 就是两个列表争同一个高亮位。
+    if local.session_picker.is_some() {
+        return None;
+    }
     if local.completion_dismissed {
         return None;
     }
@@ -952,9 +1161,29 @@ fn merge(mut frame: tui::FrameState, local: &LocalUi) -> tui::FrameState {
                 };
             }
         }
-        None => frame.composer.content.completion = compute_completion(local),
+        None => {
+            frame.composer.content.completion = session_popup(local).or(compute_completion(local))
+        }
     }
     frame
+}
+
+/// `/resume` 选择器，借补全弹窗的壳子渲染。
+///
+/// 借而不是新画一个：它要的东西补全弹窗已经全有了——一列 `名字 + 说明`、一个高亮
+/// 位、上下键和回车。区别只在选中之后做什么，而那是 `dispatch_picker_action` 的事，
+/// 不是渲染的事。
+fn session_popup(local: &LocalUi) -> Option<CompletionPopupState> {
+    let candidates = local.session_picker.clone()?;
+    let selected = local
+        .completion_selected
+        .min(candidates.len().saturating_sub(1));
+    Some(CompletionPopupState {
+        kind: CompletionKind::Session,
+        query: String::new(),
+        candidates,
+        selected,
+    })
 }
 
 fn spinner_frame() -> char {
@@ -1329,7 +1558,10 @@ mod tests {
     fn submitting_model_with_a_name_switches_the_model() {
         let mut local = local_with("/model claude-opus-5");
         let handle = FakeHandle::new();
-        assert!(submit(&mut local, &handle, &frame_without_approval()));
+        assert_eq!(
+            submit(&mut local, &handle, &frame_without_approval()),
+            Flow::Continue
+        );
         assert!(matches!(
             handle.commands().as_slice(),
             [BridgeCommand::SetModel { name }] if name == "claude-opus-5"
@@ -1343,7 +1575,7 @@ mod tests {
         let handle = FakeHandle::new();
         let mut frame = frame_without_approval();
         frame.footer_hints.model = "claude-sonnet-5".into();
-        assert!(submit(&mut local, &handle, &frame));
+        assert_eq!(submit(&mut local, &handle, &frame), Flow::Continue);
         assert!(matches!(
             handle.commands().as_slice(),
             [BridgeCommand::Note { text }] if text.contains("claude-sonnet-5")
@@ -1760,6 +1992,7 @@ mod tests {
         let two = |a: usize| ApprovalState {
             pending: vec![
                 ApprovalRequest {
+                    answer_with: AnswerWith::Choose,
                     prompt_id: "p1".into(),
                     tool_name: "Bash".into(),
                     message: "第一个".into(),
@@ -1767,6 +2000,7 @@ mod tests {
                     selected_option: 0,
                 },
                 ApprovalRequest {
+                    answer_with: AnswerWith::Choose,
                     prompt_id: "p2".into(),
                     tool_name: "Write".into(),
                     message: "第二个".into(),
@@ -1816,6 +2050,7 @@ mod tests {
         let mut frame = frame_without_approval();
         frame.composer.content.approval = Some(ApprovalState {
             pending: vec![ApprovalRequest {
+                answer_with: AnswerWith::Choose,
                 prompt_id: "p2".into(),
                 tool_name: "Write".into(),
                 message: "只剩一个了".into(),
@@ -1907,7 +2142,10 @@ mod tests {
     fn submitting_from_mid_draft_sends_the_whole_draft() {
         let mut local = editing("hello |world");
         let handle = FakeHandle::new();
-        assert!(submit(&mut local, &handle, &frame_without_approval()));
+        assert_eq!(
+            submit(&mut local, &handle, &frame_without_approval()),
+            Flow::Continue
+        );
         assert!(matches!(
             handle.commands().as_slice(),
             [BridgeCommand::Submit { text }] if text == "hello world"
@@ -1917,12 +2155,18 @@ mod tests {
 
     // ── 权限对话框 ──
 
-    /// 只走 `dispatch`——订阅接口在这些测试里不会被碰到。
-    struct FakeHandle(std::sync::Mutex<Vec<BridgeCommand>>);
+    /// 只走 `dispatch` + `sessions`——订阅接口在这些测试里不会被碰到。
+    struct FakeHandle(
+        std::sync::Mutex<Vec<BridgeCommand>>,
+        std::sync::Mutex<Vec<CompletionCandidate>>,
+    );
 
     impl FakeHandle {
         fn new() -> Self {
-            Self(std::sync::Mutex::new(Vec::new()))
+            Self(
+                std::sync::Mutex::new(Vec::new()),
+                std::sync::Mutex::new(Vec::new()),
+            )
         }
         fn commands(&self) -> Vec<BridgeCommand> {
             self.0.lock().unwrap().clone()
@@ -1944,14 +2188,18 @@ mod tests {
                 .unwrap()
                 .iter()
                 .filter_map(|c| match c {
-                    BridgeCommand::RespondPermission { decision, .. } => Some(*decision),
+                    BridgeCommand::Respond { decision, .. } => Some(decision.clone()),
                     _ => None,
                 })
                 .collect()
         }
     }
 
+    #[bridge::async_trait]
     impl EngineHandle for FakeHandle {
+        async fn sessions(&self, _query: &str) -> Vec<CompletionCandidate> {
+            self.1.lock().unwrap().clone()
+        }
         fn dispatch(&self, cmd: BridgeCommand) -> Result<(), bridge::BridgeError> {
             self.0.lock().unwrap().push(cmd);
             Ok(())
@@ -1966,6 +2214,7 @@ mod tests {
 
     fn approval_request() -> ApprovalRequest {
         ApprovalRequest {
+            answer_with: AnswerWith::Choose,
             prompt_id: "p1".into(),
             tool_name: "Bash".into(),
             message: "run rm -rf /?".into(),
@@ -2070,6 +2319,239 @@ mod tests {
                 .any(|c| matches!(c, BridgeCommand::Submit { .. })),
             "Enter 应该确认对话框，而不是提交草稿"
         );
+    }
+
+    fn question_request(answer_with: AnswerWith, options: Vec<ApprovalOption>) -> ApprovalRequest {
+        ApprovalRequest {
+            answer_with,
+            prompt_id: "t1".into(),
+            tool_name: "Branch name".into(),
+            message: "叫什么好？".into(),
+            options,
+            selected_option: 0,
+        }
+    }
+
+    fn frame_with(req: ApprovalRequest) -> tui::FrameState {
+        let mut snapshot = frame_without_approval();
+        snapshot.composer.content.approval = Some(ApprovalState {
+            pending: vec![req],
+            active_idx: 0,
+            view_mode: ApprovalViewMode::TabView,
+        });
+        snapshot
+    }
+
+    /// 模型的多选题回的是它自己的 key，不是权限决定。
+    #[test]
+    fn confirming_a_model_question_sends_the_models_own_key() {
+        let mut local = local_with("");
+        let handle = FakeHandle::new();
+        let req = question_request(
+            AnswerWith::Choose,
+            vec![
+                ApprovalOption::Answer {
+                    key: "a".into(),
+                    label: "feat/x".into(),
+                },
+                ApprovalOption::Answer {
+                    key: "b".into(),
+                    label: "fix/y".into(),
+                },
+            ],
+        );
+
+        dispatch_approval_action("editor.history.next", &mut local, &handle, &req, 1);
+        dispatch_approval_action("editor.submit", &mut local, &handle, &req, 1);
+
+        assert_eq!(
+            handle.decisions(),
+            vec![ApprovalOption::Answer {
+                key: "b".into(),
+                label: "fix/y".into()
+            }]
+        );
+    }
+
+    /// `y`/`n`/Esc 是权限门那道题的快捷键。模型的提问里没有 `PermitOnce`/`Deny`
+    /// 这两个选项，按下去替用户答一道没答过的题是最糟的一种"方便"。
+    #[test]
+    fn permission_shortcuts_do_nothing_on_a_model_question() {
+        let mut local = local_with("");
+        let handle = FakeHandle::new();
+        let req = question_request(
+            AnswerWith::Choose,
+            vec![ApprovalOption::Answer {
+                key: "a".into(),
+                label: "A".into(),
+            }],
+        );
+
+        for action in ["ask.yes-shortcut", "ask.no-shortcut", "repl.dismiss"] {
+            dispatch_approval_action(action, &mut local, &handle, &req, 1);
+        }
+        assert!(handle.decisions().is_empty());
+    }
+
+    /// 自由文本题期间键盘留在 composer 上：打字进草稿，回车把草稿当答案送走
+    /// ——**不是**当成新一轮对话发给引擎。
+    #[test]
+    fn a_typed_question_takes_the_next_submitted_line_as_its_answer() {
+        let mut local = local_with("");
+        let handle = FakeHandle::new();
+        let mut resolver = Resolver::new(default_bindings());
+        let snapshot = frame_with(question_request(AnswerWith::Type, Vec::new()));
+
+        for c in "feat/ask".chars() {
+            dispatch_key(
+                KeyEvent::new(CtKeyCode::Char(c), KeyModifiers::NONE),
+                &mut resolver,
+                &mut local,
+                &handle,
+                &snapshot,
+            );
+        }
+        assert_eq!(local.draft, "feat/ask", "自由文本题期间打字要进草稿");
+
+        dispatch_key(
+            KeyEvent::new(CtKeyCode::Enter, KeyModifiers::NONE),
+            &mut resolver,
+            &mut local,
+            &handle,
+            &snapshot,
+        );
+
+        let cmds = handle.commands();
+        assert!(
+            matches!(&cmds[..], [BridgeCommand::AnswerQuestion { prompt_id, text }]
+                     if prompt_id == "t1" && text == "feat/ask"),
+            "got: {cmds:?}"
+        );
+    }
+
+    /// 答案完全可能以 `/` 开头。把它当 slash 命令解析等于把用户的答案吃掉。
+    #[test]
+    fn an_answer_that_looks_like_a_command_is_still_an_answer() {
+        let mut local = local_with("/model 这个名字");
+        let handle = FakeHandle::new();
+        let snapshot = frame_with(question_request(AnswerWith::Type, Vec::new()));
+
+        submit(&mut local, &handle, &snapshot);
+
+        let cmds = handle.commands();
+        assert!(
+            matches!(&cmds[..], [BridgeCommand::AnswerQuestion { text, .. }]
+                     if text == "/model 这个名字"),
+            "got: {cmds:?}"
+        );
+    }
+
+    // ── /resume 会话选择器 ──
+
+    /// `/resume` 不能就地处理：列表要读盘，而 `submit` 是同步的。它必须把这件事
+    /// 交出去。
+    #[test]
+    fn resume_asks_the_event_loop_to_fetch_the_list() {
+        let handle = FakeHandle::new();
+        for (draft, expected) in [
+            ("/resume", ""),
+            ("/resume 权限门", "权限门"),
+            ("/resume   ", ""),
+        ] {
+            let mut local = local_with(draft);
+            let flow = submit(&mut local, &handle, &frame_without_approval());
+            assert_eq!(flow, Flow::ListSessions(expected.into()), "draft: {draft}");
+        }
+        assert!(
+            handle.commands().is_empty(),
+            "/resume 不该变成一条发给引擎的命令"
+        );
+    }
+
+    /// 选中一项要跑出这一层——换会话是把整个引擎重建，`run` 做不了。
+    #[test]
+    fn picking_a_session_asks_for_a_restart() {
+        let mut local = local_with("");
+        local.open_picker(candidates(&["aaa", "bbb"]));
+
+        assert_eq!(
+            dispatch_picker_action("ask.next", &mut local),
+            Flow::Continue
+        );
+        assert_eq!(local.completion_selected, 1);
+        assert_eq!(
+            dispatch_picker_action("ask.confirm", &mut local),
+            Flow::Resume("bbb".into())
+        );
+        assert!(local.session_picker.is_none(), "选完要关掉");
+    }
+
+    /// Esc 关掉选择器，而不是恢复到某个会话。
+    #[test]
+    fn escape_closes_the_picker_without_switching() {
+        let mut local = local_with("");
+        local.open_picker(candidates(&["aaa"]));
+        assert_eq!(
+            dispatch_picker_action("repl.dismiss", &mut local),
+            Flow::Continue
+        );
+        assert!(local.session_picker.is_none());
+    }
+
+    /// 选择器开着时键盘整体归它：打字不该落进草稿，否则用户以为自己在输入。
+    #[test]
+    fn the_picker_takes_the_keyboard() {
+        let mut local = local_with("");
+        local.open_picker(candidates(&["aaa", "bbb"]));
+        let handle = FakeHandle::new();
+        let mut resolver = Resolver::new(default_bindings());
+
+        for c in "hello".chars() {
+            dispatch_key(
+                KeyEvent::new(CtKeyCode::Char(c), KeyModifiers::NONE),
+                &mut resolver,
+                &mut local,
+                &handle,
+                &frame_without_approval(),
+            );
+        }
+        assert_eq!(local.draft, "");
+        assert!(local.session_picker.is_some());
+    }
+
+    /// 选择器和补全弹窗共用 `completion_selected`，两个同时开就是两个列表争一个
+    /// 高亮位。选择器开着时补全必须让路。
+    #[test]
+    fn the_picker_and_the_completion_popup_are_never_both_open() {
+        let mut local = local_with("/mo");
+        assert!(compute_completion(&local).is_some());
+        local.open_picker(candidates(&["aaa"]));
+        assert!(compute_completion(&local).is_none());
+
+        let popup = session_popup(&local).expect("选择器要能上屏");
+        assert_eq!(popup.kind, CompletionKind::Session);
+        assert_eq!(popup.candidates[0].name, "aaa");
+    }
+
+    /// 空列表按回车只是关掉，不是"恢复到一个叫空串的会话"。
+    #[test]
+    fn confirming_an_empty_picker_switches_to_nothing() {
+        let mut local = local_with("");
+        local.open_picker(Vec::new());
+        assert_eq!(
+            dispatch_picker_action("ask.confirm", &mut local),
+            Flow::Continue
+        );
+        assert!(local.session_picker.is_none());
+    }
+
+    fn candidates(ids: &[&str]) -> Vec<CompletionCandidate> {
+        ids.iter()
+            .map(|id| CompletionCandidate {
+                name: (*id).into(),
+                description: "yesterday  3 msgs  x".into(),
+            })
+            .collect()
     }
 
     /// 本地高亮下标必须覆盖进快照，否则渲染出来的选中项永远是第一项。

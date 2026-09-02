@@ -5,14 +5,15 @@
 //! composer 的编辑器/滚动字段留默认值，由 `crates/app` 的事件循环在渲染前用本地
 //! UI 状态覆盖（bridge 不知道、也不需要知道用户正在编辑到第几个字符）。
 
+use crate::ask::{PendingQuestion, QuestionEvent};
 use crate::commands::CommandCatalog;
-use base::interface::event::AgentEvent;
+use base::event::AgentEvent;
 use runtime::agent::EventReceiver;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 // 不是 `std::time::Instant`：这个认 tokio 的假时钟，于是"状态行秒数在走"
 // 能用 `time::advance` 验，不必 sleep 真实时间（见本文件的 ticker 测试）。
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 use tui::frame_state::*;
 
@@ -82,10 +83,50 @@ struct ToolOutcome {
     is_error: bool,
 }
 
+/// 一条正在等人回答的东西。两种来源共用这个队列，因为屏幕上它们是同一个对话框：
+/// 引擎的权限门（`AgentEvent::PermissionPrompt`），和模型自己的提问
+/// （`AskUserQuestion`，见 [`crate::ask`]）。区别全在 `answer_with`/`options` 上，
+/// 以及答案回到哪儿去——那是 `handle` 的事。
 struct PendingApproval {
     prompt_id: String,
     tool_name: String,
     message: String,
+    answer_with: AnswerWith,
+    options: Vec<ApprovalOption>,
+}
+
+/// 权限门那一档的四个答案。每个待批准请求都是同一套，所以只写一次。
+fn permission_options() -> Vec<ApprovalOption> {
+    vec![
+        ApprovalOption::PermitOnce,
+        ApprovalOption::PermitSession,
+        ApprovalOption::PermitProject,
+        ApprovalOption::Deny,
+    ]
+}
+
+/// 模型的提问 → 队列里的一条。
+///
+/// `options` 为空是 Core schema 明说的一档（自由文本），这里翻成
+/// [`AnswerWith::Type`]：对话框只显示问题，composer 不锁，用户提交的下一行就是
+/// 答案。**不能**退回成"没有选项的多选题"——那是个选不动也退不出的死框。
+fn pending_from_question(q: PendingQuestion) -> PendingApproval {
+    let answer_with = if q.options.is_empty() {
+        AnswerWith::Type
+    } else {
+        AnswerWith::Choose
+    };
+    PendingApproval {
+        prompt_id: q.id,
+        tool_name: q.header,
+        message: q.question,
+        answer_with,
+        options: q
+            .options
+            .into_iter()
+            .map(|(key, label)| ApprovalOption::Answer { key, label })
+            .collect(),
+    }
 }
 
 /// 子代理条上的一行。
@@ -117,6 +158,7 @@ impl Reducer {
     /// 和渲染循环订阅用的 `watch::Receiver`。
     pub fn spawn(
         mut event_rx: EventReceiver,
+        mut questions_rx: mpsc::UnboundedReceiver<QuestionEvent>,
         model_name: String,
         cwd: String,
         commands: Arc<CommandCatalog>,
@@ -131,11 +173,31 @@ impl Reducer {
             }
         });
 
+        // 模型的提问走的是**另一条**流，不是 `AgentEvent`。`AgentEvent` 是 Core 的
+        // 词汇表，里面没有"模型想问点什么"这一项，而 `AskUserQuestion` 的替身工具
+        // （见 [`crate::ask`]）跑在引擎里、够得着的是我们自己的通道。两条流都只往
+        // 同一个 `DomainState` 里写，锁在 `apply_*` 内部，互不干扰。
+        let question_reducer = reducer.clone();
+        tokio::spawn(async move {
+            while let Some(event) = questions_rx.recv().await {
+                question_reducer.apply_question(event);
+            }
+        });
+
+        // 没有订阅方了就收工。以前这里是个 `loop {}`——进程一辈子只有一个归约器，
+        // 泄漏一个 task 看不出来。`/resume` 换会话之后就不是了：每换一次留一个永远
+        // 醒着的 500ms 定时器，各自还攥着一个 `Arc<Reducer>` 和一整棵 `DomainState`。
+        //
+        // 判据是"还有没有人在看"而不是某个取消信号：这个 task 的全部作用就是让画面
+        // 上的秒数走字，没人看的时候它没有任何事情可做。
         let tick_reducer = reducer.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(STATUS_TICK);
             loop {
                 interval.tick().await;
+                if tick_reducer.frame_tx.is_closed() {
+                    return;
+                }
                 tick_reducer.tick();
             }
         });
@@ -252,6 +314,18 @@ impl Reducer {
         let mut state = self.state.lock().unwrap();
         state.pending_approvals.retain(|p| p.prompt_id != prompt_id);
         self.broadcast(&state);
+    }
+
+    /// 模型提了个问题，或者不等了。见 [`crate::ask`]。
+    pub fn apply_question(&self, event: QuestionEvent) {
+        match event {
+            QuestionEvent::Ask(q) => {
+                let mut state = self.state.lock().unwrap();
+                state.pending_approvals.push(pending_from_question(q));
+                self.broadcast_as("Question", &state);
+            }
+            QuestionEvent::Withdraw(id) => self.resolve_prompt(&id),
+        }
     }
 
     /// `/model <name>` 落地：更新状态栏显示的模型名，并往转录里留一条记录。
@@ -380,6 +454,8 @@ impl Reducer {
                     prompt_id,
                     tool_name,
                     message,
+                    answer_with: AnswerWith::Choose,
+                    options: permission_options(),
                 });
             }
             AgentEvent::TurnComplete {
@@ -514,9 +590,14 @@ impl Reducer {
 }
 
 /// Recompute `state.status` from `active_turn_started`/`activity`/`usage`. No-op if no
-/// turn is currently active. `token_in`/`token_out` reflect *cumulative session* usage
-/// (Core doesn't stream incremental per-turn usage), not this turn's usage alone — that's
-/// a deliberate approximation, not exact per-turn accounting.
+/// turn is currently active. `token_in`/`token_out` reflect *cumulative session* usage,
+/// not this turn's usage alone, and they only move when a turn ends — the number is
+/// exact per completed turn and stale for the turn in flight.
+///
+/// Per-*call* numbers do exist as of AttaCore 0.2.2 (`ApiRequestPayload`: model,
+/// latency, stop reason, tokens), but they go out through telemetry, not through
+/// `AgentEvent`. Making the counter tick mid-turn means registering an `event.sink`
+/// or a telemetry recorder, not reading harder here.
 fn refresh_running_status(state: &mut DomainState) {
     let Some(started) = state.active_turn_started else {
         return;
@@ -531,11 +612,17 @@ fn refresh_running_status(state: &mut DomainState) {
 }
 
 /// Turns that ended short of the model finishing on its own. Core emits
-/// `TurnComplete` for all four (they used to return in total silence, which is
-/// what left a cancelled turn's spinner running forever), but the stop reason is
+/// `TurnComplete` for every one of them (they used to return in total silence, which
+/// is what left a cancelled turn's spinner running forever), but the stop reason is
 /// the only place the *why* survives — without a note the transcript just stops.
 /// `end_turn`/`max_tokens`/`stop_sequence` and friends need no explanation, hence
 /// `None`.
+///
+/// **This list has to be kept level with Core's.** A reason nobody has a sentence for
+/// is not a rendering gap you can see — it is a turn that stops with no explanation,
+/// which is the exact failure this function was written to fix. `context_exceeded`
+/// and `host_ceiling` arrived in AttaCore 0.2.x (the latter from the new
+/// `TurnPolicy`) and spent that release unexplained here.
 fn early_stop_note(stop_reason: &str) -> Option<String> {
     let text = match stop_reason {
         "cancelled" => "Turn cancelled.",
@@ -544,6 +631,15 @@ fn early_stop_note(stop_reason: &str) -> Option<String> {
         "max_structured_output_retries" => {
             "Turn stopped: the model kept returning unparseable structured output."
         }
+        // Compaction ran and the context was *still* over the hard cap. Unlike the
+        // others this one will not fix itself by waiting: the next turn starts from
+        // the same oversized history, so say what to do about it.
+        "context_exceeded" => {
+            "Turn stopped: the conversation is still over the context limit after \
+             compaction. Try /clear, or /compact with a narrower instruction."
+        }
+        "host_ceiling" => "Turn stopped: a host-configured turn limit was reached.",
+        "stopped_by_hook" => "Turn stopped by a configured hook.",
         _ => return None,
     };
     Some(text.to_string())
@@ -845,12 +941,8 @@ fn render(state: &DomainState) -> FrameState {
                     prompt_id: p.prompt_id.clone(),
                     tool_name: p.tool_name.clone(),
                     message: p.message.clone(),
-                    options: vec![
-                        ApprovalOption::PermitOnce,
-                        ApprovalOption::PermitSession,
-                        ApprovalOption::PermitProject,
-                        ApprovalOption::Deny,
-                    ],
+                    answer_with: p.answer_with,
+                    options: p.options.clone(),
                     selected_option: 0,
                 })
                 .collect(),
@@ -858,7 +950,12 @@ fn render(state: &DomainState) -> FrameState {
             view_mode: ApprovalViewMode::TabView,
         })
     };
-    let locked = approval.is_some();
+    // 自由文本那一档**不锁** composer——它要的答案就是用户在 composer 里打的那一行。
+    // 一并锁掉的话对话框会开着、输入框会死，而屏幕上没有任何一个键能推进它。
+    let locked = state
+        .pending_approvals
+        .iter()
+        .any(|p| p.answer_with == AnswerWith::Choose);
 
     FrameState {
         transcript: TranscriptState {
@@ -1083,6 +1180,148 @@ mod tests {
         rx.borrow().clone()
     }
 
+    fn question(id: &str, options: &[(&str, &str)]) -> QuestionEvent {
+        QuestionEvent::Ask(PendingQuestion {
+            id: id.into(),
+            header: "Branch name".into(),
+            question: "叫什么好？".into(),
+            options: options
+                .iter()
+                .map(|(k, l)| (k.to_string(), l.to_string()))
+                .collect(),
+        })
+    }
+
+    fn only_pending(f: &FrameState) -> ApprovalRequest {
+        let approval = f
+            .composer
+            .content
+            .approval
+            .as_ref()
+            .expect("a dialog should be up");
+        assert_eq!(approval.pending.len(), 1);
+        approval.pending[0].clone()
+    }
+
+    /// 多选题：选项原样上屏，`key` 一个字都不能改——模型可能在拿它做匹配。
+    #[test]
+    fn a_multiple_choice_question_becomes_a_chooser() {
+        let (r, rx) = reducer();
+        r.apply_question(question("t1", &[("a", "feat/x"), ("b", "fix/y")]));
+
+        let f = frame(&rx);
+        let req = only_pending(&f);
+        assert_eq!(req.prompt_id, "t1");
+        assert_eq!(req.tool_name, "Branch name");
+        assert_eq!(req.answer_with, AnswerWith::Choose);
+        assert_eq!(
+            req.options,
+            vec![
+                ApprovalOption::Answer {
+                    key: "a".into(),
+                    label: "feat/x".into()
+                },
+                ApprovalOption::Answer {
+                    key: "b".into(),
+                    label: "fix/y".into()
+                },
+            ]
+        );
+        assert!(
+            f.composer.content.editor.locked,
+            "选择题期间 composer 该锁住"
+        );
+    }
+
+    /// 自由文本题：**不能**退化成一个没有选项的选择器（那是个推不动的死框），
+    /// 而且 composer 必须留着能用——答案就是要在那儿打出来的。
+    #[test]
+    fn a_free_form_question_leaves_the_composer_usable() {
+        let (r, rx) = reducer();
+        r.apply_question(question("t2", &[]));
+
+        let f = frame(&rx);
+        let req = only_pending(&f);
+        assert_eq!(req.answer_with, AnswerWith::Type);
+        assert!(req.options.is_empty());
+        assert!(
+            !f.composer.content.editor.locked,
+            "自由文本题锁住 composer 就没有任何一个键能推进它了"
+        );
+    }
+
+    /// 提问方不等了，框就得收走——尤其是选择题，它占着 composer。
+    #[test]
+    fn withdrawing_a_question_takes_the_dialog_away() {
+        let (r, rx) = reducer();
+        r.apply_question(question("t3", &[("a", "A")]));
+        assert!(frame(&rx).composer.content.approval.is_some());
+
+        r.apply_question(QuestionEvent::Withdraw("t3".into()));
+        let f = frame(&rx);
+        assert!(f.composer.content.approval.is_none());
+        assert!(!f.composer.content.editor.locked);
+    }
+
+    /// 权限提问和模型提问排在同一个队列里，各自保留自己的答法。
+    #[test]
+    fn a_permission_prompt_and_a_question_keep_their_own_shapes() {
+        let (r, rx) = reducer();
+        r.apply_event(AgentEvent::PermissionPrompt {
+            prompt_id: "p1".into(),
+            tool_name: "Bash".into(),
+            message: "run it?".into(),
+            paths: Vec::new(),
+            turn_id: String::new(),
+        });
+        r.apply_question(question("t4", &[]));
+
+        let f = frame(&rx);
+        let pending = &f.composer.content.approval.as_ref().unwrap().pending;
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].answer_with, AnswerWith::Choose);
+        assert_eq!(pending[0].options, permission_options());
+        assert_eq!(pending[1].answer_with, AnswerWith::Type);
+        assert!(
+            f.composer.content.editor.locked,
+            "队列里只要还有一道选择题，composer 就得锁着"
+        );
+    }
+
+    /// 换会话（`/resume`）会重建整个 bridge，包括归约器。定时器不收工的话，每换
+    /// 一次就留一个永远醒着的 500ms task，各自攥着一整棵 `DomainState`。
+    #[tokio::test(start_paused = true)]
+    async fn the_ticker_stops_once_nobody_is_watching() {
+        let catalog = crate::commands::CommandCatalog::new(Arc::new(
+            runtime::commands::CommandRegistry::new(),
+        ))
+        .0;
+        let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (reducer, frame_rx) = Reducer::spawn(
+            event_rx,
+            crate::ask::Questions::new().1,
+            "m".into(),
+            "/tmp".into(),
+            catalog,
+            Vec::new(),
+        );
+        // 一个订阅方也没有 = 这一帧没有人会看见。
+        drop(frame_rx);
+        let watching = Arc::downgrade(&reducer);
+        drop(reducer);
+        drop(event_tx);
+
+        // 定时器 + 事件 task 各自认出自己没事可做，最后一个 `Arc` 才会落地。
+        for _ in 0..8 {
+            tokio::time::advance(STATUS_TICK).await;
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            watching.upgrade().is_none(),
+            "没人看了之后归约器还被后台 task 攥着"
+        );
+    }
+
     #[test]
     fn begin_turn_echoes_user_prompt() {
         let (r, rx) = reducer();
@@ -1127,8 +1366,14 @@ mod tests {
         let (catalog, _cmds) = crate::commands::CommandCatalog::new(Arc::new(
             runtime::commands::CommandRegistry::new(),
         ));
-        let (r, mut frame_rx) =
-            Reducer::spawn(event_rx, "m".into(), "/tmp".into(), catalog, Vec::new());
+        let (r, mut frame_rx) = Reducer::spawn(
+            event_rx,
+            crate::ask::Questions::new().1,
+            "m".into(),
+            "/tmp".into(),
+            catalog,
+            Vec::new(),
+        );
 
         let turn_id = r.begin_turn("问".into());
         event_tx
@@ -1168,8 +1413,14 @@ mod tests {
         let (catalog, _cmds) = crate::commands::CommandCatalog::new(Arc::new(
             runtime::commands::CommandRegistry::new(),
         ));
-        let (r, frame_rx) =
-            Reducer::spawn(event_rx, "m".into(), "/tmp".into(), catalog, Vec::new());
+        let (r, frame_rx) = Reducer::spawn(
+            event_rx,
+            crate::ask::Questions::new().1,
+            "m".into(),
+            "/tmp".into(),
+            catalog,
+            Vec::new(),
+        );
         drop(event_tx);
         tokio::task::yield_now().await;
         // 通道关了，reducer 本身照常可用（app 还要靠它显示最后那一屏）。
@@ -1191,8 +1442,14 @@ mod tests {
         let (catalog, _cmds) = crate::commands::CommandCatalog::new(Arc::new(
             runtime::commands::CommandRegistry::new(),
         ));
-        let (r, frame_rx) =
-            Reducer::spawn(event_rx, "m".into(), "/tmp".into(), catalog, Vec::new());
+        let (r, frame_rx) = Reducer::spawn(
+            event_rx,
+            crate::ask::Questions::new().1,
+            "m".into(),
+            "/tmp".into(),
+            catalog,
+            Vec::new(),
+        );
         r.begin_turn("跑一个长任务".into());
 
         let elapsed = |f: &FrameState| match &f.operation_status.status_line.content {
@@ -2029,13 +2286,22 @@ mod tests {
             .any(|e| e.kind == LineKind::Note && e.text.contains("cancelled")));
     }
 
-    /// 这三个 stop_reason 以前一个事件都不发，接上 Core 的修复后才会到达。
+    /// Core 会发、而这里必须有话可说的每一个 stop_reason。
+    ///
+    /// 这张表是**手抄**的——Core 那边这些是散落在 `runtime::turn` 和
+    /// `TurnPolicy` 里的字面量，没有可以遍历的枚举。所以它会过期，而过期的症状
+    /// 在屏幕上看不见：turn 无声停住，跟卡死一模一样。改 Core 之后请对着
+    /// `core/crates/runtime/src/turn.rs` 里的 `stop_reason:` 和
+    /// `core/crates/core/src/interface/turn_policy.rs` 重新数一遍。
     #[test]
     fn other_early_stop_reasons_explain_themselves_in_the_transcript() {
         for (stop_reason, expected) in [
             ("max_turns", "max_turns"),
             ("budget_exceeded", "budget"),
             ("max_structured_output_retries", "structured output"),
+            ("context_exceeded", "context limit"),
+            ("host_ceiling", "host-configured"),
+            ("stopped_by_hook", "hook"),
         ] {
             let (r, rx) = reducer();
             let turn_id = r.begin_turn("q".into());

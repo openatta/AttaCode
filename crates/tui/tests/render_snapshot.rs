@@ -198,6 +198,7 @@ fn an_open_approval_dialog_locks_the_composer() {
     f.composer.content.editor.locked = true;
     f.composer.content.approval = Some(ApprovalState {
         pending: vec![ApprovalRequest {
+            answer_with: AnswerWith::Choose,
             prompt_id: "p1".into(),
             tool_name: "Bash".into(),
             message: "rm -rf /tmp/x".into(),
@@ -227,6 +228,7 @@ fn a_cramped_approval_dialog_keeps_the_options_and_the_key_hint() {
     f.composer.content.editor.locked = true;
     f.composer.content.approval = Some(ApprovalState {
         pending: vec![ApprovalRequest {
+            answer_with: AnswerWith::Choose,
             prompt_id: "p1".into(),
             tool_name: "Bash".into(),
             message: (1..=8)
@@ -257,6 +259,7 @@ fn several_pending_approvals_get_a_tab_strip() {
     let mut f = base();
     f.composer.content.editor.locked = true;
     let req = |id: &str, tool: &str| ApprovalRequest {
+        answer_with: AnswerWith::Choose,
         prompt_id: id.into(),
         tool_name: tool.into(),
         message: format!("{tool} wants in"),

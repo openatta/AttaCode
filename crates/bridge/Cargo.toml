@@ -10,7 +10,13 @@ description  = "AttaCode TUI↔Core glue layer — bootstraps runtime::Agent, co
 [dependencies]
 tui         = { path = "../tui" }
 
-base        = { workspace = true }
+# `sandbox` 打开 macOS `sandbox-exec` / Linux `bubblewrap` 那两个后端。AttaCore
+# 0.2.1 起它是编译期 feature 且**默认关**，理由是"机主就坐在机器前时，沙箱只是
+# 权限门后面的纵深防御"。我们仍然打开它，因为 0.1.8 之前它就是编译进来的，跟着
+# 上游改默认值等于在一次 bump 里静默降级；而且关掉之后
+# `sandbox.require_enforcement = true` 会**拒绝每一条命令**——一个设了它的用户
+# 拿到的不是"没沙箱"，是"Bash 全废"。
+base        = { workspace = true, features = ["sandbox"] }
 model       = { workspace = true }
 runtime     = { workspace = true }
 scene       = { workspace = true }

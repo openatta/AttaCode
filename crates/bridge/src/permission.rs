@@ -9,35 +9,43 @@
 //!    注册进去的工具在权限侧全是"未知工具"，会整片裸奔。
 //! 2. `bind_session_state` —— 读会话的**实时** `permission_mode`，所以
 //!    `EnterPlanMode`/`ExitPlanMode` 真能挪动这道门，而不是停在构造时的模式。
-//! 3. `add_persistent_allow` —— "本会话/本项目一直允许"落成真规则（后者还会写进
-//!    `settings.local.json`），这是 `PermissionDecision::PermitAlways` 的落点。
+//! 3. `add_persistent_allow` —— "一直允许"落成一条 `RuleSource::Session` 的真规则，
+//!    这是 `PermissionDecision::PermitAlways` 的落点。（**只在内存里**：Core 那边
+//!    没有任何一处把它写回 `settings.local.json`，所以"本项目一直允许"活不过这次
+//!    进程。要让它活下来，得由我们自己写盘——记在 TODO 里，不在本次范围内。）
 //!
 //! 上面两个 bind 由 `Builder::build()` 自动调用，所以这里只负责把规则和模式装好。
 
-use base::interface::settings::Settings;
-use base::permission::RuleSource;
-use permissions::gate::PermissionGate;
+use base::settings::Settings;
 use permissions::rule_set_permission::RuleSetPermission;
-use permissions::ruleset::RuleSet;
 use std::sync::Arc;
 
-/// 按 `settings` 里的模式 + 规则装一个权限门。
+/// 按 `settings` 里的模式 + 规则 + sandbox 配置装一个权限门。
 ///
 /// `BypassPermissions` 不做特判：gate 自己认这个模式并直接 Allow。daemon 那边为它
 /// 保留了一条零开销的 allow-all 快捷路径，是因为它一个进程里跑很多 session；单个
 /// TUI session 省这一次 `check` 没有意义，少一条分支反而少一处可能说谎的地方。
 ///
+/// **走 `from_settings` 而不是 `new`**，它比手搓那版多做两件事，两件都不是可选的：
+///
+/// - 规则取的是 `rules_from_all_tiers`，也就是 `settings.json`（`ProjectSettings`，
+///   优先级 30）**加上** `settings.local.json`（`LocalSettings`，40）。手搓那版只读
+///   前者，于是用户写在 `settings.local.json` 里的规则一条都不生效——那正是"本项目
+///   一直允许"该落的地方。
+/// - 带上 `sandbox` 设置。这是**唯一**一条能把 `sandbox.*` 送到工具自己那份
+///   `check_permissions` 的路：AttaCore 0.2.0 把写路径的控制清单接上了 `FileWrite`/
+///   `FileEdit`（在那之前那份检查是死代码），`.env` / `.gitignore` / lockfile /
+///   `.atta` / `.claude` 现在真的写不进去，而 `sandbox.allow_write` 是**唯一**的豁免
+///   口子。不传等于给用户留一堵没有门的墙。`deny_read`/`allow_read` 同理。
+///
 /// 传进去的空工具表只是占位——`Builder::build()` 会用会话真正分派的那张表把它换掉
 /// （见模块注释第 1 条）。
 pub fn build(settings: &Settings) -> Arc<dyn base::interface::permission::Permission> {
-    let rules = permissions::rule::rules_from_settings(
-        &settings.permission_rules,
-        RuleSource::ProjectSettings,
-    );
-    Arc::new(RuleSetPermission::new(
-        Arc::new(PermissionGate::new(RuleSet::new(rules))),
-        Arc::new(base::tool::InMemoryToolRegistry::new()),
+    Arc::new(RuleSetPermission::from_settings(
+        settings,
         settings.permission_mode.into(),
+        Arc::new(base::tool::InMemoryToolRegistry::new()),
+        [],
     ))
 }
 
@@ -45,7 +53,7 @@ pub fn build(settings: &Settings) -> Arc<dyn base::interface::permission::Permis
 mod tests {
     use super::*;
     use base::interface::permission::{Permission, PermissionOutcome};
-    use base::interface::settings::{PermissionAction, PermissionMode, PermissionRule};
+    use base::settings::{PermissionAction, PermissionMode, PermissionRule};
     use base::tool::{InMemoryToolRegistry, ProgressSender, Tool, ToolContext, ToolResult};
     use serde_json::Value;
     use std::path::Path;
@@ -128,6 +136,61 @@ mod tests {
         let perm = build(&settings_with(PermissionMode::BypassPermissions, vec![]));
         bound(&perm);
         assert!(matches!(check(&perm).await, PermissionOutcome::Permit));
+    }
+
+    /// `settings.local.json` 那一层（`local_permission_rules`）必须和
+    /// `settings.json` 那层一起进 gate。漏掉它的症状是静默的：用户写在
+    /// `settings.local.json` 里的规则一条都不生效，而那个文件正是"本项目一直允许"
+    /// 该落的地方。
+    #[tokio::test]
+    async fn local_settings_rules_reach_the_gate_too() {
+        let mut settings = settings_with(PermissionMode::Default, vec![]);
+        settings.local_permission_rules = vec![PermissionRule {
+            tool: "Write".into(),
+            action: PermissionAction::Deny,
+        }];
+        let perm = build(&settings);
+        bound(&perm);
+        assert!(matches!(check(&perm).await, PermissionOutcome::Deny { .. }));
+    }
+
+    /// `sandbox.allow_write` 必须抵达工具**自己那份** `check_permissions`。
+    ///
+    /// AttaCore 0.2.0 才把写路径的控制清单真正接上 `FileWrite`/`FileEdit`，而
+    /// `RuleSetPermission` 携带的 `sandbox` 是它唯一的到达路径。这两条断言合起来
+    /// 才有意义：第一条证明墙在（否则第二条测的是"本来就能写"），第二条证明门在
+    /// （否则用户对着一堵没有门的墙）。
+    #[tokio::test]
+    async fn sandbox_allow_write_reaches_the_tools_own_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join(".env");
+        let input = serde_json::json!({
+            "file_path": target.display().to_string(),
+            "content": "x",
+        });
+        let ask = |settings: &Settings| {
+            let perm = build(settings);
+            let tools = Arc::new(InMemoryToolRegistry::new());
+            tools.register(Arc::new(tools::file_write::FileWriteTool));
+            perm.bind_tool_registry(tools);
+            let input = input.clone();
+            let cwd = dir.path().to_path_buf();
+            async move { perm.check("Write", &input, &cwd, "sess-1").await }
+        };
+
+        let walled = settings_with(PermissionMode::Default, vec![]);
+        assert!(
+            matches!(ask(&walled).await, PermissionOutcome::Deny { .. }),
+            "`.env` is on the built-in credential deny list and must not be writable"
+        );
+
+        let mut exempt = walled.clone();
+        exempt.sandbox.allow_write = vec![target.clone()];
+        assert!(
+            !matches!(ask(&exempt).await, PermissionOutcome::Deny { .. }),
+            "`sandbox.allow_write` is the only way to say \"that one is fine here\"; \
+             if it does not reach the tool the setting is inert"
+        );
     }
 
     /// 未注册的工具必须**fail closed**。老的 `GatePermission` 直接 `Deny`，

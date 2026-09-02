@@ -245,6 +245,9 @@ pub struct CompletionPopupState {
 pub enum CompletionKind {
     SlashCommand,
     FileMention,
+    /// `/resume` 的会话选择器。名字是完整的 session id，说明是"什么时候 / 多少条 /
+    /// 关于什么"。
+    Session,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -268,25 +271,59 @@ pub struct ApprovalRequest {
     pub prompt_id: String,
     pub tool_name: String,
     pub message: String,
+    /// How this one is answered. Drives both rendering and key routing, so it
+    /// is stated rather than inferred from `options` being empty — a request
+    /// that renders a chooser with nothing to choose is a deadlock, and an
+    /// inferred rule makes that one typo away.
+    pub answer_with: AnswerWith,
+    /// Empty exactly when `answer_with` is [`AnswerWith::Type`].
     pub options: Vec<ApprovalOption>,
     pub selected_option: usize,
 }
 
+/// Where the answer comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AnswerWith {
+    /// Pick one of `options`. The composer is locked while this is up: the
+    /// engine is blocked on the answer, so a keystroke that went to the draft
+    /// instead would be typed at something that cannot read it.
+    Choose,
+    /// Type it. The composer stays open and the next submitted line is the
+    /// answer — used when the model asked an open question rather than
+    /// offering choices.
+    Type,
+}
+
+/// Something the user can pick in the approval dialog.
+///
+/// Two unrelated questions share this dialog, which is why the four permission
+/// answers and [`Answer`](Self::Answer) sit in one enum: *may this tool call
+/// proceed* (asked by the engine's permission gate) and *the model would like
+/// to know something* (`AskUserQuestion`). They look the same on screen and are
+/// routed to completely different places — see `bridge::handle`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ApprovalOption {
     PermitOnce,
     PermitSession,
     PermitProject,
     Deny,
+    /// One of the model's own options. `key` goes back to it verbatim (it
+    /// chose that string and may be matching on it); `label` is what the user
+    /// reads.
+    Answer {
+        key: String,
+        label: String,
+    },
 }
 
 impl ApprovalOption {
-    pub fn label(self) -> &'static str {
+    pub fn label(&self) -> &str {
         match self {
             ApprovalOption::PermitOnce => "Yes",
             ApprovalOption::PermitSession => "Yes, allow for this session",
             ApprovalOption::PermitProject => "Yes, allow for this project",
             ApprovalOption::Deny => "No",
+            ApprovalOption::Answer { label, .. } => label,
         }
     }
 }

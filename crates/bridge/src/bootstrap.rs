@@ -1,7 +1,8 @@
 //! Bridge 启动装配 — 组装 `runtime::Agent` 所需依赖，调用 `Builder::build()`。
 //!
-//! 装配顺序沿用 `core/daemon/src/main.rs` 的参考实现：Settings → AnthropicClient/Model
-//! → CodingScene → `runtime::agent::Builder`。`Permission` 由 `crate::permission::build`
+//! 装配顺序沿用 `core/daemon/src/main.rs` 的参考实现：Settings → provider →
+//! Model（经 `model::factory::builtin_registry`）→ CodingScene →
+//! `runtime::agent::Builder`。`Permission` 由 `crate::permission::build`
 //! 装配后显式传入：`Builder::build()` 的默认值是 always-allow 占位实现，留着它等于
 //! 工具调用一律不过门、TUI 的审批对话框永远不弹。
 //!
@@ -10,10 +11,8 @@
 //! `hooks_config` / `permission_rules` 一律钉成空，效果是用户写在 settings.json 里的
 //! 东西一件都不生效——而这些字段 `Builder::build()` 全都会自己消费。
 
-use base::interface::settings::{PathSettings, Settings};
+use base::settings::{PathSettings, Settings};
 use history::store::HistoryStore;
-use model::adapter::AnthropicModel;
-use model::client::{AuthMode, HttpAnthropicClient};
 use runtime::agent::{Agent, Builder, EventReceiver, InputSender};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -58,16 +57,22 @@ pub enum BootstrapError {
         id: String,
         source: session::session::SessionError,
     },
-    #[error("invalid ANTHROPIC_BASE_URL: {0}")]
-    InvalidBaseUrl(#[from] url::ParseError),
-    #[error("failed to construct Anthropic client: {0}")]
-    Client(#[from] model::error::AnthropicError),
+    #[error(
+        "settings.json configures several providers ({0}) but no `default_provider`; \
+         name the one this session should use"
+    )]
+    AmbiguousProvider(String),
+    #[error("`default_provider` names `{0}`, which is not in `providers`")]
+    UnknownProvider(String),
+    #[error("failed to construct the model client: {0}")]
+    Client(String),
     #[error("failed to build agent: {0}")]
     Engine(#[from] runtime::agent::EngineError),
 }
 
 /// 最小可用装配所需的运行参数。三个 model 相关字段是**兜底**，不是最终值——真正的
 /// 取值在 [`resolve_settings`] 里和 settings.json 合并之后才定下来。
+#[derive(Clone)]
 pub struct BootstrapConfig {
     /// settings.json 没写 `model.model_name` 时用的兜底模型。
     pub fallback_model: String,
@@ -85,12 +90,23 @@ pub struct BootstrapConfig {
 }
 
 impl BootstrapConfig {
-    /// 走 Core 的路径约定（`ConfigPaths::from_env`）：全局 `~/.atta/`、场景覆盖
-    /// `~/.atta/scenes/coding/`、项目 `<cwd>/.atta/`，并尊重 `ATTA_DATA_DIR` /
-    /// `ATTA_LOCAL_DATA_DIR` 覆盖。
+    /// 走 Core 的路径约定：全局 `~/.atta/`、场景覆盖 `~/.atta/scenes/coding/`、
+    /// 项目 `<cwd>/.atta/`，并尊重 `ATTA_DATA_DIR` / `ATTA_LOCAL_DATA_DIR` 覆盖。
+    ///
+    /// **环境变量是在这里读的，不在 Core。** `ConfigPaths::from_env` 已被上游删掉，
+    /// 理由写在 `ConfigPaths::new` 的文档里：一个进程服务一个实例，它归哪个目录管
+    /// 是**宿主**的决定；Core 自己去读 `$HOME` 会让每个下游模块都默默同意"调用者的
+    /// 家目录"，那对测试、服务账号、状态放在别处的部署全是错的。所以这份 env →
+    /// 路径的翻译落在 AttaCode 身上，变量名保持不变，用户那边无感。
     pub fn defaults(fallback_model: impl Into<String>) -> Self {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let dirs = base::paths::ConfigPaths::from_env(&cwd, SCENE_SCOPE);
+        let global_data_dir = std::env::var("ATTA_DATA_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| home_dir().join(".atta"));
+        let local_data_dir = std::env::var("ATTA_LOCAL_DATA_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| cwd.join(".atta"));
+        let dirs = base::paths::ConfigPaths::new(global_data_dir, local_data_dir, SCENE_SCOPE);
         Self {
             fallback_model: fallback_model.into(),
             model_override: std::env::var("ANTHROPIC_MODEL")
@@ -106,6 +122,17 @@ impl BootstrapConfig {
             resume: None,
         }
     }
+}
+
+/// `$HOME`，读不到就退到 `.`（当前目录）。
+///
+/// 以前是 `base::paths::dirs_home()`，随 `ConfigPaths::from_env` 一起被上游删了
+/// （见 [`BootstrapConfig::defaults`]）。语义照抄，包括那个 `.` 兜底：拿不到 HOME
+/// 时把状态写进 cwd，总好过 panic 在启动路径上。
+fn home_dir() -> PathBuf {
+    std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."))
 }
 
 /// 三层 settings.json 合并 + AttaCode 自己拥有的那几项覆盖。
@@ -171,19 +198,36 @@ fn discover_instruction_file(project_root: &Path) -> Option<PathBuf> {
 /// （端点 + 凭据），`register_builtin_tools` 里放不下。场景的工具白名单和注册表
 /// 取交集，不注册就是"模型根本看不到"。和 `core/daemon/src/session_pool.rs` 的
 /// 装配顺序一致。
-fn build_tool_registry(settings: &Settings) -> Arc<base::tool::InMemoryToolRegistry> {
+fn build_tool_registry(
+    settings: &Settings,
+    questions: Arc<crate::ask::Questions>,
+) -> Arc<base::tool::InMemoryToolRegistry> {
     let tools = Arc::new(base::tool::InMemoryToolRegistry::new());
     tools::register_builtin_tools(&tools);
     tools::register_web_search(&tools, settings);
+    // `AskUserQuestion` 换成会真的问人的那一版。理由和"为什么不实现 `Elicitation`"
+    // 都写在 [`crate::ask`] 的模块注释里。**必须是 `replace` 不是 `register`**：
+    // 后者是追加，而 `find` 取第一个同名匹配，于是新的那个永远轮不到。
+    // 返回的 `Disposer` 丢掉即可——它是显式撤销用的句柄，drop 不会撤销
+    // （Core 的文档明说了这一点），而我们这一条要活到进程结束。
+    let _ = base::tool::ToolRegistry::replace(
+        tools.as_ref(),
+        Arc::new(crate::ask::TuiAskUserQuestion::new(questions)),
+    );
     tools
 }
 
 /// 会话转录的落盘后端。没有它 `SessionManager` 纯内存，进程一退整段对话就没了。
 ///
-/// 根目录用 `global_data_dir/sessions/`（**不是**场景目录）：`sessions` 和
-/// `memory`/`vcr`/`mcp` 一样属于"全局 + 项目、没有场景层"那一类，而
-/// `JsonlHistoryStore` 自己会按 cwd 在这个根下再分项目——见 `base::paths` 的模块文档。
-/// 和 `daemon/src/main.rs` 取的是同一个根。
+/// 根目录用 `global_data_dir`（**不是**场景目录）：会话状态和 `memory`/`vcr`/`mcp`
+/// 一样属于"全局 + 项目、没有场景层"那一类。`HistoryRoots::under` 在这个根下再分两半
+/// ——transcript 落 `projects/`（按项目分），sidecar（metadata / memory / 输入历史）落
+/// `sessions/`（按 session id 分）。0.1.5 之前两者共用 `sessions/`，于是同一个目录里
+/// 混着两套命名。和 `daemon/src/main.rs` 取的是同一个根、同一套划分。
+///
+/// `migrate_layout` 必须在建 store **之前**跑：老用户的转录还躺在 0.1.5 前的位置，
+/// 不搬的话 `--continue` / `--resume` 在新根下什么都找不到——历史没丢，但等于丢了。
+/// 它幂等、只搬不删，干净的树上是个 no-op。
 ///
 /// 失败不致命：warn 一声，这次运行退回纯内存会话——落不了盘不该让人连 agent 都用不上。
 /// 返回具体类型而不是 `Arc<dyn HistoryStore>`：`list_recent_sessions`（`--continue`
@@ -192,8 +236,19 @@ fn build_tool_registry(settings: &Settings) -> Arc<base::tool::InMemoryToolRegis
 async fn build_history_store(
     paths: &PathSettings,
 ) -> Option<Arc<history::store::JsonlHistoryStore>> {
-    let root = paths.global_data_dir.join("sessions");
-    match history::store::JsonlHistoryStore::with_root(&paths.project_root(), root).await {
+    let migration = history::migrate::migrate_layout(&paths.global_data_dir);
+    if !migration.did_nothing() {
+        tracing::info!(
+            transcripts = migration.transcripts_moved,
+            sidecars = migration.sidecars_moved,
+            skipped = migration.skipped_existing,
+            failed = migration.failed,
+            "migrated session state to the projects/ + sessions/ layout"
+        );
+    }
+
+    let roots = history::path::HistoryRoots::under(&paths.global_data_dir);
+    match history::store::JsonlHistoryStore::with_roots(&paths.project_root(), roots).await {
         Ok(store) => Some(Arc::new(store)),
         Err(e) => {
             tracing::warn!(
@@ -205,16 +260,126 @@ async fn build_history_store(
     }
 }
 
+/// 凭据来源：先看 `settings.json` 里那个 provider 自己的 `api_key`，没有再看环境变量。
+///
+/// 两半都得留着。写在配置里是绝大多数人的做法，也是 Core 的默认
+/// （`ConfigCredentials`）；而 `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY` 是
+/// AttaCode 一直以来唯一的入口，只认配置等于让所有老用户在一次升级里失去凭据。
+/// 顺序是"具体的压过笼统的"：一个人为某个 provider 专门写了 key，就是他要用的那个。
+struct SettingsThenEnv;
+
+impl base::interface::credentials::CredentialSource for SettingsThenEnv {
+    fn api_key(
+        &self,
+        provider_id: &str,
+        config: &base::provider::ProviderConfig,
+    ) -> Result<base::interface::credentials::Secret, String> {
+        base::interface::credentials::ConfigCredentials
+            .api_key(provider_id, config)
+            .or_else(|_| {
+                base::interface::credentials::EnvCredentials::anthropic()
+                    .api_key(provider_id, config)
+            })
+    }
+}
+
+/// 这次会话要用哪个 provider，以及它长什么样。
+///
+/// 三种情况：
+///
+/// 1. `settings.providers` 里有东西 → 用 `default_provider` 点名的那个；没点名而
+///    恰好只有一个，就是它；没点名又有好几个是**错误**——静默挑一个的后果是模型和
+///    账单都跑到了用户没打算用的地方。
+/// 2. 什么都没配 → 合成一个 anthropic provider，`base_url` 取 `ANTHROPIC_BASE_URL`
+///    （DeepSeek 的 `/anthropic` 兼容层那种），key 由 [`SettingsThenEnv`] 从环境变量
+///    取。这就是 0.2.3 之前唯一的那条路，形状不变。
+///
+/// 走同一个 [`model::factory::builtin_registry`] 是重点：`providers` 这一段在
+/// `Settings` 里躺了很久，而 AttaCode 一直手搓 Anthropic 客户端、从不看它——用户
+/// 写进去的 `providers` / `default_provider` 一个字都没生效过。两条路合成一个构造点
+/// 之后就没有"另一条路忘了看"这回事了。
+fn resolve_provider(
+    settings: &Settings,
+) -> Result<(String, base::provider::ProviderConfig), BootstrapError> {
+    if !settings.providers.is_empty() {
+        let id = match &settings.default_provider {
+            Some(id) => id.clone(),
+            None if settings.providers.len() == 1 => {
+                settings.providers.keys().next().cloned().expect("len == 1")
+            }
+            None => {
+                let mut ids: Vec<_> = settings.providers.keys().cloned().collect();
+                ids.sort();
+                return Err(BootstrapError::AmbiguousProvider(ids.join(", ")));
+            }
+        };
+        let cfg = settings
+            .providers
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| BootstrapError::UnknownProvider(id.clone()))?;
+        return Ok((id, cfg));
+    }
+
+    // `ANTHROPIC_BASE_URL` 指向一个 Anthropic 兼容的别处端点。只作用于这条兜底路径：
+    // 配了 provider 的人已经在 `base_url` 里说过话了，让一个环境变量从背后改掉它，
+    // 等于让笼统的压过具体的。
+    let base_url = std::env::var("ANTHROPIC_BASE_URL")
+        .ok()
+        .filter(|v| !v.is_empty());
+    Ok((
+        "anthropic".to_string(),
+        base::provider::ProviderConfig {
+            api_type: Some("anthropic".into()),
+            base_url,
+            ..Default::default()
+        },
+    ))
+}
+
+/// provider 说了用哪个模型、而没有任何更近的来源说过话时，该改用的那个名字。
+///
+/// 不这么做的话，配了 DeepSeek 的人会拿着 [`DEFAULT_MODEL`] 那个 Claude 模型名去问
+/// DeepSeek 要东西——protocol 换了，模型名没换。
+///
+/// "没有任何更近的来源" = 既没有 `--model` / `ANTHROPIC_MODEL`，三层 settings.json
+/// 的 `model.model_name` 也没被写过。后半句只能靠哨兵认：`Settings::load` 把兜底值
+/// 和"用户真写了这个值"揉成了同一个 `String`。和 `max_tokens` 那处同款，误判的形状
+/// 也同款——有人把 `model_name` 显式写成和兜底值一模一样时，这里会误判成没设过，
+/// 于是听 provider 的。那正是他写下的那个值配不上他选的 provider 的情形，改过去
+/// 反而更可能是对的。
+fn model_name_from_provider(
+    settings: &Settings,
+    provider: &base::provider::ProviderConfig,
+    config: &BootstrapConfig,
+) -> Option<String> {
+    if config.model_override.is_some() || settings.model.model_name != config.fallback_model {
+        return None;
+    }
+    provider
+        .default_model
+        .clone()
+        .filter(|m| !m.trim().is_empty())
+}
+
 /// 装配好的引擎。调用方负责 `tokio::spawn(agent.run(cancel))`。
 pub struct BuiltEngine {
     pub agent: Agent,
     pub event_rx: EventReceiver,
     pub input_tx: InputSender,
+    /// `/resume` 列会话用。`None` = 这次会话纯内存，没东西可列。
+    pub history: Option<Arc<history::store::JsonlHistoryStore>>,
+    /// `/doctor` 问的就是它。**必须在 `agent.run()` 之前取**——`run()` 会 `&mut self`
+    /// 借走整个 agent，之后就没有 `&Agent` 可问了。拿到的是 `Arc`，一直持有即可。
+    pub health: Arc<base::interface::health::HealthChecks>,
+    /// 模型提问的会合点，和归约器要消费的那条流。见 [`crate::ask`]。
+    pub questions: Arc<crate::ask::Questions>,
+    pub questions_rx: tokio::sync::mpsc::UnboundedReceiver<crate::ask::QuestionEvent>,
     /// 三层 settings.json 合并完之后**真正生效**的模型名——状态栏要显示的是这个，
     /// 不是调用方传进来的兜底值。
     pub model_name: String,
     /// 这次会话的 id（BASE58）。转录落在
-    /// `<global_data_dir>/sessions/<项目>/<session_id>.jsonl`；`--resume` 要的就是它。
+    /// `<global_data_dir>/projects/<项目>/<session_id>.jsonl`；`--resume` 要的就是它。
     pub session_id: String,
     /// resume 时从 jsonl 读回来的历史消息，用来把转录区填回去。全新会话是空的。
     ///
@@ -255,34 +420,36 @@ async fn resolve_resume_target(
 
 /// 组装一个 `runtime::Agent`。
 pub async fn build_agent(config: &BootstrapConfig) -> Result<BuiltEngine, BootstrapError> {
-    let api_key = std::env::var("ANTHROPIC_AUTH_TOKEN")
-        .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
-        .map_err(|_| BootstrapError::MissingCredentials)?;
-    let auth = AuthMode::ApiKey(api_key);
-    // `ANTHROPIC_BASE_URL` targets an Anthropic-compatible endpoint other than the
-    // default (e.g. DeepSeek's `/anthropic` shim) — mirrors core/daemon/src/main.rs.
-    let client = match std::env::var("ANTHROPIC_BASE_URL")
-        .ok()
-        .filter(|v| !v.is_empty())
-    {
-        Some(mut raw) => {
-            if !raw.ends_with('/') {
-                raw.push('/');
-            }
-            let base = url::Url::parse(&raw)?;
-            Arc::new(HttpAnthropicClient::with_base(auth, base)?)
-        }
-        None => Arc::new(HttpAnthropicClient::new(auth)?),
-    };
-    let model = Arc::new(AnthropicModel::new(client));
+    let mut settings = resolve_settings(config);
+    let (provider_id, provider) = resolve_provider(&settings)?;
 
-    let settings = Arc::new(resolve_settings(config));
+    if let Some(name) = model_name_from_provider(&settings, &provider, config) {
+        settings.model.model_name = name;
+    }
+
+    let model = model::factory::builtin_registry()
+        .with_credentials(Arc::new(SettingsThenEnv))
+        .build(&provider_id, &provider)
+        .map_err(|e| {
+            // 一个字都没配、环境变量也没设，那不是"provider 坏了"，是最常见的
+            // 第一次运行——报回那句一直在报的话，别让人去查 provider 文档。
+            if settings.providers.is_empty() && e.contains("missing api_key") {
+                BootstrapError::MissingCredentials
+            } else {
+                BootstrapError::Client(e)
+            }
+        })?;
+
+    let settings = Arc::new(settings);
     let model_name = settings.model.model_name.clone();
 
     let scene: Arc<dyn base::interface::scene::AgentScene> =
         Arc::new(scene::scene::coding::CodingScene);
 
-    let tools = build_tool_registry(&settings);
+    // 模型提问的会合点。工具那一端现在就要装进注册表，人那一端要等归约器起来，
+    // 所以它比两者都先出生。
+    let (questions, questions_rx) = crate::ask::Questions::new();
+    let tools = build_tool_registry(&settings, questions.clone());
 
     // 权限门。默认模式是"没有规则命中就问"——工具自判允许的调用（只读工具、项目内的
     // Write/Edit）照旧静默通过，其余会走 `PermissionOutcome::Prompt` →
@@ -328,7 +495,13 @@ pub async fn build_agent(config: &BootstrapConfig) -> Result<BuiltEngine, Bootst
         .permission(permission)
         .session_id(session_id.clone())
         .tools(tools)
-        .settings(settings);
+        .settings(settings.clone());
+    // `/doctor` 的内容。引擎自己一条检查都不注册（`HealthChecks` 初始为空，而空集合
+    // 的报告是 `Ok`），所以不挂这些的话 `/doctor` 只会永远说"一切正常"。见
+    // [`crate::doctor`]。
+    for check in crate::doctor::checks(&settings, store.is_some()) {
+        builder = builder.health_check(check);
+    }
     // 有落盘后端时，`SessionManager` 每个 turn 结束增量追加一次 jsonl；没有就纯内存
     // （`Builder` 的默认行为），进程一退全丢。顺带一提，会话记忆边车
     // （`session_memory.md`）也只在有这个 store 的时候才建——见 `Builder::build`。
@@ -368,9 +541,13 @@ pub async fn build_agent(config: &BootstrapConfig) -> Result<BuiltEngine, Bootst
     }
 
     Ok(BuiltEngine {
+        history: store,
+        health: agent.health(),
         agent,
         event_rx,
         input_tx,
+        questions,
+        questions_rx,
         model_name,
         session_id,
         restored,
@@ -419,6 +596,173 @@ mod tests {
             project,
             config,
         }
+    }
+
+    /// 分派到的 `AskUserQuestion` 必须是**会去问人**的那一版。
+    ///
+    /// 用 `register` 而不是 `replace` 的话这里会静默地退回 Core 那版：`register` 是
+    /// 追加、`find` 取第一个同名匹配，于是新的那个永远轮不到，而屏幕上的表现是模型
+    /// 每次提问都拿到一句"用户没被问到"——没有任何报错。
+    ///
+    /// 断言的是**行为**而不是类型：两版工具对外的每一个方法都是一样的（那是刻意的，
+    /// 见 [`crate::ask`]），唯一的区别就是 `call` 会不会把问题送出来。
+    #[tokio::test]
+    async fn the_dispatched_ask_user_question_actually_asks() {
+        let settings = Settings::defaults_for("m");
+        let (questions, mut asked) = crate::ask::Questions::new();
+        let registry = build_tool_registry(&settings, questions);
+
+        assert_eq!(
+            registry
+                .list()
+                .iter()
+                .filter(|t| t.name() == "AskUserQuestion")
+                .count(),
+            1,
+            "同名工具应该只剩一个，否则 `find` 取到的是哪个全看注册顺序"
+        );
+
+        let tool = registry.get("AskUserQuestion").expect("必须还在表里");
+        // 没人回答，所以这次调用会一直等——它等的正是我们要断言的那条消息。
+        let calling = tokio::spawn(async move {
+            tool.call(
+                serde_json::json!({
+                    "question": "which branch?",
+                    "options": [{"key": "a", "label": "main"}],
+                }),
+                base::tool::ToolContext::for_test("/tmp".into()),
+                base::tool::ProgressSender::noop("ask"),
+            )
+            .await
+        });
+
+        let event = asked.recv().await.expect("问题必须送到人这一侧");
+        assert!(
+            matches!(&event, crate::ask::QuestionEvent::Ask(q) if q.question == "which branch?"),
+            "got: {event:?}"
+        );
+        calling.abort();
+    }
+
+    fn provider(api_type: &str, default_model: Option<&str>) -> base::provider::ProviderConfig {
+        base::provider::ProviderConfig {
+            api_type: Some(api_type.into()),
+            base_url: Some("https://example.invalid/v1".into()),
+            api_key: Some("k".into()),
+            default_model: default_model.map(Into::into),
+            ..Default::default()
+        }
+    }
+
+    /// 一个 provider 而没写 `default_provider`：没有歧义，用它。
+    #[test]
+    fn a_single_provider_needs_no_default_provider() {
+        let mut s = Settings::defaults_for("m");
+        s.providers
+            .insert("deepseek".into(), provider("anthropic", None));
+        let (id, _) = resolve_provider(&s).unwrap();
+        assert_eq!(id, "deepseek");
+    }
+
+    #[test]
+    fn default_provider_picks_among_several() {
+        let mut s = Settings::defaults_for("m");
+        s.providers.insert("a".into(), provider("anthropic", None));
+        s.providers.insert("b".into(), provider("anthropic", None));
+        s.default_provider = Some("b".into());
+        assert_eq!(resolve_provider(&s).unwrap().0, "b");
+    }
+
+    /// 几个 provider 而没点名，必须报错。静默挑一个的后果是模型和账单都跑到了
+    /// 用户没打算用的地方，而屏幕上什么都不会说。
+    #[test]
+    fn several_providers_without_a_default_is_an_error_not_a_guess() {
+        let mut s = Settings::defaults_for("m");
+        s.providers.insert("a".into(), provider("anthropic", None));
+        s.providers.insert("b".into(), provider("anthropic", None));
+        let err = resolve_provider(&s).unwrap_err();
+        assert!(
+            matches!(&err, BootstrapError::AmbiguousProvider(ids) if ids.contains('a') && ids.contains('b')),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_default_provider_that_is_not_configured_says_so() {
+        let mut s = Settings::defaults_for("m");
+        s.providers.insert("a".into(), provider("anthropic", None));
+        s.default_provider = Some("typo".into());
+        assert!(matches!(
+            resolve_provider(&s).unwrap_err(),
+            BootstrapError::UnknownProvider(id) if id == "typo"
+        ));
+    }
+
+    /// 什么都没配时合成的那个 provider，就是 0.2.3 之前唯一那条路的形状。
+    #[test]
+    fn no_providers_falls_back_to_anthropic_over_the_env() {
+        let s = Settings::defaults_for("m");
+        let (id, cfg) = resolve_provider(&s).unwrap();
+        assert_eq!(id, "anthropic");
+        assert_eq!(cfg.api_type.as_deref(), Some("anthropic"));
+        assert!(cfg.api_key.is_none(), "key 由 SettingsThenEnv 从环境变量取");
+    }
+
+    /// provider 自己的 key 压过环境变量：为某个 provider 专门写了 key 的人，
+    /// 要的就是那个。
+    #[test]
+    fn a_providers_own_key_wins_over_the_environment() {
+        use base::interface::credentials::CredentialSource;
+        let cfg = provider("anthropic", None);
+        let key = SettingsThenEnv.api_key("deepseek", &cfg).unwrap();
+        assert_eq!(key.expose(), "k");
+    }
+
+    /// 换了 protocol 就得换模型名，否则是拿着 Claude 的模型名去问 DeepSeek 要东西。
+    #[test]
+    fn a_providers_default_model_fills_in_when_nothing_nearer_spoke() {
+        let l = layout();
+        let s = resolve_settings(&l.config);
+        assert_eq!(s.model.model_name, "fallback-model");
+        assert_eq!(
+            model_name_from_provider(&s, &provider("anthropic", Some("deepseek-chat")), &l.config)
+                .as_deref(),
+            Some("deepseek-chat")
+        );
+    }
+
+    /// `--model` / `ANTHROPIC_MODEL` 是为这一次运行显式指定的，压过 provider。
+    #[test]
+    fn an_explicit_model_override_beats_the_providers_default() {
+        let mut l = layout();
+        l.config.model_override = Some("claude-opus-5".into());
+        let s = resolve_settings(&l.config);
+        assert!(model_name_from_provider(
+            &s,
+            &provider("anthropic", Some("deepseek-chat")),
+            &l.config
+        )
+        .is_none());
+    }
+
+    /// settings.json 里写死的模型名同样压过 provider 的默认值。
+    #[test]
+    fn a_configured_model_name_beats_the_providers_default() {
+        let l = layout();
+        write_settings(
+            &l.project.join(".atta"),
+            serde_json::json!({
+                "model": { "model_name": "written-down" }
+            }),
+        );
+        let s = resolve_settings(&l.config);
+        assert_eq!(s.model.model_name, "written-down");
+        assert!(model_name_from_provider(
+            &s,
+            &provider("anthropic", Some("deepseek-chat")),
+            &l.config
+        )
+        .is_none());
     }
 
     fn write_settings(dir: &Path, json: serde_json::Value) {
@@ -484,7 +828,7 @@ mod tests {
         let s = resolve_settings(&l.config);
         assert_eq!(
             s.permission_mode,
-            base::interface::settings::PermissionMode::AcceptEdits
+            base::settings::PermissionMode::AcceptEdits
         );
         assert_eq!(s.permission_rules.len(), 1);
         assert_eq!(s.permission_rules[0].tool, "Bash(rm:*)");
@@ -535,11 +879,12 @@ mod tests {
         );
     }
 
-    /// 转录落在 `global_data_dir/sessions/` 下，**不是**场景目录——`sessions` 属于
-    /// "全局 + 项目、没有场景层"那一类。这是这里唯一一个可能选错的东西，所以真写一条
-    /// 进去看看文件落在哪。
+    /// 转录落在 `global_data_dir/projects/` 下，**不是**场景目录、也不再是
+    /// `sessions/`（0.1.5 起 transcript 和 sidecar 分了根，见 [`build_history_store`]）。
+    /// 会话状态属于"全局 + 项目、没有场景层"那一类。这是这里唯一一个可能选错的东西，
+    /// 所以真写一条进去看看文件落在哪。
     #[tokio::test]
-    async fn transcripts_land_under_the_global_sessions_root() {
+    async fn transcripts_land_under_the_global_projects_root() {
         let l = layout();
         let store = build_history_store(&l.config.paths).await.unwrap();
         let session = base::session::SessionId::new();
@@ -555,15 +900,16 @@ mod tests {
             .await
             .unwrap();
 
-        let written: Vec<_> = walk_files(&l.global.join("sessions")).collect();
+        let written: Vec<_> = walk_files(&l.global.join("projects")).collect();
         assert_eq!(
             written.len(),
             1,
             "expected exactly one transcript under {}, got {written:?}",
-            l.global.join("sessions").display()
+            l.global.join("projects").display()
         );
         assert!(written[0].to_string_lossy().ends_with(".jsonl"));
         // 场景目录不该有任何东西。
+        assert_eq!(walk_files(&l.scene.join("projects")).count(), 0);
         assert_eq!(walk_files(&l.scene.join("sessions")).count(), 0);
     }
 
@@ -577,7 +923,7 @@ mod tests {
     fn the_registry_has_every_tool_the_coding_scene_promises() {
         let l = layout();
         let settings = resolve_settings(&l.config);
-        let registry = build_tool_registry(&settings);
+        let registry = build_tool_registry(&settings, crate::ask::Questions::new().0);
         let names: Vec<String> = registry
             .list()
             .iter()

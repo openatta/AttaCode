@@ -2,8 +2,8 @@
 //! Z2.R2.S1 CompletionPopup floating + Z2.R2.S2 Approval stacked above Editor), Z2.R3 BottomRule.
 
 use crate::frame_state::{
-    ApprovalRequest, ApprovalState, ApprovalViewMode, BottomRuleState, CompletionPopupState,
-    ComposerState, ContentState, EditorState, InputMode, TopRuleState,
+    AnswerWith, ApprovalRequest, ApprovalState, ApprovalViewMode, BottomRuleState,
+    CompletionPopupState, ComposerState, ContentState, EditorState, InputMode, TopRuleState,
 };
 use crate::regions::style::{self, separator_color, COLOR_ACCENT, COLOR_SECONDARY};
 use ratatui::{
@@ -80,6 +80,8 @@ fn approval_height(state: &ApprovalState, _width: u16) -> u16 {
 
 fn card_inner_height(req: &ApprovalRequest) -> u16 {
     let msg_lines = req.message.lines().count().max(1) as u16;
+    // 自由文本题的 `options` 是空的，那一段自然是 0 行——高度跟着选项数走就对了，
+    // 不需要为它开一个分支。
     1 /* tool_name header */ + msg_lines + 1 /* blank */ + req.options.len() as u16 + 1 /* blank */ + 1
     /* footer */
 }
@@ -357,10 +359,12 @@ fn render_approval_tabs(frame: &mut Frame, area: Rect, state: &ApprovalState) {
         )));
     }
     tail.push(Line::from(""));
-    let footer = if state.pending.len() > 1 {
-        "Enter=confirm  Esc=deny  Tab=next"
-    } else {
-        "Enter=confirm  Esc=deny"
+    // 自由文本题没有可选的东西，Enter 送的是 composer 里那一行，Esc 也不代表拒绝
+    // ——照着选择题写会指错三个键里的三个。
+    let footer = match (req.answer_with, state.pending.len() > 1) {
+        (AnswerWith::Type, _) => "Type your answer below, then Enter",
+        (AnswerWith::Choose, true) => "Enter=confirm  Esc=deny  Tab=next",
+        (AnswerWith::Choose, false) => "Enter=confirm  Esc=deny",
     };
     tail.push(Line::from(Span::styled(
         format!("  {footer}"),
@@ -483,6 +487,7 @@ mod tests {
     #[test]
     fn single_pending_approval_has_no_tab_strip_height() {
         let req = ApprovalRequest {
+            answer_with: AnswerWith::Choose,
             prompt_id: "test-1".into(),
             tool_name: "Bash".into(),
             message: "git status".into(),

@@ -129,6 +129,29 @@ cargo run -p app
 - [ ] 选"本会话一直允许"之后，同类调用不再弹
 - [ ] 对话框开着时 `Ctrl+C` 能中断整个 turn
 
+## 5.5 模型向你提问（AskUserQuestion）
+
+AttaCore 0.2.0 起这个工具是**真的会去问人**的（在那之前它把问题原样回给模型当答案）。
+Core 自带的 `Elicitation` 只认权限提问，所以我们换了自己那版工具——见
+`crates/bridge/src/ask.rs`。两种问法都要试。
+
+发一句 `用 AskUserQuestion 问我：这个分支该叫什么，给我 feat/x 和 fix/y 两个选项`：
+
+- [ ] 弹出对话框，标题是模型给的 header，选项就是模型给的那两个
+- [ ] 输入框变灰（锁住）
+- [ ] `↑`/`↓` + `Enter` 选一个 → 模型接下来的话里出现的是**选项的 key**，不是别的
+- [ ] **`y`/`n`/`Esc` 在这个框上什么都不做**——它们是权限门的快捷键，这里没有对应的选项，
+      按下去替你答一道没答过的题是最糟的一种"方便"
+
+再发一句 `用 AskUserQuestion 问我这个分支该叫什么，不要给选项`：
+
+- [ ] 对话框只显示问题，**输入框没有变灰**，底下提示是 "Type your answer below, then Enter"
+- [ ] 打字进的是草稿（不是被丢掉）
+- [ ] `Enter` 之后这一行成了**答案**，转录里**没有**多出一条"用户说了这句话"的新一轮对话
+- [ ] 答案以 `/` 开头（比如打 `/tmp 那个目录`）时照样是答案，不会被当成 slash 命令
+- [ ] 问题挂着的时候 `Ctrl+C` 中断 turn → 对话框跟着消失，输入框恢复可用
+      （不消失的话它会一直占着 composer，人连字都打不了）
+
 ## 6. 取消
 
 发一个长任务（`把整个 crates/ 目录读一遍并总结`），中途 `Ctrl+C`。
@@ -152,11 +175,15 @@ cargo run -p app
 
 ## 8. slash 命令 / 补全 / 模型
 
-- [ ] 🤖 打 `/` 弹出补全，里面既有 Core 的（`/help` `/compact` …）也有本地的（`/model` `/quit`）
+- [ ] 🤖 打 `/` 弹出补全，里面既有 Core 的（`/help` `/compact` …）也有本地的（`/model` `/doctor` `/resume` `/quit`）
 - [ ] 🤖 `↑`/`↓` 选，`Enter` 补全（不是提交），`Esc` 关掉且不动草稿；**已经打全的命令按 Enter 应该直接提交**
 - [ ] 🤖 `/model` 回车 → 转录里报当前模型
 - [ ] `/model claude-sonnet-5` → 状态栏立刻换，转录留一条 note；下一轮真的用新模型（看 smoke 或日志）
 - [ ] `/help` 转发给 Core 并有回应
+- [ ] `/doctor` → 转录里一份四行的报告：`model.provider` / `history.store` / `sandbox` /
+      `permissions`，每行都说得出这次会话**实际**装成了什么
+- [ ] `/doctor` 的 `sandbox` 那行在 macOS 上是 `MacOSSandboxExec`（不是 `Unavailable`）
+      ——是 `Unavailable` 就说明 `base/sandbox` 那个 feature 掉了，见 CLAUDE.md
 - [ ] `/quit` 退出
 
 ## 9. 会话 resume
@@ -171,12 +198,26 @@ cargo run -p app -- --continue   # 或 --resume <session-id>
 - [ ] `--resume 不存在的id` 报错退出，不是静默开新会话
 - [ ] 没有任何历史时 `--continue` 正常开新会话（不报错）
 
+会话选择器（`/resume`）。**这是唯一一条会把整个引擎重建的命令**，所以要看的不只是
+列表本身：
+
+- [ ] `/resume` 回车 → 弹出列表，每行是 `时间  N msgs  这次会话讲了什么`
+- [ ] `↑`/`↓` 换选中项；**打字不落进草稿**（列表开着时键盘整体归它）
+- [ ] `Esc` 关掉列表，草稿和转录都没动
+- [ ] `Enter` 选中一个 → 转录换成那个会话的内容，接着提问模型**记得那边的上文**
+- [ ] 换过去之后 `/resume` 再换回来，两边都还在
+- [ ] `/resume 一个关键词` → 只列内容里有这个词的会话
+- [ ] `/resume 一个绝对匹配不到的词` → 转录里一句 "nothing matches"，**不弹空列表**
+- [ ] 一个全新的空项目里 `/resume` → 一句 "no earlier sessions in this project"
+
 ## 10. 异常与收尾
 
 - [ ] 🤖 不设 `ANTHROPIC_AUTH_TOKEN` → 启动报错清楚（退出码 1），不是 panic 或空白屏
 - [ ] 🤖 凭据/网络出错发一句 → 转录里是红色 Error 行，TUI 不卡死，还能继续输入
 - [ ] 终端窗口拉宽/拉窄 → 布局跟着变，不错位
-- [ ] 退出后 `~/.atta/sessions/<项目>/` 下有本次会话的 jsonl，内容不是空的
+- [ ] 退出后 `~/.atta/projects/<项目>/` 下有本次会话的 jsonl，内容不是空的
+      （0.1.5 前落在 `~/.atta/sessions/<项目>/`；老会话由 `history::migrate` 搬过来，
+      搬完那边只剩按 session id 命名的 sidecar 目录）
 
 ---
 

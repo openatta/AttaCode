@@ -348,6 +348,7 @@ fn single_approval(_elapsed: u64) -> FrameState {
     f.composer.content.editor.locked = true;
     f.composer.content.approval = Some(ApprovalState {
         pending: vec![ApprovalRequest {
+            answer_with: AnswerWith::Choose,
             prompt_id: "demo-1".into(),
             tool_name: "Bash".into(),
             message: "git push --force origin main".into(),
@@ -370,6 +371,7 @@ fn multi_approval(elapsed: u64) -> FrameState {
     f.composer.content.approval = Some(ApprovalState {
         pending: vec![
             ApprovalRequest {
+                answer_with: AnswerWith::Choose,
                 prompt_id: "demo-1".into(),
                 tool_name: "Bash".into(),
                 message: "git push --force origin main".into(),
@@ -377,6 +379,7 @@ fn multi_approval(elapsed: u64) -> FrameState {
                 selected_option: 0,
             },
             ApprovalRequest {
+                answer_with: AnswerWith::Choose,
                 prompt_id: "demo-2".into(),
                 tool_name: "Edit".into(),
                 message: "src/parser.rs".into(),
@@ -388,6 +391,7 @@ fn multi_approval(elapsed: u64) -> FrameState {
                 selected_option: 0,
             },
             ApprovalRequest {
+                answer_with: AnswerWith::Choose,
                 prompt_id: "demo-3".into(),
                 tool_name: "Agent".into(),
                 message: "spawn sub-agent: code-reviewer".into(),

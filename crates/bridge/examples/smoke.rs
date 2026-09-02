@@ -22,7 +22,8 @@ async fn main() -> anyhow::Result<()> {
     // 和 `crates/app` 用同一个兜底模型；`ANTHROPIC_MODEL` / settings.json 照旧压过它。
     let config = BootstrapConfig::defaults(bridge::DEFAULT_MODEL);
 
-    let (handle, cancel) = bridge::start(config).await?;
+    let session = bridge::start(config).await?;
+    let handle = session.handle.clone();
     let mut frame_rx = handle.subscribe();
     // 三层 settings.json 合并之后才知道最终用的是哪个模型，所以从快照里读。
     println!("model = {}", frame_rx.borrow().footer_hints.model);
@@ -65,7 +66,7 @@ async fn main() -> anyhow::Result<()> {
     })
     .await;
 
-    cancel.cancel();
+    session.shutdown();
 
     match result {
         Ok(inner) => inner,
