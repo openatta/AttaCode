@@ -11,7 +11,9 @@
 //! 补全弹窗 → 移动选中项；多行草稿 → 行间移动；到边界 → 翻输入历史。
 //! 还缺的是选区和 undo。
 
-use bridge::{BootstrapConfig, BridgeCommand, EngineHandle, Resume, Session, DEFAULT_MODEL};
+use bridge::{
+    BootstrapConfig, BridgeCommand, BtwKey, EngineHandle, Resume, Session, DEFAULT_MODEL,
+};
 use crossterm::event::{
     Event, EventStream, KeyCode as CtKeyCode, KeyEvent, KeyEventKind, KeyModifiers,
 };
@@ -462,6 +464,16 @@ fn dispatch_key(
         &format!("{:?}+{:?}", key.modifiers, key.code),
         &format!("{outcome:?}"),
     );
+    // **侧问区最优先。** 它是一个"进去了要出来"的模式：屏幕下半整个是它的，主 UI
+    // 的任何操作都做不了。放在审批对话框前面，是因为侧问区把对话框也盖住了——盖住
+    // 的东西不该还能被操作。
+    if snapshot.btw.is_some() {
+        return match outcome {
+            ResolveOutcome::Action(action) => dispatch_btw_action(&action, handle),
+            // 侧问区不收字符：它没有输入框（单次回答，要继续就再 /btw 一次）。
+            _ => Flow::Continue,
+        };
+    }
     // 有待批准的请求时，键盘整体归对话框——`FrameState` 那边 composer 已经是
     // `locked`，路由不跟着改的话 Enter 会把草稿提交给一个正卡在权限检查上的引擎。
     //
@@ -492,9 +504,13 @@ fn dispatch_key(
         };
     }
     match outcome {
-        // `y`/`n` 绑的是裸字符。没有对话框时它们就是普通输入——不然打 "yes" 会丢字母。
+        // `y`/`n`/`x` 绑的是裸字符。它们各自所属的那个区域没开着时就是普通输入
+        // ——不然打 "yes" 会丢字母，打 "box" 会丢 x。
         ResolveOutcome::Action(action)
-            if matches!(action.as_str(), "ask.yes-shortcut" | "ask.no-shortcut") =>
+            if matches!(
+                action.as_str(),
+                "ask.yes-shortcut" | "ask.no-shortcut" | "btw.clear"
+            ) =>
         {
             insert_char(key, local);
             Flow::Continue
@@ -506,6 +522,30 @@ fn dispatch_key(
             Flow::Continue
         }
     }
+}
+
+/// 侧问区开着时的键位。照 CC 的那张表，去掉两条依赖外部能力的（`c` 复制、`f` fork）。
+///
+/// 认的 action 名都是既有的：这个区域没有自己的键位命名空间，它借编辑器和对话框那两套
+/// ——用户改绑了方向键，侧问区跟着一起变，不用改第二处配置。
+fn dispatch_btw_action(action: &str, handle: &dyn EngineHandle) -> Flow {
+    let key = match action {
+        "editor.history.prev" | "ask.prev" => BtwKey::Scroll(-1),
+        "editor.history.next" | "ask.next" => BtwKey::Scroll(1),
+        "editor.cursor.left" => BtwKey::Older,
+        "editor.cursor.right" => BtwKey::Newer,
+        // `x` 清空早前问答。绑的是裸字符，所以只在侧问区里才有这个意思。
+        "btw.clear" => BtwKey::ClearEarlier,
+        "repl.dismiss" | "repl.exit" | "editor.submit" | "ask.confirm" => BtwKey::Close,
+        // 侧问区盖住了状态区，主 turn 还在跑——中断它仍然是合理动作。
+        "repl.cancel" => {
+            let _ = handle.dispatch(BridgeCommand::CancelTurn);
+            return Flow::Continue;
+        }
+        _ => return Flow::Continue,
+    };
+    let _ = handle.dispatch(BridgeCommand::BtwKey(key));
+    Flow::Continue
 }
 
 /// `/resume` 选择器开着时的键位。
@@ -814,6 +854,8 @@ enum LocalCommand {
     Doctor,
     /// `/resume [关键词]` —— 打开会话选择器。空串 = 最近的几个。
     Resume(String),
+    /// `/btw [问题]` —— 开一道侧问。空串 = 重开侧问区，停在最近一次问答上。
+    Btw(String),
 }
 
 /// `/` 前缀的一次性分流。认出来的在本地处理，其余原样转发给 Core 解析——补全
@@ -832,6 +874,7 @@ fn local_command(text: &str) -> Option<LocalCommand> {
         })),
         "/doctor" => Some(LocalCommand::Doctor),
         "/resume" => Some(LocalCommand::Resume(rest.trim().to_string())),
+        "/btw" => Some(LocalCommand::Btw(rest.trim().to_string())),
         _ => None,
     }
 }
@@ -851,6 +894,10 @@ fn local_command_candidates() -> Vec<PickerCandidate> {
         (
             "/resume",
             "Switch to an earlier session in this project  (args: [search text])",
+        ),
+        (
+            "/btw",
+            "Ask a side question about this session, off the record  (args: [question])",
         ),
         ("/quit", "Exit AttaCode"),
         ("/exit", "Exit AttaCode"),
@@ -900,6 +947,7 @@ fn submit(local: &mut LocalUi, handle: &dyn EngineHandle, snapshot: &tui::FrameS
             ),
         },
         Some(LocalCommand::Doctor) => BridgeCommand::Doctor,
+        Some(LocalCommand::Btw(question)) => BridgeCommand::Btw { question },
         None => BridgeCommand::Submit { text },
     };
     let _ = handle.dispatch(cmd);
@@ -2714,6 +2762,169 @@ mod tests {
         assert_eq!(local.ask_selected, 0);
     }
 
+    // ── /btw 侧问区 ──
+
+    fn frame_with_btw() -> tui::FrameState {
+        let mut f = frame_without_ask();
+        f.btw = Some(tui::frame_state::BtwState {
+            question: "那个配置文件叫什么".into(),
+            answer: "叫 settings.json".into(),
+            streaming: false,
+            scroll: 0,
+            earlier: vec!["第一问".into()],
+            older: 0,
+            viewing: 0,
+        });
+        f
+    }
+
+    #[test]
+    fn btw_is_a_local_command_carrying_the_question() {
+        let handle = FakeHandle::new();
+        let mut local = local_with("/btw 那个配置文件叫什么");
+        submit(&mut local, &handle, &frame_without_ask());
+        assert!(
+            matches!(&handle.commands()[..], [BridgeCommand::Btw { question }]
+                     if question == "那个配置文件叫什么"),
+            "got: {:?}",
+            handle.commands()
+        );
+    }
+
+    /// **侧问区独占键盘。** 它盖住了输入区、状态区、底栏和子代理条——盖住的东西
+    /// 不该还能被操作。打字尤其不能落进草稿：屏幕上根本没有输入框。
+    #[test]
+    fn the_side_question_panel_takes_the_whole_keyboard() {
+        let mut local = local_with("原有草稿");
+        let handle = FakeHandle::new();
+        let mut resolver = Resolver::new(default_bindings());
+        let snapshot = frame_with_btw();
+
+        for c in "hello".chars() {
+            dispatch_key(
+                KeyEvent::new(CtKeyCode::Char(c), KeyModifiers::NONE),
+                &mut resolver,
+                &mut local,
+                &handle,
+                &snapshot,
+            );
+        }
+        assert_eq!(local.draft, "原有草稿", "草稿一个字都不该动");
+
+        // 回车不是提交，是退出。
+        dispatch_key(
+            KeyEvent::new(CtKeyCode::Enter, KeyModifiers::NONE),
+            &mut resolver,
+            &mut local,
+            &handle,
+            &snapshot,
+        );
+        assert!(
+            handle
+                .commands()
+                .iter()
+                .any(|c| matches!(c, BridgeCommand::BtwKey(BtwKey::Close))),
+            "got: {:?}",
+            handle.commands()
+        );
+        assert!(
+            !handle
+                .commands()
+                .iter()
+                .any(|c| matches!(c, BridgeCommand::Submit { .. })),
+            "回车在侧问区里绝不能把草稿提交出去"
+        );
+    }
+
+    /// 侧问区的方向键：↑↓ 滚动，←→ 翻看早前。
+    #[test]
+    fn arrows_scroll_and_step_through_earlier_answers() {
+        let handle = FakeHandle::new();
+        for (key, expected) in [
+            (CtKeyCode::Up, BtwKey::Scroll(-1)),
+            (CtKeyCode::Down, BtwKey::Scroll(1)),
+            (CtKeyCode::Left, BtwKey::Older),
+            (CtKeyCode::Right, BtwKey::Newer),
+        ] {
+            let mut local = local_with("");
+            let mut resolver = Resolver::new(default_bindings());
+            dispatch_key(
+                KeyEvent::new(key, KeyModifiers::NONE),
+                &mut resolver,
+                &mut local,
+                &handle,
+                &frame_with_btw(),
+            );
+            assert!(
+                handle
+                    .commands()
+                    .iter()
+                    .any(|c| matches!(c, BridgeCommand::BtwKey(k) if *k == expected)),
+                "{key:?} 该发 {expected:?}，实际: {:?}",
+                handle.commands()
+            );
+        }
+    }
+
+    /// `x` 绑的是裸字符。侧问区**没**开着时它必须是普通输入——不然打 "box" 会丢字母。
+    #[test]
+    fn x_is_plain_text_when_the_side_question_panel_is_closed() {
+        let mut local = local_with("");
+        let handle = FakeHandle::new();
+        let mut resolver = Resolver::new(default_bindings());
+
+        for c in "box".chars() {
+            dispatch_key(
+                KeyEvent::new(CtKeyCode::Char(c), KeyModifiers::NONE),
+                &mut resolver,
+                &mut local,
+                &handle,
+                &frame_without_ask(),
+            );
+        }
+        assert_eq!(local.draft, "box");
+        assert!(handle.commands().is_empty());
+    }
+
+    /// 侧问区开着时 `x` 才是"清空早前问答"。
+    #[test]
+    fn x_clears_the_earlier_exchanges_inside_the_panel() {
+        let mut local = local_with("");
+        let handle = FakeHandle::new();
+        let mut resolver = Resolver::new(default_bindings());
+        dispatch_key(
+            KeyEvent::new(CtKeyCode::Char('x'), KeyModifiers::NONE),
+            &mut resolver,
+            &mut local,
+            &handle,
+            &frame_with_btw(),
+        );
+        assert!(handle
+            .commands()
+            .iter()
+            .any(|c| matches!(c, BridgeCommand::BtwKey(BtwKey::ClearEarlier))));
+        assert_eq!(local.draft, "", "在侧问区里它是快捷键，不是输入");
+    }
+
+    /// 侧问区盖住了状态区，而主 turn 可能还在跑——Ctrl+C 仍要能中断它。
+    #[test]
+    fn ctrl_c_still_interrupts_the_turn_from_inside_the_panel() {
+        let mut local = local_with("");
+        let handle = FakeHandle::new();
+        let mut resolver = Resolver::new(default_bindings());
+        dispatch_key(
+            KeyEvent::new(CtKeyCode::Char('c'), KeyModifiers::CONTROL),
+            &mut resolver,
+            &mut local,
+            &handle,
+            &frame_with_btw(),
+        );
+        assert!(handle
+            .commands()
+            .iter()
+            .any(|c| matches!(c, BridgeCommand::CancelTurn)));
+    }
+
     // ── /resume 会话选择器 ──
 
     /// `/resume` 不能就地处理：列表要读盘，而 `submit` 是同步的。它必须把这件事
@@ -2972,6 +3183,7 @@ mod tests {
     fn frame_without_ask() -> tui::FrameState {
         use tui::frame_state::*;
         tui::FrameState {
+            btw: None,
             transcript: TranscriptState {
                 header: HeaderState {
                     text: None,

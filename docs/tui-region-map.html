@@ -227,10 +227,11 @@ h1 .cursor {
   background: color-mix(in srgb, var(--r-btw) 9%, var(--surface));
 }
 .overlay-band.pending .cn::after {
-  content: "（待建）";
+  content: "· /btw";
+  font-family: "JetBrains Mono", ui-monospace, monospace;
   color: var(--r-btw);
-  font-size: .85em;
-  margin-left: .2em;
+  font-size: .8em;
+  margin-left: .35em;
 }
 
 .overlay-band {
@@ -555,7 +556,7 @@ tr[data-depth="3"] td.c-path { padding-left: 2.4rem; }
           </tr>
           <tr data-id="btw" data-depth="1" style="--swatch:var(--r-btw)">
             <td class="c-path">btw</td><td class="c-en">Side Question</td><td class="c-cn">侧问区</td>
-            <td class="c-what"><strong>待建</strong> · <code>/btw</code> 问一句题外话，不进主对话历史、不占主上下文。独占半屏</td>
+            <td class="c-what"><code>/btw</code> 问一句题外话 —— 不进主对话历史、不占主上下文、<strong>无工具</strong>、单次回答。独占半屏，turn 跑着也能用</td>
           </tr>
           <tr data-id="overlay" data-depth="1" style="--swatch:var(--r-overlay)">
             <td class="c-path">overlay</td><td class="c-en">Overlay</td><td class="c-cn">浮层</td>

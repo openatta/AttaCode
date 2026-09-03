@@ -3,7 +3,7 @@
 //! 区域的规范名（代码路径 / English / 中文）见 `docs/TUI_DESIGN.md`。
 
 use crate::frame_state::FrameState;
-use crate::regions::{composer, footer_hints, operation_status, sub_agent_bar, transcript};
+use crate::regions::{btw, composer, footer_hints, operation_status, sub_agent_bar, transcript};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     Frame,
@@ -30,6 +30,26 @@ pub fn transcript_body_height(area: Rect, state: &FrameState) -> u16 {
 }
 
 pub fn render(frame: &mut Frame, area: Rect, state: &FrameState, spinner: char) {
+    // 侧问区激活时，屏幕只有两块：上半的转录区和下半的它自己。状态区、输入区、底栏、
+    // 子代理条**都不画**——它独占。盖住之后主任务的进度就看不见了，这是照 Claude Code
+    // 的 `/btw` 做的，CC 也是这样；那是这个形态的代价，不是遗漏。
+    if let Some(btw_state) = &state.btw {
+        let btw_h = btw::height(area);
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(area.height.saturating_sub(btw_h)),
+                Constraint::Length(btw_h),
+            ])
+            .split(area);
+        let [top, bottom]: [Rect; 2] = rows.as_ref().try_into().expect("2 rows");
+        if top.height > 0 {
+            transcript::render_body(frame, top, &state.transcript.body);
+        }
+        btw::render(frame, bottom, btw_state);
+        return;
+    }
+
     let header_h = transcript::header_height(&state.transcript.header);
     let status_h = operation_status::status_line_height(&state.operation_status.status_line);
     let task_h = operation_status::task_list_height(&state.operation_status.task_list);

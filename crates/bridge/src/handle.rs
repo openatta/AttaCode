@@ -56,6 +56,28 @@ pub enum BridgeCommand {
     },
     /// `/doctor` —— 跑一遍健康检查，把报告写进转录。见 [`crate::doctor`]。
     Doctor,
+    /// `/btw <问题>` —— 开一道侧问。空串 = 重开侧问区，停在最近一次问答上。
+    /// 见 [`crate::btw`]。
+    Btw {
+        question: String,
+    },
+    /// 侧问区里的操作。
+    BtwKey(BtwKey),
+}
+
+/// 侧问区开着时能按的东西。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BtwKey {
+    /// 滚动答案，`+1` 往下。
+    Scroll(i8),
+    /// 往旧翻。
+    Older,
+    /// 往新翻。
+    Newer,
+    /// 清空早前问答。
+    ClearEarlier,
+    /// 退出，回主 UI。
+    Close,
 }
 
 /// bridge 对外暴露的唯一入口：下发命令、订阅渲染快照。
@@ -97,6 +119,8 @@ pub struct EngineParts {
     pub health: Option<Arc<base::interface::health::HealthChecks>>,
     /// `/resume` 列会话用。`None` = 这次会话纯内存。
     pub history: Option<Arc<history::store::JsonlHistoryStore>>,
+    /// `/btw` 侧问。`None` = 测试里那个不接引擎的 handle。
+    pub side_questions: Option<Arc<crate::btw::SideQuestions>>,
 }
 
 /// `EngineHandle` 的具体实现：持有 `InputSender`（转发给 `runtime::Agent`）
@@ -112,6 +136,8 @@ pub struct BridgeHandle {
     health: Option<Arc<base::interface::health::HealthChecks>>,
     /// `/resume` 列表的来源。见 [`EngineParts`]。
     history: Option<Arc<history::store::JsonlHistoryStore>>,
+    /// `/btw` 侧问。见 [`crate::btw`]。
+    side_questions: Option<Arc<crate::btw::SideQuestions>>,
     /// Same token passed to `Agent::run()` — it ends the *whole session*, and is
     /// nothing to do with the interrupt key. Held here so a future "switch
     /// session"/"shut the engine down" command has it; `BridgeCommand::CancelTurn`
@@ -137,6 +163,7 @@ impl BridgeHandle {
             questions: engine.questions,
             health: engine.health,
             history: engine.history,
+            side_questions: engine.side_questions,
             cancel,
         }
     }
@@ -258,6 +285,61 @@ impl EngineHandle for BridgeHandle {
                 self.reducer.note(text);
                 Ok(())
             }
+            // 侧问区里的键。这些都是纯本地状态，不经引擎——所以侧问区开着时主 turn
+            // 照常在跑，一点没被打扰。
+            BridgeCommand::BtwKey(key) => {
+                match key {
+                    BtwKey::Scroll(delta) => self.reducer.btw_scroll(delta as isize),
+                    BtwKey::Older => self.reducer.btw_step(true),
+                    BtwKey::Newer => self.reducer.btw_step(false),
+                    BtwKey::ClearEarlier => {
+                        if let Some(side) = &self.side_questions {
+                            side.clear();
+                        }
+                        self.reducer.btw_clear_earlier();
+                    }
+                    BtwKey::Close => self.reducer.btw_close(),
+                }
+                Ok(())
+            }
+            BridgeCommand::Btw { question } => {
+                let Some(side) = self.side_questions.clone() else {
+                    self.reducer
+                        .note("/btw: no engine is attached to this session".into());
+                    return Ok(());
+                };
+                let question = question.trim().to_string();
+                if question.is_empty() {
+                    // 不带问题 = 重开侧问区，停在最近一次问答上（照 CC）。
+                    let earlier = side.exchanges();
+                    match earlier.last().cloned() {
+                        Some(last) => {
+                            let head = earlier[..earlier.len() - 1].to_vec();
+                            self.reducer.btw_open(last.question, head);
+                            self.reducer.btw_done(Some(last.answer));
+                        }
+                        None => self
+                            .reducer
+                            .note("/btw: nothing asked yet — try `/btw <question>`".into()),
+                    }
+                    return Ok(());
+                }
+
+                // 立刻上屏（带着"在想"），答案随后流式填进来。**这一步不 await**——
+                // 侧问跑在自己的 task 上，主 turn 一点都不等它。
+                self.reducer.btw_open(question.clone(), side.exchanges());
+                let reducer = self.reducer.clone();
+                let cancel = self.cancel.child_token();
+                tokio::spawn(async move {
+                    let outcome = side
+                        .ask(&question, cancel, |delta| reducer.btw_delta(delta))
+                        .await;
+                    // 失败也要说出来。一个答不出来的侧问必须说自己答不出来，
+                    // 而不是留一个永远"在想"的空框。
+                    reducer.btw_done(outcome.err());
+                });
+                Ok(())
+            }
             BridgeCommand::Doctor => {
                 let text = match &self.health {
                     Some(health) => crate::doctor::render(&health.report()),
@@ -322,6 +404,7 @@ mod tests {
                 questions: questions.clone(),
                 health: None,
                 history: None,
+                side_questions: None,
             },
             frame_rx.clone(),
             commands_rx,

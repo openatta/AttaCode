@@ -37,7 +37,7 @@ AttaCode/
 ```
 用户按键
   → keybindings::Resolver（快捷键匹配 → action 名）
-  → app 分流：本地动作（草稿/滚动/块选择/ /model /quit /doctor /resume）或 EngineHandle::dispatch
+  → app 分流：本地动作（草稿/滚动/块选择/ /model /quit /doctor /resume /btw）或 EngineHandle::dispatch
   → bridge → runtime::InputMessage → runtime::Agent::process_turn()
   → base::event::AgentEvent 流
   → bridge 归约器（流式文本、工具块配对、折叠态、用量、权限队列）
@@ -58,7 +58,7 @@ AttaCode/
 
 slash 命令有两个来源，提交时在 `app` 分流：
 
-- **本地**（`crates/app`）：`/model`、`/doctor`、`/resume`、`/quit`、`/exit` —— 不联系 Core。
+- **本地**（`crates/app`）：`/model`、`/doctor`、`/resume`、`/btw`、`/quit`、`/exit` —— 不联系 Core。
 - **Core**：其余一律原样转发，由 `runtime::commands::CommandRegistry` 解析（内置 `/help` `/skills` `/clear` `/compact` `/cost` + 实时技能 + 插件/MCP prompts）。补全弹窗里的候选就是这份实时表 + 上面那几条本地命令，所以选中的命令提交后一定解析得出来。
 
 `/resume` 是唯一一条会把整个引擎重建一遍的命令：模型上下文、工具表、权限门、转录

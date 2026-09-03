@@ -56,6 +56,20 @@ struct DomainState {
     activity: String,
     model_name: String,
     cwd: String,
+    /// 侧问区。`Some` = 激活，它独占屏幕下半和键盘。见 [`crate::btw`]。
+    btw: Option<BtwSession>,
+}
+
+/// 侧问区当前的样子。
+struct BtwSession {
+    question: String,
+    answer: String,
+    streaming: bool,
+    scroll: usize,
+    /// 早前问答，旧的在前。翻看时从这里取。
+    earlier: Vec<crate::btw::Exchange>,
+    /// 正在看第几条（0 = 当前这问，往大 = 越早）。
+    viewing: usize,
 }
 
 struct Turn {
@@ -223,6 +237,7 @@ impl Reducer {
             activity: String::new(),
             model_name,
             cwd,
+            btw: None,
         };
         let initial_frame = render(&initial);
         let (frame_tx, frame_rx) = watch::channel(initial_frame);
@@ -314,6 +329,90 @@ impl Reducer {
         let mut state = self.state.lock().unwrap();
         state.pending_asks.retain(|p| p.prompt_id != prompt_id);
         self.broadcast(&state);
+    }
+
+    /// `/btw` 开一问：立刻上屏（带着"在想"），答案随后流式填进来。
+    pub fn btw_open(&self, question: String, earlier: Vec<crate::btw::Exchange>) {
+        let mut state = self.state.lock().unwrap();
+        state.btw = Some(BtwSession {
+            question,
+            answer: String::new(),
+            streaming: true,
+            scroll: 0,
+            earlier,
+            viewing: 0,
+        });
+        self.broadcast_as("btw.open", &state);
+    }
+
+    /// 答案又长出一段。
+    pub fn btw_delta(&self, text: &str) {
+        let mut state = self.state.lock().unwrap();
+        if let Some(btw) = &mut state.btw {
+            btw.answer.push_str(text);
+        }
+        self.broadcast_as("btw.delta", &state);
+    }
+
+    /// 这一问答完了（或者失败了——`answer` 里就是那句失败原因）。
+    pub fn btw_done(&self, answer: Option<String>) {
+        let mut state = self.state.lock().unwrap();
+        if let Some(btw) = &mut state.btw {
+            if let Some(text) = answer {
+                btw.answer = text;
+            }
+            btw.streaming = false;
+        }
+        self.broadcast_as("btw.done", &state);
+    }
+
+    /// 退出侧问区，回主 UI。
+    pub fn btw_close(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.btw = None;
+        self.broadcast_as("btw.close", &state);
+    }
+
+    pub fn btw_is_open(&self) -> bool {
+        self.state.lock().unwrap().btw.is_some()
+    }
+
+    /// 滚动答案。`delta` 是行数，负数往上。
+    pub fn btw_scroll(&self, delta: isize) {
+        let mut state = self.state.lock().unwrap();
+        if let Some(btw) = &mut state.btw {
+            btw.scroll = btw.scroll.saturating_add_signed(delta);
+        }
+        self.broadcast_as("btw.scroll", &state);
+    }
+
+    /// 在当前这问和早前问答之间翻。`back` = 往旧翻。
+    ///
+    /// 还在流式回答的时候不给翻——答案正在长，翻走再翻回来会看见半截。
+    pub fn btw_step(&self, back: bool) {
+        let mut state = self.state.lock().unwrap();
+        let Some(btw) = &mut state.btw else { return };
+        if btw.streaming {
+            return;
+        }
+        let deepest = btw.earlier.len();
+        btw.viewing = if back {
+            (btw.viewing + 1).min(deepest)
+        } else {
+            btw.viewing.saturating_sub(1)
+        };
+        btw.scroll = 0;
+        self.broadcast_as("btw.step", &state);
+    }
+
+    /// 清空早前问答（`x`）。当前这一问答留着——用户看的就是它。
+    pub fn btw_clear_earlier(&self) {
+        let mut state = self.state.lock().unwrap();
+        if let Some(btw) = &mut state.btw {
+            btw.earlier.clear();
+            btw.viewing = 0;
+        }
+        self.broadcast_as("btw.clear", &state);
     }
 
     /// 模型提了个问题，或者不等了。见 [`crate::ask`]。
@@ -1023,6 +1122,34 @@ fn render(state: &DomainState) -> FrameState {
                 color: SeparatorColor::DarkGray,
             },
         },
+        btw: state.btw.as_ref().map(|b| {
+            // 翻看早前问答时，屏幕上显示的是**那一条**的问和答，而不是最新那条。
+            // 0 = 当前这问；1 起是 `earlier` 从新往旧数。
+            let (question, answer, streaming) = match b.viewing.checked_sub(1) {
+                None => (b.question.clone(), b.answer.clone(), b.streaming),
+                Some(back) => match b.earlier.iter().rev().nth(back) {
+                    Some(e) => (e.question.clone(), e.answer.clone(), false),
+                    None => (b.question.clone(), b.answer.clone(), b.streaming),
+                },
+            };
+            // 上方那份暗色列表：最近 5 条的问题，新的在前，更早的只报个数。
+            const SHOWN: usize = 5;
+            BtwState {
+                question,
+                answer,
+                streaming,
+                scroll: b.scroll,
+                earlier: b
+                    .earlier
+                    .iter()
+                    .rev()
+                    .take(SHOWN)
+                    .map(|e| e.question.clone())
+                    .collect(),
+                older: b.earlier.len().saturating_sub(SHOWN),
+                viewing: b.viewing,
+            }
+        }),
         sub_agent_bar: SubAgentBarState {
             agents: state
                 .sub_agents

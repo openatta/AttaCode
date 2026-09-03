@@ -81,6 +81,9 @@ pub fn default_bindings() -> Vec<Keybinding> {
         // app 那层解决的——权限对话框开着时它按对话框的语义解释 `editor.submit` /
         // `editor.history.*`（见 `dispatch_ask_action`）。这里留着这三条是给
         // 想把选项导航改绑到别的键的用户用的，改了就能走通。
+        // `x` 在侧问区里是"清空早前问答"（照 CC）。裸字符，和 `y`/`n` 一样——只有
+        // 那个区域开着时 app 才会按这个意思解释它，别处它就是普通输入。
+        bind("x", "btw.clear", "Clear earlier /btw exchanges"),
         bind("Up", "ask.prev", "Previous option in ask-dialog"),
         bind("Down", "ask.next", "Next option in ask-dialog"),
         bind("Enter", "ask.confirm", "Confirm current ask-dialog choice"),
@@ -175,6 +178,7 @@ mod tests {
             "Up = ask.prev",
             "Up = editor.history.prev",
             "n = ask.no-shortcut",
+            "x = btw.clear",
             "y = ask.yes-shortcut",
         ]
         .map(str::to_string)

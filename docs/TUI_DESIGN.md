@@ -54,7 +54,7 @@ v4 相对 v3 的核心变化：**废止 `Z/R/S` 字母+数字坐标**，改用�
 | `composer.bottom_rule` | Bottom Rule | 输入·下分隔线 | 嵌套 |
 | `sub_agent_bar` | Sub-Agent Bar | 子代理条 | 顶层，叶子 |
 | `footer_hints` | Footer Hints | 底栏 | 顶层，叶子 |
-| `btw` | Side Question | 侧问区 | 独立层，独占；转录区压到一半，它吃下半屏（**尚未实现**，见 `docs/reqs/2026-09-02-btw-side-question.md`） |
+| `btw` | Side Question | 侧问区 | 独立层，**独占键盘**；转录区压到一半，它吃下半屏，盖住状态区/输入区/底栏/子代理条。`/btw` 激活，见 `docs/reqs/2026-09-02-btw-side-question.md` |
 | `overlay` | Overlay | 浮层 | 独立层，盖在以上全部之上 |
 
 > **`overlay` 不参与上面的堆叠**：它是盖在整个 frame 之上的全屏浮层，一次只有一个，
@@ -112,8 +112,9 @@ v4 相对 v3 的核心变化：**废止 `Z/R/S` 字母+数字坐标**，改用�
 overlay:{help|model|resume|settings|doctor|search}          浮层
   — 盖在以上所有区域之上，不参与这个堆叠，一次只有一个
 btw                                                         侧问区
-  — 激活时转录区压到一半，它吃下半屏并盖住状态区/输入区/底栏/子代理条；
-    独占键盘。尚未实现，见 docs/reqs/2026-09-02-btw-side-question.md
+  — `/btw <问题>` 激活。转录区压到一半，它吃下半屏并盖住状态区/输入区/底栏/
+    子代理条，独占键盘。盖住期间看不见主任务进度——CC 也是这样，是这个形态的
+    代价。见 docs/reqs/2026-09-02-btw-side-question.md
 
 底栏在子代理条**上面**：底栏是常驻的一行，子代理条是条件显示的。把常驻的那条钉在
 固定位置上，眼睛才不用每次重新找它——子代理条一出现就把底栏顶走一行的话，人会先愣一下。

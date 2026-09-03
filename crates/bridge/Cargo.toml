@@ -26,6 +26,7 @@ compaction  = { workspace = true }
 history     = { workspace = true }
 session     = { workspace = true }
 
+futures     = { workspace = true }
 tokio       = { workspace = true }
 tokio-util  = { workspace = true }
 serde_json  = { workspace = true }

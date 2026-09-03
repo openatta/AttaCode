@@ -197,6 +197,7 @@ dependencies = [
  "async-trait",
  "base",
  "compaction",
+ "futures",
  "history",
  "model",
  "permissions",

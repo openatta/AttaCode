@@ -61,6 +61,7 @@ fn entry(kind: LineKind, text: &str, block: Option<&str>) -> TranscriptEntry {
 /// 一帧最小可用的快照，各测试在它上面改自己关心的那部分。
 fn base() -> FrameState {
     FrameState {
+        btw: None,
         transcript: TranscriptState {
             header: HeaderState {
                 text: None,

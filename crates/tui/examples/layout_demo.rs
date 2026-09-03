@@ -191,6 +191,7 @@ fn entry(kind: LineKind, text: &str) -> TranscriptEntry {
 
 fn base_frame(entries: Vec<TranscriptEntry>) -> FrameState {
     FrameState {
+        btw: None,
         transcript: TranscriptState {
             header: HeaderState {
                 text: None,

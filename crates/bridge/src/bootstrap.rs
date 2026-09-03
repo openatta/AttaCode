@@ -411,6 +411,8 @@ pub struct BuiltEngine {
     pub health: Arc<base::interface::health::HealthChecks>,
     /// 模型提问的会合点，和归约器要消费的那条流。见 [`crate::ask`]。
     pub questions: Arc<crate::ask::Questions>,
+    /// `/btw` 侧问。见 [`crate::btw`]。
+    pub side_questions: Arc<crate::btw::SideQuestions>,
     pub questions_rx: tokio::sync::mpsc::UnboundedReceiver<crate::ask::QuestionEvent>,
     /// 三层 settings.json 合并完之后**真正生效**的模型名——状态栏要显示的是这个，
     /// 不是调用方传进来的兜底值。
@@ -480,6 +482,12 @@ pub async fn build_agent(config: &BootstrapConfig) -> Result<BuiltEngine, Bootst
             }
         })?;
 
+    // 侧问：`/btw` 要看见"模型此刻看见的全部对话"，而那份东西宿主够不着
+    // （`Agent.session` 是 `pub(crate)`，`Agent` 又已经被 move 进 `run()`）。正门是
+    // `ModelInterceptor::on_request`——每次模型调用发出之前把整个请求交到手上。
+    // 见 [`crate::btw`]。
+    let side_questions = crate::btw::SideQuestions::new(model.clone());
+
     let settings = Arc::new(settings);
     let model_name = settings.model.model_name.clone();
 
@@ -543,6 +551,7 @@ pub async fn build_agent(config: &BootstrapConfig) -> Result<BuiltEngine, Bootst
     {
         builder = builder.health_check(check);
     }
+    builder = builder.model_interceptor(side_questions.mirror());
     // 有落盘后端时，`SessionManager` 每个 turn 结束增量追加一次 jsonl；没有就纯内存
     // （`Builder` 的默认行为），进程一退全丢。顺带一提，会话记忆边车
     // （`session_memory.md`）也只在有这个 store 的时候才建——见 `Builder::build`。
@@ -582,6 +591,7 @@ pub async fn build_agent(config: &BootstrapConfig) -> Result<BuiltEngine, Bootst
     }
 
     Ok(BuiltEngine {
+        side_questions,
         history: store,
         health: agent.health(),
         agent,

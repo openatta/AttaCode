@@ -428,6 +428,33 @@ impl AppMode {
 
 // ═══ Top-level aggregate ═══
 
+// ═══ btw — Side Question / 侧问区 ═══
+
+/// 侧问区。`FrameState::btw` 为 `Some` 时它就是激活的。
+///
+/// 激活期间它**独占屏幕下半和键盘**：转录区压到约一半，它盖住状态区、输入区、底栏和
+/// 子代理条。这是照 Claude Code 的 `/btw` 做的，包括"盖住之后主任务进度就看不见了"
+/// ——CC 也是这样，那是这个形态的代价。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BtwState {
+    /// 当前正在看的那一问。
+    pub question: String,
+    /// 当前这一答。流式长出来的。
+    pub answer: String,
+    /// 还在等模型说话。
+    pub streaming: bool,
+    /// 答案的滚动位置（跳过的行数）。
+    pub scroll: usize,
+    /// 早前问答的问题行，新的在前，最多 5 条（照 CC）。
+    pub earlier: Vec<String>,
+    /// 除了上面那 5 条之外还有多少条更早的。
+    pub older: usize,
+    /// 正在看第几条（0 = 当前这条，往大 = 越早）。
+    pub viewing: usize,
+}
+
+// ═══ FrameState ═══
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FrameState {
     pub transcript: TranscriptState,
@@ -435,4 +462,7 @@ pub struct FrameState {
     pub composer: ComposerState,
     pub sub_agent_bar: SubAgentBarState,
     pub footer_hints: FooterHintsState,
+    /// 侧问区。`Some` = 激活，它独占屏幕下半和键盘，上面那四个区域都不画。
+    #[serde(default)]
+    pub btw: Option<BtwState>,
 }

@@ -6,6 +6,7 @@
 
 pub mod ask;
 pub mod bootstrap;
+pub mod btw;
 pub mod commands;
 pub mod doctor;
 pub mod handle;
@@ -18,7 +19,7 @@ pub mod trace;
 /// `crates/app` 不必自己去依赖 `async-trait`——它用的是哪个宏 crate 是 bridge 的事。
 pub use async_trait::async_trait;
 pub use bootstrap::{BootstrapConfig, BootstrapError, Resume, DEFAULT_MODEL};
-pub use handle::{BridgeCommand, BridgeError, BridgeHandle, EngineHandle};
+pub use handle::{BridgeCommand, BridgeError, BridgeHandle, BtwKey, EngineHandle};
 
 use reducer::Reducer;
 use std::sync::Arc;
@@ -73,6 +74,7 @@ pub async fn start(config: BootstrapConfig) -> Result<Session, BootstrapError> {
             questions: engine.questions,
             health: Some(engine.health),
             history: engine.history,
+            side_questions: Some(engine.side_questions),
         },
         frame_rx,
         commands_rx,
