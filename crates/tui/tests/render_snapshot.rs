@@ -51,7 +51,7 @@ fn transcript_then(lines: &[&str], tail: &[&str], h: usize) -> Vec<String> {
 
 fn entry(kind: LineKind, text: &str, block: Option<&str>) -> TranscriptEntry {
     TranscriptEntry {
-        continues_previous: false,
+        starts_segment: false,
         kind,
         text: text.into(),
         block_id: block.map(str::to_string),
@@ -330,6 +330,26 @@ fn a_running_turn_shows_status_tasks_and_sub_agents() {
     ] {
         assert!(screen.contains(expected), "缺 {expected:?}:\n{screen}");
     }
+
+    // 自上而下的堆叠顺序。只断言"内容都在"是不够的——那样任何一次调序都测不出来，
+    // 而屏幕上东西的位置正是这份布局的全部意义。
+    let rows = draw_at(&f, W, 16);
+    let row_of = |needle: &str| {
+        rows.iter()
+            .position(|r| r.contains(needle))
+            .unwrap_or_else(|| panic!("找不到 {needle:?}:\n{}", rows.join("\n")))
+    };
+    let status = row_of("Running Bash");
+    let tasks = row_of("✓ read code");
+    let footer = row_of("1.5k↑ 300↓");
+    let agents = row_of("explore#3f2a1b7c");
+    assert!(status < tasks, "状态行在任务清单上面");
+    assert!(tasks < footer, "任务清单在输入区/底栏上面");
+    assert!(
+        footer < agents,
+        "底栏在子代理条**上面**：底栏常驻，子代理条条件显示，\
+         常驻的那条得钉在固定位置上"
+    );
 }
 
 /// 补全弹窗浮在输入框**上方**，选中项带 `❯`。

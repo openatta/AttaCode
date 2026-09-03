@@ -924,9 +924,20 @@ fn summarize_input(input: &serde_json::Value) -> String {
 
 fn render(state: &DomainState) -> FrameState {
     let mut entries = Vec::new();
+    // 段与段之间留一行空。**空行是一条真 entry**——整个滚动模型建立在"一条 entry =
+    // 屏幕一行"上（`total_lines`、翻页步长、`scroll.offset` 全按条数算），渲染时凭空
+    // 多画一行会让"跳过 N 条"不再等于"跳过 N 行"，翻页会越翻越偏。
+    //
+    // 一段 = 转录里的一件事：一次用户输入、一段模型回答、一次工具调用、一条通知。
+    // 不分段的话它们首尾相接糊成一片，人得靠颜色和前缀去猜边界在哪。
     for turn in &state.turns {
         for block in &turn.blocks {
+            let before = entries.len();
             push_block_entries(&mut entries, block);
+            // 空块（比如没有结果的工具？）什么都没产出时不要平白留一行空。
+            if before > 0 && entries.len() > before {
+                entries.insert(before, plain(LineKind::Spacer, ""));
+            }
         }
     }
 
@@ -1052,7 +1063,7 @@ fn push_block_entries(entries: &mut Vec<TranscriptEntry>, block: &Block) {
             expanded,
         } => {
             entries.push(TranscriptEntry {
-                continues_previous: false,
+                starts_segment: true,
                 kind: LineKind::ToolHeading,
                 text: format!("{name}({input_summary})"),
                 block_id: Some(id.clone()),
@@ -1069,7 +1080,7 @@ fn push_block_entries(entries: &mut Vec<TranscriptEntry>, block: &Block) {
             if lines.len() <= FOLD_LINE_THRESHOLD || *expanded {
                 if lines.is_empty() {
                     entries.push(TranscriptEntry {
-                        continues_previous: false,
+                        starts_segment: false,
                         kind: base,
                         text: String::new(),
                         block_id: Some(id.clone()),
@@ -1078,7 +1089,7 @@ fn push_block_entries(entries: &mut Vec<TranscriptEntry>, block: &Block) {
                 for (i, line) in lines.iter().enumerate() {
                     let kind = kind(i, line);
                     entries.push(TranscriptEntry {
-                        continues_previous: false,
+                        starts_segment: false,
                         kind,
                         text: strip_diff_marker(kind, line),
                         block_id: Some(id.clone()),
@@ -1088,7 +1099,7 @@ fn push_block_entries(entries: &mut Vec<TranscriptEntry>, block: &Block) {
                 for (i, line) in lines[..FOLD_LINE_THRESHOLD].iter().enumerate() {
                     let kind = kind(i, line);
                     entries.push(TranscriptEntry {
-                        continues_previous: false,
+                        starts_segment: false,
                         kind,
                         text: strip_diff_marker(kind, line),
                         block_id: Some(id.clone()),
@@ -1096,7 +1107,7 @@ fn push_block_entries(entries: &mut Vec<TranscriptEntry>, block: &Block) {
                 }
                 let hidden = lines.len() - FOLD_LINE_THRESHOLD;
                 entries.push(TranscriptEntry {
-                    continues_previous: false,
+                    starts_segment: false,
                     kind: LineKind::Note,
                     text: format!("… {hidden} more lines (toggle to expand)"),
                     block_id: Some(id.clone()),
@@ -1174,25 +1185,27 @@ fn classify(idx: usize, line: &str, diff_from: Option<usize>, base: LineKind) ->
 /// 空串给一条空 entry 而不是零条：一个空的 note/error 仍然占一行，和以前一样。
 fn push_lines(entries: &mut Vec<TranscriptEntry>, kind: LineKind, text: &str) {
     if text.is_empty() {
-        entries.push(plain(kind, ""));
+        let mut entry = plain(kind, "");
+        entry.starts_segment = true;
+        entries.push(entry);
         return;
     }
     // `lines()` 而不是 `split('\n')`：前者认 `\r\n`，也不会为结尾那个换行多造一条
     // 空行（流式文本经常以换行收尾）。段落之间的空行照样保留。
     //
-    // 第二行起打上 `continues_previous`：谁要还原"这原本是一段"，读的必须是这个
-    // 标记。恢复出来的转录里两次相邻的用户提交（发一句、Ctrl+C、再发一句）之间
-    // 什么都没有，按相邻拼会把它们粘成一条。
+    // 只有第一行是段首：谁要还原"这原本是一段"，读的必须是这个标记。恢复出来的
+    // 转录里两次相邻的用户提交（发一句、Ctrl+C、再发一句）之间什么都没有，按相邻
+    // 拼会把它们粘成一条。
     for (i, line) in text.lines().enumerate() {
         let mut entry = plain(kind, line);
-        entry.continues_previous = i > 0;
+        entry.starts_segment = i == 0;
         entries.push(entry);
     }
 }
 
 fn plain(kind: LineKind, text: &str) -> TranscriptEntry {
     TranscriptEntry {
-        continues_previous: false,
+        starts_segment: false,
         kind,
         text: text.to_string(),
         block_id: None,
@@ -1396,9 +1409,89 @@ mod tests {
             .entries
             .iter()
             .filter(|e| e.kind == LineKind::AssistantText)
-            .map(|e| e.continues_previous)
+            .map(|e| e.starts_segment)
             .collect();
-        assert_eq!(flags, [false, true, true, true, true]);
+        assert_eq!(
+            flags,
+            [true, false, false, false, false],
+            "只有第一行是段首"
+        );
+    }
+
+    /// **转录是一段一段的，不是一片。**
+    ///
+    /// 一段 = 一件事：一次用户输入、一段模型回答、一次工具调用（含它的结果）、
+    /// 一条通知。段与段之间留一行空，段内不留——工具的标题和结果讲的是同一件事，
+    /// 中间劈开反而更难读。
+    ///
+    /// 空行是**真 entry** 而不是渲染时插的：整个滚动模型建立在"一条 entry = 屏幕
+    /// 一行"上，渲染时凭空多画一行，翻页会越翻越偏。
+    #[test]
+    fn the_transcript_is_laid_out_in_segments() {
+        let (r, rx) = reducer();
+        let turn_id = r.begin_turn("帮我看一下".into());
+        r.apply_event(AgentEvent::TextDelta {
+            text: "好，我先读文件。".into(),
+            turn_id: turn_id.clone(),
+        });
+        r.apply_event(AgentEvent::ToolUse {
+            id: "t1".into(),
+            name: "Read".into(),
+            input: serde_json::json!({ "file_path": "a.rs" }),
+            turn_id: turn_id.clone(),
+        });
+        r.apply_event(AgentEvent::ToolResult {
+            id: "t1".into(),
+            name: "Read".into(),
+            content: "fn main() {}".into(),
+            is_error: Some(false),
+            turn_id: turn_id.clone(),
+        });
+        r.apply_event(AgentEvent::TextDelta {
+            text: "读完了。".into(),
+            turn_id,
+        });
+
+        let f = frame(&rx);
+        let kinds: Vec<LineKind> = f.transcript.body.entries.iter().map(|e| e.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                LineKind::UserPrompt,
+                LineKind::Spacer,
+                LineKind::AssistantText,
+                LineKind::Spacer,
+                LineKind::ToolHeading,
+                LineKind::ToolResultOk, // 同一段，不留空
+                LineKind::Spacer,
+                LineKind::AssistantText,
+            ]
+        );
+
+        // 每一段的第一行都带段首标记，段内的不带；空行不算任何一段的开头。
+        let marks: Vec<(LineKind, bool)> = f
+            .transcript
+            .body
+            .entries
+            .iter()
+            .map(|e| (e.kind, e.starts_segment))
+            .collect();
+        assert_eq!(
+            marks
+                .iter()
+                .filter(|(k, _)| *k != LineKind::Spacer)
+                .map(|(_, m)| *m)
+                .collect::<Vec<_>>(),
+            [true, true, true, false, true]
+        );
+
+        // 开头不留空——第一段上面没有东西可隔开。
+        assert_ne!(f.transcript.body.entries[0].kind, LineKind::Spacer);
+        // 滚动模型的前提：条数就是行数。
+        assert_eq!(
+            f.transcript.body.scroll.total_lines,
+            f.transcript.body.entries.len()
+        );
     }
 
     /// `/doctor` 的报告是多行的，必须真的画成多行。
@@ -1525,6 +1618,7 @@ mod tests {
                     .body
                     .entries
                     .iter()
+                    .filter(|e| e.kind != LineKind::Spacer)
                     .map(|e| e.text.clone())
                     .collect();
                 if texts.len() >= 2 {
@@ -1625,6 +1719,7 @@ mod tests {
             .body
             .entries
             .iter()
+            .filter(|e| e.kind != LineKind::Spacer)
             .map(|e| e.text.clone())
             .collect();
         assert_eq!(
@@ -1719,7 +1814,12 @@ mod tests {
             .body
             .entries
             .iter()
-            .filter(|e| e.kind != LineKind::UserPrompt && e.kind != LineKind::ToolHeading)
+            .filter(|e| {
+                !matches!(
+                    e.kind,
+                    LineKind::UserPrompt | LineKind::ToolHeading | LineKind::Spacer
+                )
+            })
             .map(|e| e.kind)
             .collect();
         assert_eq!(
@@ -2116,16 +2216,26 @@ mod tests {
             kinds,
             vec![
                 LineKind::UserPrompt,
+                LineKind::Spacer,
                 LineKind::AssistantText,
+                LineKind::Spacer,
                 LineKind::ToolHeading,
+                // 工具的标题和它的结果是**同一段**，中间不留空
                 LineKind::ToolResultOk,
+                LineKind::Spacer,
                 LineKind::AssistantText,
             ]
         );
-        // 工具结果回填到了它自己的块上（block_id 和 heading 一致）。
-        let heading = f.transcript.body.entries[2].block_id.clone();
+        // 工具结果回填到了它自己的块上（block_id 和 heading 一致）。按类型找，
+        // 不按下标——段与段之间有空行，写死的下标会随排版一起漂。
+        let entries = &f.transcript.body.entries;
+        let heading_at = entries
+            .iter()
+            .position(|e| e.kind == LineKind::ToolHeading)
+            .expect("有工具块");
+        let heading = entries[heading_at].block_id.clone();
         assert_eq!(heading.as_deref(), Some("t1"));
-        assert_eq!(f.transcript.body.entries[3].block_id, heading);
+        assert_eq!(entries[heading_at + 1].block_id, heading);
         // header 钉的是恢复出来的最后一个用户输入。
         assert_eq!(
             f.transcript.header.text.as_deref(),
@@ -2190,6 +2300,7 @@ mod tests {
             .body
             .entries
             .iter()
+            .filter(|e| e.kind != LineKind::Spacer)
             .map(|e| e.text.clone())
             .collect();
         assert_eq!(texts, vec!["旧问题", "新问题", "新回答"]);

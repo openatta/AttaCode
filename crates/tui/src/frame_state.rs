@@ -53,18 +53,25 @@ pub struct TranscriptEntry {
     /// `None` for entries that are never foldable (plain text, headings, …).
     #[serde(default)]
     pub block_id: Option<String>,
-    /// 这一条是不是上一条的**续行**——同一段文本被拆开的第二行起。
+    /// 这一条是不是一个**段**的第一行。
     ///
-    /// 一条 entry 是屏幕上的一行，所以一次多行提交、一段多行回答在这里都是好几条
-    /// （见 `bridge::reducer::push_lines`）。谁要还原"这原本是一段"，靠的必须是
-    /// 这个标记，**不能靠相邻**：恢复出来的转录里，两次相邻的用户提交（发一句、
-    /// Ctrl+C、再发一句）之间什么都没有，按相邻拼会把它们粘成一条。
+    /// 一段 = 转录里的一件事：一次用户输入、一段模型回答、一次工具调用（含它的
+    /// 结果）、一条通知。一条 entry 是屏幕上的一行，所以一段通常是好几条。
+    ///
+    /// 两个消费方靠它：渲染那边在段与段之间留白（`LineKind::Spacer`），`crates/app`
+    /// 那边把同一段的几行拼回一次提交。**都不能靠相邻推断**——恢复出来的转录里，
+    /// 两次相邻的用户提交（发一句、Ctrl+C、再发一句）之间什么都没有，按相邻拼会把
+    /// 两次提交粘成一条。
     #[serde(default)]
-    pub continues_previous: bool,
+    pub starts_segment: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LineKind {
+    /// 段与段之间的空行。**是一条真 entry，不是渲染时插进去的**——整个滚动模型
+    /// （`total_lines`、翻页步长、`scroll.offset`）都建立在"一条 entry = 屏幕一行"
+    /// 上，渲染时凭空多画一行会让"跳过 N 条"不再等于"跳过 N 行"。
+    Spacer,
     Banner,
     UserPrompt,
     AssistantText,

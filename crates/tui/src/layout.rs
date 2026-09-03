@@ -46,12 +46,15 @@ pub fn render(frame: &mut Frame, area: Rect, state: &FrameState, spinner: char) 
             Constraint::Length(status_h),
             Constraint::Length(task_h),
             Constraint::Length(composer_h),
-            Constraint::Length(sub_agent_h),
+            // 底栏在子代理条**上面**：底栏是常驻的一行（模型/cwd/权限模式/用量），
+            // 子代理条是条件显示的，把常驻的那条钉在固定位置上，眼睛才不用每次
+            // 重新找它——子代理条一出现就把底栏顶走一行的话，人会先愣一下。
             Constraint::Length(footer_h),
+            Constraint::Length(sub_agent_h),
         ])
         .split(area);
 
-    let [header_r, body_r, status_r, task_r, composer_r, sub_agent_r, footer_r]: [Rect; 7] =
+    let [header_r, body_r, status_r, task_r, composer_r, footer_r, sub_agent_r]: [Rect; 7] =
         rows.as_ref().try_into().expect("7 rows");
 
     if header_h > 0 {
@@ -65,8 +68,8 @@ pub fn render(frame: &mut Frame, area: Rect, state: &FrameState, spinner: char) 
         operation_status::render_task_list(frame, task_r, &state.operation_status.task_list);
     }
     composer::render(frame, composer_r, &state.composer);
+    footer_hints::render(frame, footer_r, &state.footer_hints);
     if sub_agent_h > 0 {
         sub_agent_bar::render(frame, sub_agent_r, &state.sub_agent_bar, spinner);
     }
-    footer_hints::render(frame, footer_r, &state.footer_hints);
 }

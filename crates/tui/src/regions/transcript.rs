@@ -91,6 +91,8 @@ pub fn render_body(frame: &mut Frame, area: Rect, state: &TranscriptBodyState) {
 /// selecting something doesn't shift the whole transcript sideways by one cell.
 fn entry_line(entry: &TranscriptEntry, selected: bool) -> Line<'static> {
     let (prefix, fg, bold) = match entry.kind {
+        // 段与段之间那一行空。连 gutter 都不画——它存在的意义就是什么都没有。
+        LineKind::Spacer => ("", Color::Reset, false),
         LineKind::UserPrompt => (style::USER_PROMPT_PREFIX, Color::White, false),
         LineKind::AssistantText => ("  ", Color::White, false),
         LineKind::ToolHeading => (style::TOOL_HEADING_PREFIX, style::COLOR_SUCCESS, true),
@@ -157,7 +159,7 @@ mod tests {
         use crate::frame_state::ScrollState;
         let entries: Vec<TranscriptEntry> = (0..50)
             .map(|i| TranscriptEntry {
-                continues_previous: false,
+                starts_segment: false,
                 kind: LineKind::AssistantText,
                 text: format!("line{i}"),
                 block_id: None,
@@ -181,7 +183,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, id)| TranscriptEntry {
-                continues_previous: false,
+                starts_segment: false,
                 kind: LineKind::ToolResultOk,
                 text: format!("row{i}"),
                 block_id: Some((*id).to_string()),

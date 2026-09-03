@@ -182,7 +182,7 @@ fn base_entries() -> Vec<TranscriptEntry> {
 
 fn entry(kind: LineKind, text: &str) -> TranscriptEntry {
     TranscriptEntry {
-        continues_previous: false,
+        starts_segment: false,
         kind,
         text: text.to_string(),
         block_id: None,

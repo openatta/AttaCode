@@ -716,10 +716,10 @@ fn prompt_is_visible(frame: &tui::FrameState, local: &LocalUi) -> bool {
     // "看得见"、于是把 header 收起来——而 header 要显示的那一行恰好在屏幕外面，
     // 正好和它存在的理由相反。
     //
-    // 往回走的依据同样是 `continues_previous` 而不是相邻：相邻的上一条可能是**上一次**
+    // 往回走的依据同样是 `starts_segment` 而不是相邻：相邻的上一条可能是**上一次**
     // 提交（中间那一轮被取消了），那时该钉的是这一次的第一行，不是上一次的。
     let mut idx = last;
-    while idx > 0 && entries[idx].continues_previous && is_prompt(&entries[idx - 1]) {
+    while idx > 0 && entries[idx].starts_segment && is_prompt(&entries[idx - 1]) {
         idx -= 1;
     }
     let page = local.viewport_lines.max(1);
@@ -736,7 +736,7 @@ fn prompt_is_visible(frame: &tui::FrameState, local: &LocalUi) -> bool {
 /// 在转录里是好几条。按条收的话，`↑` 只召回最后一行，再按一次是同一次提交的上一行
 /// ——而**当场**提交时 `remember()` 存的是整段。同一份历史，两种形状。
 ///
-/// 拼的依据是 `continues_previous`，**不是相邻**：恢复出来的转录里每条用户消息各成
+/// 拼的依据是 `starts_segment`，**不是相邻**：恢复出来的转录里每条用户消息各成
 /// 一个 turn，两次相邻的提交（发一句、Ctrl+C、再发一句）之间什么都没有，按相邻拼
 /// 会把两次提交粘成一条。
 fn user_prompts(frame: &tui::FrameState) -> Vec<String> {
@@ -746,7 +746,7 @@ fn user_prompts(frame: &tui::FrameState) -> Vec<String> {
             continue;
         }
         match out.last_mut() {
-            Some(last) if entry.continues_previous => {
+            Some(last) if entry.starts_segment => {
                 last.push('\n');
                 last.push_str(&entry.text);
             }
@@ -1418,7 +1418,7 @@ mod tests {
         let mut snapshot = frame_without_ask();
         snapshot.transcript.body.entries = (0..100)
             .map(|i| TranscriptEntry {
-                continues_previous: false,
+                starts_segment: false,
                 kind: LineKind::AssistantText,
                 text: format!("line{i}"),
                 block_id: None,
@@ -1497,7 +1497,7 @@ mod tests {
         let mut frame = frame_without_ask();
         frame.transcript.body.entries = (0..50)
             .map(|i| TranscriptEntry {
-                continues_previous: false,
+                starts_segment: false,
                 kind: LineKind::AssistantText,
                 text: format!("line{i}"),
                 block_id: None,
@@ -1521,7 +1521,7 @@ mod tests {
             .iter()
             .flat_map(|(id, rows)| {
                 (0..*rows).map(move |r| TranscriptEntry {
-                    continues_previous: false,
+                    starts_segment: false,
                     kind: LineKind::ToolResultOk,
                     text: format!("{id}{r}"),
                     block_id: Some((*id).to_string()),
@@ -1605,7 +1605,7 @@ mod tests {
         let mut frame = frame_without_ask();
         frame.transcript.body.entries = (0..50)
             .map(|i| TranscriptEntry {
-                continues_previous: false,
+                starts_segment: false,
                 kind: LineKind::ToolResultOk,
                 text: format!("row{i}"),
                 block_id: Some(format!("b{i}")),
@@ -1957,13 +1957,13 @@ mod tests {
         };
         frame.transcript.body.entries = vec![
             TranscriptEntry {
-                continues_previous: false,
+                starts_segment: false,
                 kind: LineKind::UserPrompt,
                 text: "问题".into(),
                 block_id: None,
             },
             TranscriptEntry {
-                continues_previous: false,
+                starts_segment: false,
                 kind: LineKind::AssistantText,
                 text: "答案".into(),
                 block_id: None,
@@ -1979,7 +1979,7 @@ mod tests {
         // 回答变长，prompt 被挤出视口 → header 该出现了。
         for i in 0..10 {
             frame.transcript.body.entries.push(TranscriptEntry {
-                continues_previous: false,
+                starts_segment: false,
                 kind: LineKind::AssistantText,
                 text: format!("续{i}"),
                 block_id: None,
@@ -1998,7 +1998,7 @@ mod tests {
         let mut local = local_with("");
         local.viewport_lines = 3;
         let entry = |kind, text: &str| TranscriptEntry {
-            continues_previous: false,
+            starts_segment: false,
             kind,
             text: text.into(),
             block_id: None,
@@ -2028,7 +2028,7 @@ mod tests {
         let mut frame = frame_without_ask();
         frame.transcript.body.entries = (0..10)
             .map(|i| TranscriptEntry {
-                continues_previous: false,
+                starts_segment: false,
                 kind: if i == 4 {
                     LineKind::UserPrompt
                 } else {
@@ -2053,13 +2053,13 @@ mod tests {
         let mut frame = frame_without_ask();
         frame.transcript.body.entries = vec![
             TranscriptEntry {
-                continues_previous: false,
+                starts_segment: false,
                 kind: LineKind::UserPrompt,
                 text: "上次问的".into(),
                 block_id: None,
             },
             TranscriptEntry {
-                continues_previous: false,
+                starts_segment: false,
                 kind: LineKind::AssistantText,
                 text: "上次答的".into(),
                 block_id: None,
@@ -2541,8 +2541,8 @@ mod tests {
         let mut f = frame_without_ask();
         f.transcript.body.entries = entries
             .into_iter()
-            .map(|(kind, text, continues_previous)| TranscriptEntry {
-                continues_previous,
+            .map(|(kind, text, starts_segment)| TranscriptEntry {
+                starts_segment,
                 kind,
                 text: text.into(),
                 block_id: None,

@@ -21,6 +21,7 @@
   --r-agents:     #85508f;
   --r-footer:     #4f6373;
   --r-overlay:    #8a6a3a;
+  --r-btw:        #a35563;
 
   --tint: 12%;
 }
@@ -43,6 +44,7 @@
     --r-agents:     #bb85c6;
     --r-footer:     #8ba3b8;
     --r-overlay:    #c9a061;
+    --r-btw:        #e08b98;
 
     --tint: 18%;
   }
@@ -65,6 +67,7 @@
   --r-agents:     #bb85c6;
   --r-footer:     #8ba3b8;
   --r-overlay:    #c9a061;
+  --r-btw:        #e08b98;
 
   --tint: 18%;
 }
@@ -219,6 +222,17 @@ h1 .cursor {
   padding-left: 2px;
 }
 
+.overlay-band.pending {
+  border-color: color-mix(in srgb, var(--r-btw) 60%, transparent);
+  background: color-mix(in srgb, var(--r-btw) 9%, var(--surface));
+}
+.overlay-band.pending .cn::after {
+  content: "（待建）";
+  color: var(--r-btw);
+  font-size: .85em;
+  margin-left: .2em;
+}
+
 .overlay-band {
   margin-top: 4px;
   border: 1px dashed color-mix(in srgb, var(--r-overlay) 60%, transparent);
@@ -354,7 +368,7 @@ tr[data-depth="3"] td.c-path { padding-left: 2.4rem; }
             <div class="kid" data-id="transcript.body">
               <span class="path">.body</span><span class="cn">转录·正文</span>
               <span class="en">Transcript Body</span>
-              <span class="note">一条 entry = 屏幕一行</span>
+              <span class="note">一段一段的；一条 entry = 屏幕一行</span>
             </div>
           </div>
         </div>
@@ -424,6 +438,15 @@ tr[data-depth="3"] td.c-path { padding-left: 2.4rem; }
           </div>
         </div>
 
+        <div class="zone" data-hue="footer" data-id="footer_hints">
+          <div class="row">
+            <span class="path">footer_hints</span>
+            <span class="cn">底栏</span>
+            <span class="en">Footer Hints</span>
+            <span class="note">常驻，1 行 · 钉在子代理条上面</span>
+          </div>
+        </div>
+
         <div class="zone" data-hue="agents" data-id="sub_agent_bar">
           <div class="row">
             <span class="path">sub_agent_bar</span>
@@ -433,13 +456,12 @@ tr[data-depth="3"] td.c-path { padding-left: 2.4rem; }
           </div>
         </div>
 
-        <div class="zone" data-hue="footer" data-id="footer_hints">
-          <div class="row">
-            <span class="path">footer_hints</span>
-            <span class="cn">底栏</span>
-            <span class="en">Footer Hints</span>
-            <span class="note">常驻，1 行</span>
-          </div>
+        <div class="stack-label">独占层 · 不参与上面的堆叠</div>
+        <div class="overlay-band pending" data-id="btw">
+          <span class="path" style="color:var(--r-btw)">btw</span>
+          <span class="cn">侧问区</span>
+          <span class="en">Side Question</span>
+          <span class="note">转录区压到一半，它吃下半屏并独占键盘</span>
         </div>
 
         <div class="stack-label">盖在以上全部之上，一次只有一个</div>
@@ -477,7 +499,7 @@ tr[data-depth="3"] td.c-path { padding-left: 2.4rem; }
           </tr>
           <tr data-id="transcript.body" data-depth="2" style="--swatch:var(--r-transcript)">
             <td class="c-path">transcript.body</td><td class="c-en">Transcript Body</td><td class="c-cn">转录·正文</td>
-            <td class="c-what">输入回显、回答、思考、工具卡片、diff。<strong>一条 entry 就是屏幕一行</strong></td>
+            <td class="c-what">输入回显、回答、思考、工具卡片、diff。<strong>一段一段的</strong>，段间留空行；一条 entry 就是屏幕一行</td>
           </tr>
           <tr data-id="operation_status" data-depth="1" style="--swatch:var(--r-status)">
             <td class="c-path">operation_status</td><td class="c-en">Operation Status</td><td class="c-cn">状态区</td>
@@ -523,13 +545,17 @@ tr[data-depth="3"] td.c-path { padding-left: 2.4rem; }
             <td class="c-path">composer.bottom_rule</td><td class="c-en">Bottom Rule</td><td class="c-cn">输入·下分隔线</td>
             <td class="c-what">纯分隔</td>
           </tr>
+          <tr data-id="footer_hints" data-depth="1" style="--swatch:var(--r-footer)">
+            <td class="c-path">footer_hints</td><td class="c-en">Footer Hints</td><td class="c-cn">底栏</td>
+            <td class="c-what">模型、cwd、权限模式、会话累计用量</td>
+          </tr>
           <tr data-id="sub_agent_bar" data-depth="1" style="--swatch:var(--r-agents)">
             <td class="c-path">sub_agent_bar</td><td class="c-en">Sub-Agent Bar</td><td class="c-cn">子代理条</td>
             <td class="c-what">在跑的和刚跑完的子代理，带 token 数</td>
           </tr>
-          <tr data-id="footer_hints" data-depth="1" style="--swatch:var(--r-footer)">
-            <td class="c-path">footer_hints</td><td class="c-en">Footer Hints</td><td class="c-cn">底栏</td>
-            <td class="c-what">模型、cwd、权限模式、会话累计用量</td>
+          <tr data-id="btw" data-depth="1" style="--swatch:var(--r-btw)">
+            <td class="c-path">btw</td><td class="c-en">Side Question</td><td class="c-cn">侧问区</td>
+            <td class="c-what"><strong>待建</strong> · <code>/btw</code> 问一句题外话，不进主对话历史、不占主上下文。独占半屏</td>
           </tr>
           <tr data-id="overlay" data-depth="1" style="--swatch:var(--r-overlay)">
             <td class="c-path">overlay</td><td class="c-en">Overlay</td><td class="c-cn">浮层</td>
