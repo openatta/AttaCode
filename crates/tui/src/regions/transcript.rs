@@ -156,6 +156,7 @@ mod tests {
         use crate::frame_state::ScrollState;
         let entries: Vec<TranscriptEntry> = (0..50)
             .map(|i| TranscriptEntry {
+                continues_previous: false,
                 kind: LineKind::AssistantText,
                 text: format!("line{i}"),
                 block_id: None,
@@ -179,6 +180,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, id)| TranscriptEntry {
+                continues_previous: false,
                 kind: LineKind::ToolResultOk,
                 text: format!("row{i}"),
                 block_id: Some((*id).to_string()),

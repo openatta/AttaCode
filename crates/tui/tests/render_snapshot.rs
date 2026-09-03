@@ -51,6 +51,7 @@ fn transcript_then(lines: &[&str], tail: &[&str], h: usize) -> Vec<String> {
 
 fn entry(kind: LineKind, text: &str, block: Option<&str>) -> TranscriptEntry {
     TranscriptEntry {
+        continues_previous: false,
         kind,
         text: text.into(),
         block_id: block.map(str::to_string),

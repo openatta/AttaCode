@@ -1052,6 +1052,7 @@ fn push_block_entries(entries: &mut Vec<TranscriptEntry>, block: &Block) {
             expanded,
         } => {
             entries.push(TranscriptEntry {
+                continues_previous: false,
                 kind: LineKind::ToolHeading,
                 text: format!("{name}({input_summary})"),
                 block_id: Some(id.clone()),
@@ -1068,6 +1069,7 @@ fn push_block_entries(entries: &mut Vec<TranscriptEntry>, block: &Block) {
             if lines.len() <= FOLD_LINE_THRESHOLD || *expanded {
                 if lines.is_empty() {
                     entries.push(TranscriptEntry {
+                        continues_previous: false,
                         kind: base,
                         text: String::new(),
                         block_id: Some(id.clone()),
@@ -1076,6 +1078,7 @@ fn push_block_entries(entries: &mut Vec<TranscriptEntry>, block: &Block) {
                 for (i, line) in lines.iter().enumerate() {
                     let kind = kind(i, line);
                     entries.push(TranscriptEntry {
+                        continues_previous: false,
                         kind,
                         text: strip_diff_marker(kind, line),
                         block_id: Some(id.clone()),
@@ -1085,6 +1088,7 @@ fn push_block_entries(entries: &mut Vec<TranscriptEntry>, block: &Block) {
                 for (i, line) in lines[..FOLD_LINE_THRESHOLD].iter().enumerate() {
                     let kind = kind(i, line);
                     entries.push(TranscriptEntry {
+                        continues_previous: false,
                         kind,
                         text: strip_diff_marker(kind, line),
                         block_id: Some(id.clone()),
@@ -1092,6 +1096,7 @@ fn push_block_entries(entries: &mut Vec<TranscriptEntry>, block: &Block) {
                 }
                 let hidden = lines.len() - FOLD_LINE_THRESHOLD;
                 entries.push(TranscriptEntry {
+                    continues_previous: false,
                     kind: LineKind::Note,
                     text: format!("… {hidden} more lines (toggle to expand)"),
                     block_id: Some(id.clone()),
@@ -1174,13 +1179,20 @@ fn push_lines(entries: &mut Vec<TranscriptEntry>, kind: LineKind, text: &str) {
     }
     // `lines()` 而不是 `split('\n')`：前者认 `\r\n`，也不会为结尾那个换行多造一条
     // 空行（流式文本经常以换行收尾）。段落之间的空行照样保留。
-    for line in text.lines() {
-        entries.push(plain(kind, line));
+    //
+    // 第二行起打上 `continues_previous`：谁要还原"这原本是一段"，读的必须是这个
+    // 标记。恢复出来的转录里两次相邻的用户提交（发一句、Ctrl+C、再发一句）之间
+    // 什么都没有，按相邻拼会把它们粘成一条。
+    for (i, line) in text.lines().enumerate() {
+        let mut entry = plain(kind, line);
+        entry.continues_previous = i > 0;
+        entries.push(entry);
     }
 }
 
 fn plain(kind: LineKind, text: &str) -> TranscriptEntry {
     TranscriptEntry {
+        continues_previous: false,
         kind,
         text: text.to_string(),
         block_id: None,
@@ -1375,6 +1387,18 @@ mod tests {
                 .all(|e| !e.text.contains('\n')),
             "任何一条 entry 里都不该再有换行——它到屏幕上会被吞掉"
         );
+
+        // 拆出来的第二行起要打上标记：`crates/app` 靠它把一次提交/一段回答拼回去，
+        // 而"相邻"这个依据是不成立的（恢复出来的转录里相邻的两条可能是两次提交）。
+        let flags: Vec<bool> = f
+            .transcript
+            .body
+            .entries
+            .iter()
+            .filter(|e| e.kind == LineKind::AssistantText)
+            .map(|e| e.continues_previous)
+            .collect();
+        assert_eq!(flags, [false, true, true, true, true]);
     }
 
     /// `/doctor` 的报告是多行的，必须真的画成多行。

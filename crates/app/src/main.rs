@@ -322,12 +322,22 @@ impl LocalUi {
         // （`active_idx = min(...)`），从没写回本地，于是本地光标能停在队列末尾之外：
         // 3 个请求、Tab 到第 3 个，前面一个自己超时消失之后，再按一次 Tab
         // 算出来还是同一个——一次按键什么都不发生。
-        if let Some(approval) = &frame.composer.content.approval {
-            self.approval_active = self
-                .approval_active
-                .min(approval.pending.len().saturating_sub(1));
-        } else {
-            self.approval_active = 0;
+        let Some(approval) = &frame.composer.content.approval else {
+            self.reset_approval_cursor();
+            return;
+        };
+        self.approval_active = self
+            .approval_active
+            .min(approval.pending.len().saturating_sub(1));
+        // **选项下标也得跟着夹。** 两个下标是一对（`reset_approval_cursor` 的文档
+        // 就是这么说的），只夹一个的后果是回车变成死键：队列 `[A(4 个选项),
+        // B(2 个)]`，用户在 A 上选到第 4 项，A 自己超时消失，active 落到 B——
+        // 屏幕上高亮的是 B 的第一项（`merge` 把越界的渲染值归了 0），而
+        // `ask.confirm` 读的是没夹过的本地值，`options.get(3)` 是 None，于是
+        // 什么都不发生，得先按一下方向键把它绕回范围内。
+        let options = approval.active().map_or(0, |r| r.options.len());
+        if self.approval_selected >= options {
+            self.approval_selected = 0;
         }
     }
 
@@ -410,6 +420,16 @@ async fn run(
                     // 读盘。放在这里而不是 `submit` 里，是因为只有这一层是 async 的
                     // ——一个几百个会话的项目要读一会儿，同步做就是画面卡住。
                     Flow::ListSessions(query) => {
+                        // 屏幕太矮时弹窗根本画不出来（`render_completion_popup` 在
+                        // 上方放不下时直接不画），而键盘路由不知道这件事——列表会
+                        // 一个字都不显示却吃掉方向键，回车直接换到一个用户从没看见
+                        // 过的会话。宁可不开，并说清楚为什么。
+                        if local.viewport_lines < 3 {
+                            let _ = handle.dispatch(BridgeCommand::Note {
+                                text: "/resume needs a taller terminal to show the list".into(),
+                            });
+                            continue;
+                        }
                         let found = handle.sessions(&query).await;
                         if found.is_empty() {
                             let _ = handle.dispatch(BridgeCommand::Note {
@@ -703,10 +723,13 @@ fn prompt_is_visible(frame: &tui::FrameState, local: &LocalUi) -> bool {
     // 也是第一行在不在视口里。按最后一行判的话，一段多行提交只露出尾巴时会被判成
     // "看得见"、于是把 header 收起来——而 header 要显示的那一行恰好在屏幕外面，
     // 正好和它存在的理由相反。
-    let idx = entries[..last]
-        .iter()
-        .rposition(|e| !is_prompt(e))
-        .map_or(0, |before| before + 1);
+    //
+    // 往回走的依据同样是 `continues_previous` 而不是相邻：相邻的上一条可能是**上一次**
+    // 提交（中间那一轮被取消了），那时该钉的是这一次的第一行，不是上一次的。
+    let mut idx = last;
+    while idx > 0 && entries[idx].continues_previous && is_prompt(&entries[idx - 1]) {
+        idx -= 1;
+    }
     let page = local.viewport_lines.max(1);
     match local.scroll_offset {
         Some(offset) => idx >= offset && idx < offset + page,
@@ -717,26 +740,26 @@ fn prompt_is_visible(frame: &tui::FrameState, local: &LocalUi) -> bool {
 /// 转录里的用户输入，按出现顺序——resume 之后用它续上输入历史。
 /// 转录里恢复出来的用户输入，一次提交算**一条**。
 ///
-/// 连着的 `UserPrompt` entry 要拼回去：一条 entry 是屏幕上的一行（见
-/// `bridge::reducer::push_lines`），所以一次多行提交在转录里是好几条。按条收的话，
-/// `↑` 只召回最后一行，再按一次是同一次提交的上一行——而**当场**提交时
-/// `remember()` 存的是整段。同一个历史，两种形状。
+/// 一条 entry 是屏幕上的一行（见 `bridge::reducer::push_lines`），所以一次多行提交
+/// 在转录里是好几条。按条收的话，`↑` 只召回最后一行，再按一次是同一次提交的上一行
+/// ——而**当场**提交时 `remember()` 存的是整段。同一份历史，两种形状。
+///
+/// 拼的依据是 `continues_previous`，**不是相邻**：恢复出来的转录里每条用户消息各成
+/// 一个 turn，两次相邻的提交（发一句、Ctrl+C、再发一句）之间什么都没有，按相邻拼
+/// 会把两次提交粘成一条。
 fn user_prompts(frame: &tui::FrameState) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    let mut in_run = false;
     for entry in &frame.transcript.body.entries {
         if entry.kind != tui::frame_state::LineKind::UserPrompt {
-            in_run = false;
             continue;
         }
-        match (in_run, out.last_mut()) {
-            (true, Some(last)) => {
+        match out.last_mut() {
+            Some(last) if entry.continues_previous => {
                 last.push('\n');
                 last.push_str(&entry.text);
             }
             _ => out.push(entry.text.clone()),
         }
-        in_run = true;
     }
     out
 }
@@ -1409,6 +1432,7 @@ mod tests {
         let mut snapshot = frame_without_approval();
         snapshot.transcript.body.entries = (0..100)
             .map(|i| TranscriptEntry {
+                continues_previous: false,
                 kind: LineKind::AssistantText,
                 text: format!("line{i}"),
                 block_id: None,
@@ -1487,6 +1511,7 @@ mod tests {
         let mut frame = frame_without_approval();
         frame.transcript.body.entries = (0..50)
             .map(|i| TranscriptEntry {
+                continues_previous: false,
                 kind: LineKind::AssistantText,
                 text: format!("line{i}"),
                 block_id: None,
@@ -1510,6 +1535,7 @@ mod tests {
             .iter()
             .flat_map(|(id, rows)| {
                 (0..*rows).map(move |r| TranscriptEntry {
+                    continues_previous: false,
                     kind: LineKind::ToolResultOk,
                     text: format!("{id}{r}"),
                     block_id: Some((*id).to_string()),
@@ -1593,6 +1619,7 @@ mod tests {
         let mut frame = frame_without_approval();
         frame.transcript.body.entries = (0..50)
             .map(|i| TranscriptEntry {
+                continues_previous: false,
                 kind: LineKind::ToolResultOk,
                 text: format!("row{i}"),
                 block_id: Some(format!("b{i}")),
@@ -1954,11 +1981,13 @@ mod tests {
         };
         frame.transcript.body.entries = vec![
             TranscriptEntry {
+                continues_previous: false,
                 kind: LineKind::UserPrompt,
                 text: "问题".into(),
                 block_id: None,
             },
             TranscriptEntry {
+                continues_previous: false,
                 kind: LineKind::AssistantText,
                 text: "答案".into(),
                 block_id: None,
@@ -1974,6 +2003,7 @@ mod tests {
         // 回答变长，prompt 被挤出视口 → header 该出现了。
         for i in 0..10 {
             frame.transcript.body.entries.push(TranscriptEntry {
+                continues_previous: false,
                 kind: LineKind::AssistantText,
                 text: format!("续{i}"),
                 block_id: None,
@@ -1992,6 +2022,7 @@ mod tests {
         let mut local = local_with("");
         local.viewport_lines = 3;
         let entry = |kind, text: &str| TranscriptEntry {
+            continues_previous: false,
             kind,
             text: text.into(),
             block_id: None,
@@ -2021,6 +2052,7 @@ mod tests {
         let mut frame = frame_without_approval();
         frame.transcript.body.entries = (0..10)
             .map(|i| TranscriptEntry {
+                continues_previous: false,
                 kind: if i == 4 {
                     LineKind::UserPrompt
                 } else {
@@ -2045,11 +2077,13 @@ mod tests {
         let mut frame = frame_without_approval();
         frame.transcript.body.entries = vec![
             TranscriptEntry {
+                continues_previous: false,
                 kind: LineKind::UserPrompt,
                 text: "上次问的".into(),
                 block_id: None,
             },
             TranscriptEntry {
+                continues_previous: false,
                 kind: LineKind::AssistantText,
                 text: "上次答的".into(),
                 block_id: None,
@@ -2526,11 +2560,13 @@ mod tests {
 
     // ── 多行提交（`push_lines` 之后一次提交在转录里是好几条 entry）──
 
-    fn frame_with_entries(entries: Vec<(LineKind, &str)>) -> tui::FrameState {
+    /// `(kind, text, 是不是上一条的续行)`。
+    fn frame_with_entries(entries: Vec<(LineKind, &str, bool)>) -> tui::FrameState {
         let mut f = frame_without_approval();
         f.transcript.body.entries = entries
             .into_iter()
-            .map(|(kind, text)| TranscriptEntry {
+            .map(|(kind, text, continues_previous)| TranscriptEntry {
+                continues_previous,
                 kind,
                 text: text.into(),
                 block_id: None,
@@ -2545,12 +2581,12 @@ mod tests {
     #[test]
     fn a_multi_line_prompt_comes_back_from_the_transcript_as_one_history_item() {
         let frame = frame_with_entries(vec![
-            (LineKind::UserPrompt, "第一次提问"),
-            (LineKind::AssistantText, "答"),
-            (LineKind::UserPrompt, "git commit -m 修一下"),
-            (LineKind::UserPrompt, ""),
-            (LineKind::UserPrompt, "顺便把注释也改了"),
-            (LineKind::AssistantText, "好"),
+            (LineKind::UserPrompt, "第一次提问", false),
+            (LineKind::AssistantText, "答", false),
+            (LineKind::UserPrompt, "git commit -m 修一下", false),
+            (LineKind::UserPrompt, "", true),
+            (LineKind::UserPrompt, "顺便把注释也改了", true),
+            (LineKind::AssistantText, "好", false),
         ]);
 
         assert_eq!(
@@ -2562,18 +2598,34 @@ mod tests {
         );
     }
 
+    /// **相邻不等于同一次提交。** 恢复出来的转录里每条用户消息各成一个 turn，
+    /// 所以"发一句 → Ctrl+C → 再发一句"会留下两条紧挨着的 prompt，中间什么都没有。
+    /// 按相邻拼会把两次提交粘成一条，`↑` 一次召回两句话。
+    #[test]
+    fn two_adjacent_submissions_are_not_glued_into_one() {
+        let frame = frame_with_entries(vec![
+            (LineKind::UserPrompt, "先问的那句", false),
+            (LineKind::UserPrompt, "打断之后重新问的", false),
+        ]);
+
+        assert_eq!(
+            user_prompts(&frame),
+            vec!["先问的那句".to_string(), "打断之后重新问的".to_string()]
+        );
+    }
+
     /// sticky header 钉的是**第一行**（`reducer::current_prompt` 取 `first_line`），
     /// 所以"看得见吗"问的也得是第一行。按最后一行判的话，一段多行提交只露出尾巴时
     /// 会被判成看得见、header 被收起来——而它要显示的那一行正好在屏幕外面。
     #[test]
     fn a_partly_scrolled_multi_line_prompt_still_needs_its_header() {
-        let mut entries = vec![(LineKind::AssistantText, "早先的内容"); 10];
+        let mut entries = vec![(LineKind::AssistantText, "早先的内容", false); 10];
         entries.extend([
-            (LineKind::UserPrompt, "第一行——header 钉的就是这句"),
-            (LineKind::UserPrompt, "第二行"),
-            (LineKind::UserPrompt, "第三行"),
+            (LineKind::UserPrompt, "第一行——header 钉的就是这句", false),
+            (LineKind::UserPrompt, "第二行", true),
+            (LineKind::UserPrompt, "第三行", true),
         ]);
-        entries.extend([(LineKind::AssistantText, "回答"); 4]);
+        entries.extend([(LineKind::AssistantText, "回答", false); 4]);
         let frame = frame_with_entries(entries);
 
         let mut local = local_with("");
@@ -2608,6 +2660,66 @@ mod tests {
 
         local.reconcile(&frame_without_approval());
         assert_eq!(local.approval_active, 0, "队列空了就归零");
+    }
+
+    /// **两个下标必须一起夹。** 只夹 `approval_active` 的话回车会变成死键：
+    /// 队列 `[A(4 个选项), B(2 个)]`，用户在 A 上选到第 4 项，A 自己超时消失，
+    /// active 落到 B——屏幕上高亮的是 B 的第一项（`merge` 把越界的渲染值归了 0），
+    /// 而 `ask.confirm` 读的是**没夹过的本地值**，`options.get(3)` 是 None，于是
+    /// 什么都不发生，得先按一下方向键才活过来。
+    #[test]
+    fn a_shrinking_queue_never_leaves_confirm_pointing_at_nothing() {
+        let two_options = question_request(
+            AnswerWith::Choose,
+            vec![
+                ApprovalOption::Answer {
+                    key: "a".into(),
+                    label: "A".into(),
+                },
+                ApprovalOption::Answer {
+                    key: "b".into(),
+                    label: "B".into(),
+                },
+            ],
+        );
+        let mut frame = frame_without_approval();
+        frame.composer.content.approval = Some(ApprovalState {
+            pending: vec![two_options.clone()],
+            active_idx: 0,
+            view_mode: ApprovalViewMode::TabView,
+        });
+
+        let mut local = local_with("");
+        local.approval_active = 1; // 前面那条刚消失
+        local.approval_selected = 3; // 停在前面那条的第 4 个选项上
+        local.reconcile(&frame);
+        assert_eq!(local.approval_selected, 0, "越界的选项下标要归零");
+
+        // 回车必须真的答出一个东西来，而不是什么都不发生。
+        let handle = FakeHandle::new();
+        dispatch_approval_action("editor.submit", &mut local, &handle, &two_options, 1);
+        assert_eq!(
+            handle.decisions(),
+            vec![ApprovalOption::Answer {
+                key: "a".into(),
+                label: "A".into()
+            }]
+        );
+    }
+
+    /// 还在范围内的选择不该被无端复位——用户挑到第 2 项、队列没动，就该停在那儿。
+    #[test]
+    fn an_in_range_selection_survives_reconcile() {
+        let mut frame = frame_without_approval();
+        frame.composer.content.approval = Some(ApprovalState {
+            pending: vec![approval_request()],
+            active_idx: 0,
+            view_mode: ApprovalViewMode::TabView,
+        });
+        let mut local = local_with("");
+        local.approval_selected = 2;
+        local.reconcile(&frame);
+        assert_eq!(local.approval_selected, 2);
     }
 
     /// 答完一个之后光标回队列头。留在原地的话，下一个请求一到会凭空成为 active
