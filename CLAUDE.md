@@ -128,8 +128,16 @@ cargo run -p bridge --example smoke
 **用哪个 provider**（`bootstrap::resolve_provider`）：`settings.providers` 里有东西就用
 `default_provider` 点名的那个；没点名而恰好只有一个就是它；没点名又有好几个是**错误**
 （静默挑一个的后果是模型和账单都跑到了用户没打算用的地方）。什么都没配时合成一个
-anthropic provider，`base_url` 取 `ANTHROPIC_BASE_URL`。凭据先看 provider 自己的
-`api_key`，再看 `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY`。
+anthropic provider，`base_url` 取 `ANTHROPIC_BASE_URL`。
+
+**凭据先看 provider 自己的 `api_key`，环境变量那一半有门。** `ANTHROPIC_AUTH_TOKEN`
+是 api.anthropic.com 的凭据，只发给两种 provider：我们自己合成的那个内置 anthropic
+（`ANTHROPIC_BASE_URL` 和它同属一族，用同一族变量重定向是用户的明确选择），以及
+`settings.json` 里 `api_type` 是 anthropic 且**没写 `base_url`** 的。所以
+**在 `settings.json` 里配一个 anthropic 协议的网关，必须自己写 `api_key`**——它拿不到
+环境变量里那个，会以 `missing api_key` 启动失败。这是刻意的：无条件回退意味着一个
+`openai_compatible` 的 provider 忘了写 key 时，Anthropic 的 token 会被发到那个第三方
+地址上，本该报错的地方变成一次静默的凭据外泄。
 
 `/doctor` 把上面这些**实际生效成了什么**打出来（选中的 provider 和端点、模型、转录
 落没落盘、沙箱后端、权限模式和规则数）。三层 settings 合并之后的结果，人对着源文件

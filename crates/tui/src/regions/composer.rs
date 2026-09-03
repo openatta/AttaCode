@@ -283,9 +283,14 @@ fn render_completion_popup(frame: &mut Frame, editor_area: Rect, state: &Complet
         }
     };
 
-    let visible = state.candidates.len().min(MAX_POPUP_ROWS);
-    // 上方放不下就少画几行，而不是把弹窗顶出屏幕。
-    let visible = visible.min(editor_area.y.saturating_sub(2) as usize).max(1);
+    // 一行内容 + 两条边框是这个弹窗的最小尺寸。上方连这点地方都没有（终端很矮，
+    // 或者草稿长到把编辑器顶到了顶上）就干脆不画——`.max(1)` 那种"至少画一行"会把
+    // 它按在 y=0 上，正好盖住它所属的那个输入框，比不画更糟。
+    let room = editor_area.y.saturating_sub(2) as usize;
+    if room == 0 {
+        return;
+    }
+    let visible = state.candidates.len().min(MAX_POPUP_ROWS).min(room);
     let start = popup_window_start(state.selected, state.candidates.len(), visible);
 
     let rows: Vec<(bool, String, String)> = state
@@ -577,6 +582,45 @@ mod tests {
     fn a_short_list_is_never_scrolled() {
         assert_eq!(popup_window_start(2, 3, 10), 0);
         assert_eq!(popup_window_start(0, 1, 10), 0);
+    }
+
+    /// 上方连"一行内容 + 两条边框"都放不下时，弹窗该**不画**。
+    ///
+    /// "至少画一行"会把它按在 y=0 上，正好盖住它所属的那个输入框——比不画更糟。
+    #[test]
+    fn a_popup_with_no_room_above_the_editor_is_skipped_rather_than_drawn_over_it() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let state = CompletionPopupState {
+            kind: CompletionKind::SlashCommand,
+            query: "m".into(),
+            candidates: vec![crate::frame_state::CompletionCandidate {
+                name: "/model".into(),
+                description: "switch".into(),
+            }],
+            selected: 0,
+        };
+        for y in [0u16, 1, 2] {
+            let mut t = Terminal::new(TestBackend::new(40, 6)).unwrap();
+            t.draw(|f| {
+                let editor = Rect {
+                    x: 0,
+                    y,
+                    width: 40,
+                    height: 2,
+                };
+                render_completion_popup(f, editor, &state);
+            })
+            .unwrap();
+            let buf = t.backend().buffer().clone();
+            let painted: String = (0..6)
+                .flat_map(|row| (0..40).map(move |x| (x, row)))
+                .map(|(x, row)| buf[(x, row)].symbol().to_string())
+                .collect();
+            assert!(
+                painted.trim().is_empty(),
+                "editor 在 y={y}，上方放不下，不该画出任何东西:\n{painted:?}"
+            );
+        }
     }
 
     #[test]

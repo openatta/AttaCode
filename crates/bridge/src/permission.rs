@@ -10,9 +10,17 @@
 //! 2. `bind_session_state` —— 读会话的**实时** `permission_mode`，所以
 //!    `EnterPlanMode`/`ExitPlanMode` 真能挪动这道门，而不是停在构造时的模式。
 //! 3. `add_persistent_allow` —— "一直允许"落成一条 `RuleSource::Session` 的真规则，
-//!    这是 `PermissionDecision::PermitAlways` 的落点。（**只在内存里**：Core 那边
-//!    没有任何一处把它写回 `settings.local.json`，所以"本项目一直允许"活不过这次
-//!    进程。要让它活下来，得由我们自己写盘——记在 TODO 里，不在本次范围内。）
+//!    这是 `PermissionDecision::PermitAlways` 的落点。
+//!
+//! 第 3 条只管**本次进程**。"本项目一直允许"（`PersistScope::Local`）还要落盘，那一步
+//! 在 Core 里（`runtime::turn` 的 `PermitAlways` 分支调
+//! `permissions::settings_patch::append_permission_rule`，写进
+//! `PathSettings::local_settings_file()` = `<项目>/.atta/settings.local.json`）。
+//!
+//! **所以这道门必须把那一层读回来，否则那次写盘等于没发生。** 这正是下面走
+//! `from_settings` 而不是手搓 `new` 的第二个理由：`rules_from_all_tiers` 会同时收
+//! `settings.json` 和 `settings.local.json` 两层。只读前者的话，用户选了"本项目一直
+//! 允许"、Core 老老实实写了盘，下次启动照样弹——文件在那儿，没人读。
 //!
 //! 上面两个 bind 由 `Builder::build()` 自动调用，所以这里只负责把规则和模式装好。
 
@@ -30,8 +38,9 @@ use std::sync::Arc;
 ///
 /// - 规则取的是 `rules_from_all_tiers`，也就是 `settings.json`（`ProjectSettings`，
 ///   优先级 30）**加上** `settings.local.json`（`LocalSettings`，40）。手搓那版只读
-///   前者，于是用户写在 `settings.local.json` 里的规则一条都不生效——那正是"本项目
-///   一直允许"该落的地方。
+///   前者，于是用户写在 `settings.local.json` 里的规则一条都不生效——而那正是 Core
+///   把"本项目一直允许"写进去的地方（见模块注释第 3 条）。写了没人读，用户下次启动
+///   照样被问同一个问题。
 /// - 带上 `sandbox` 设置。这是**唯一**一条能把 `sandbox.*` 送到工具自己那份
 ///   `check_permissions` 的路：AttaCore 0.2.0 把写路径的控制清单接上了 `FileWrite`/
 ///   `FileEdit`（在那之前那份检查是死代码），`.env` / `.gitignore` / lockfile /

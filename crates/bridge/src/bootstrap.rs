@@ -685,6 +685,56 @@ mod tests {
         calling.abort();
     }
 
+    /// **"本项目一直允许"的完整往返。**
+    ///
+    /// 写盘那半在 Core：`runtime::turn` 的 `PermitAlways{Local}` 分支把规则
+    /// `append` 进 `<项目>/.atta/settings.local.json`。读回来那半在我们这儿——
+    /// 而它曾经是缺的：`permission::build` 只收 `settings.json` 一层，于是 Core
+    /// 老老实实写了盘，下次启动照样弹同一个问题，文件在那儿没人读。
+    ///
+    /// 这条测的就是"下次启动"：造一个已经写好的 `settings.local.json`，走一遍
+    /// `resolve_settings` + `permission::build`，那个工具必须直接放行。
+    #[tokio::test]
+    async fn a_permit_always_rule_written_last_time_is_honored_next_launch() {
+        use base::interface::permission::PermissionOutcome;
+
+        let l = layout();
+        // Core 写下的那种形状：机器本地那一层里的 `permission_rules`。
+        std::fs::write(
+            l.project.join(".atta").join("settings.local.json"),
+            serde_json::json!({
+                "permission_rules": [{ "tool": "Bash", "action": "allow" }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let settings = resolve_settings(&l.config);
+        assert_eq!(
+            settings.local_permission_rules.len(),
+            1,
+            "loader 得先把它读进 local_permission_rules"
+        );
+
+        let perm = crate::permission::build(&settings);
+        let tools = Arc::new(base::tool::InMemoryToolRegistry::new());
+        tools::register_builtin_tools(&tools);
+        perm.bind_tool_registry(tools);
+
+        let outcome = perm
+            .check(
+                "Bash",
+                &serde_json::json!({ "command": "echo hi" }),
+                &l.project,
+                "sess-1",
+            )
+            .await;
+        assert!(
+            matches!(outcome, PermissionOutcome::Permit),
+            "上次选的\"本项目一直允许\"这次必须还算数，实际: {outcome:?}"
+        );
+    }
+
     fn provider(api_type: &str, default_model: Option<&str>) -> base::provider::ProviderConfig {
         base::provider::ProviderConfig {
             api_type: Some(api_type.into()),

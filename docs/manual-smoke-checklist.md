@@ -131,6 +131,9 @@ cargo run -p app
 - [ ] `↑`/`↓` 换选项，`Enter` 确认，`Esc` 拒绝
 - [ ] `y`/`n` 快捷键有效；**没有**对话框时打 "yes" 不会丢字母
 - [ ] 选"本会话一直允许"之后，同类调用不再弹
+- [ ] 选"本项目一直允许" → `<项目>/.atta/settings.local.json` 里多出一条规则，
+      **退出重开之后同类调用仍然不弹**（写盘那半在 Core，读回来那半在
+      `bridge::permission::build`——只读 `settings.json` 一层的话，文件在那儿没人读）
 - [ ] 对话框开着时 `Ctrl+C` 能中断整个 turn
 
 ## 5.5 模型向你提问（AskUserQuestion）

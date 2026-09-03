@@ -318,6 +318,28 @@ impl LocalUi {
         if frame.composer.content.approval.is_some() {
             self.close_picker();
         }
+        // 队列缩短时本地光标要跟着回来。`merge` 只是在**渲染用的那份拷贝**上夹了一次
+        // （`active_idx = min(...)`），从没写回本地，于是本地光标能停在队列末尾之外：
+        // 3 个请求、Tab 到第 3 个，前面一个自己超时消失之后，再按一次 Tab
+        // 算出来还是同一个——一次按键什么都不发生。
+        if let Some(approval) = &frame.composer.content.approval {
+            self.approval_active = self
+                .approval_active
+                .min(approval.pending.len().saturating_sub(1));
+        } else {
+            self.approval_active = 0;
+        }
+    }
+
+    /// 答完一个之后，光标回到队列头。
+    ///
+    /// 两个下标都要复位。只复位 `approval_selected` 的话，`approval_active` 会留在
+    /// 原地——而 `merge` 现在**从 active 那一条推算输入框锁不锁**，于是队列
+    /// `[问答题, 权限B]`、用户 Tab 到 1 答掉 B 之后光标还停在 1；下一个权限请求一到，
+    /// 它凭空成了 active，输入框在用户打了一半的草稿底下自己锁上。
+    fn reset_approval_cursor(&mut self) {
+        self.approval_selected = 0;
+        self.approval_active = 0;
     }
 
     /// 打开 `/resume` 选择器。高亮位归零——上一次停在第几项和这一次的列表无关。
@@ -672,12 +694,19 @@ fn dispatch_action(
 /// 跟随模式下视口是最后一屏，滚动模式下是 `[offset, offset+高度)`。
 fn prompt_is_visible(frame: &tui::FrameState, local: &LocalUi) -> bool {
     let entries = &frame.transcript.body.entries;
-    let Some(idx) = entries
-        .iter()
-        .rposition(|e| e.kind == tui::frame_state::LineKind::UserPrompt)
-    else {
+    let is_prompt =
+        |e: &tui::frame_state::TranscriptEntry| e.kind == tui::frame_state::LineKind::UserPrompt;
+    let Some(last) = entries.iter().rposition(is_prompt) else {
         return true; // 没有 prompt，也就没什么可钉的
     };
+    // header 钉的是**第一行**（`reducer::current_prompt` 取 `first_line`），所以要问的
+    // 也是第一行在不在视口里。按最后一行判的话，一段多行提交只露出尾巴时会被判成
+    // "看得见"、于是把 header 收起来——而 header 要显示的那一行恰好在屏幕外面，
+    // 正好和它存在的理由相反。
+    let idx = entries[..last]
+        .iter()
+        .rposition(|e| !is_prompt(e))
+        .map_or(0, |before| before + 1);
     let page = local.viewport_lines.max(1);
     match local.scroll_offset {
         Some(offset) => idx >= offset && idx < offset + page,
@@ -686,15 +715,30 @@ fn prompt_is_visible(frame: &tui::FrameState, local: &LocalUi) -> bool {
 }
 
 /// 转录里的用户输入，按出现顺序——resume 之后用它续上输入历史。
+/// 转录里恢复出来的用户输入，一次提交算**一条**。
+///
+/// 连着的 `UserPrompt` entry 要拼回去：一条 entry 是屏幕上的一行（见
+/// `bridge::reducer::push_lines`），所以一次多行提交在转录里是好几条。按条收的话，
+/// `↑` 只召回最后一行，再按一次是同一次提交的上一行——而**当场**提交时
+/// `remember()` 存的是整段。同一个历史，两种形状。
 fn user_prompts(frame: &tui::FrameState) -> Vec<String> {
-    frame
-        .transcript
-        .body
-        .entries
-        .iter()
-        .filter(|e| e.kind == tui::frame_state::LineKind::UserPrompt)
-        .map(|e| e.text.clone())
-        .collect()
+    let mut out: Vec<String> = Vec::new();
+    let mut in_run = false;
+    for entry in &frame.transcript.body.entries {
+        if entry.kind != tui::frame_state::LineKind::UserPrompt {
+            in_run = false;
+            continue;
+        }
+        match (in_run, out.last_mut()) {
+            (true, Some(last)) => {
+                last.push('\n');
+                last.push_str(&entry.text);
+            }
+            _ => out.push(entry.text.clone()),
+        }
+        in_run = true;
+    }
+    out
 }
 
 /// 转录里所有可折叠块的 id，按出现顺序、去重。一个块占多行，这里要的是块的序列。
@@ -826,6 +870,7 @@ fn submit(local: &mut LocalUi, handle: &dyn EngineHandle, snapshot: &tui::FrameS
             prompt_id: req.prompt_id.clone(),
             text,
         });
+        local.reset_approval_cursor();
         return Flow::Continue;
     }
     let cmd = match local_command(&text) {
@@ -858,7 +903,7 @@ fn respond(
         prompt_id: req.prompt_id.clone(),
         decision,
     });
-    local.approval_selected = 0;
+    local.reset_approval_cursor();
 }
 
 fn insert_char(key: KeyEvent, local: &mut LocalUi) {
@@ -2479,6 +2524,113 @@ mod tests {
         );
     }
 
+    // ── 多行提交（`push_lines` 之后一次提交在转录里是好几条 entry）──
+
+    fn frame_with_entries(entries: Vec<(LineKind, &str)>) -> tui::FrameState {
+        let mut f = frame_without_approval();
+        f.transcript.body.entries = entries
+            .into_iter()
+            .map(|(kind, text)| TranscriptEntry {
+                kind,
+                text: text.into(),
+                block_id: None,
+            })
+            .collect();
+        f.transcript.body.scroll.total_lines = f.transcript.body.entries.len();
+        f
+    }
+
+    /// `--continue` 之后 `↑` 召回的必须是**整段**，和当场提交时 `remember()` 存的
+    /// 形状一致。按条收的话，一次三行的提交在历史里变成三条，`↑` 只召回最后一行。
+    #[test]
+    fn a_multi_line_prompt_comes_back_from_the_transcript_as_one_history_item() {
+        let frame = frame_with_entries(vec![
+            (LineKind::UserPrompt, "第一次提问"),
+            (LineKind::AssistantText, "答"),
+            (LineKind::UserPrompt, "git commit -m 修一下"),
+            (LineKind::UserPrompt, ""),
+            (LineKind::UserPrompt, "顺便把注释也改了"),
+            (LineKind::AssistantText, "好"),
+        ]);
+
+        assert_eq!(
+            user_prompts(&frame),
+            vec![
+                "第一次提问".to_string(),
+                "git commit -m 修一下\n\n顺便把注释也改了".to_string(),
+            ]
+        );
+    }
+
+    /// sticky header 钉的是**第一行**（`reducer::current_prompt` 取 `first_line`），
+    /// 所以"看得见吗"问的也得是第一行。按最后一行判的话，一段多行提交只露出尾巴时
+    /// 会被判成看得见、header 被收起来——而它要显示的那一行正好在屏幕外面。
+    #[test]
+    fn a_partly_scrolled_multi_line_prompt_still_needs_its_header() {
+        let mut entries = vec![(LineKind::AssistantText, "早先的内容"); 10];
+        entries.extend([
+            (LineKind::UserPrompt, "第一行——header 钉的就是这句"),
+            (LineKind::UserPrompt, "第二行"),
+            (LineKind::UserPrompt, "第三行"),
+        ]);
+        entries.extend([(LineKind::AssistantText, "回答"); 4]);
+        let frame = frame_with_entries(entries);
+
+        let mut local = local_with("");
+        local.viewport_lines = 5;
+        // 视口只够显示最后 5 条：prompt 的第一行（下标 10）已经在上面看不见了。
+        assert!(
+            !prompt_is_visible(&frame, &local),
+            "第一行在视口外，header 必须留着"
+        );
+
+        // 视口够大到把第一行也装进来了，才该收起来。
+        local.viewport_lines = 20;
+        assert!(prompt_is_visible(&frame, &local));
+    }
+
+    // ── 待确认队列的本地光标 ──
+
+    /// 队列缩短时本地光标要跟着回来，否则一次 Tab 会什么都不发生。
+    #[test]
+    fn the_local_cursor_follows_a_shrinking_queue() {
+        let mut local = local_with("");
+        local.approval_active = 2;
+
+        let mut frame = frame_without_approval();
+        frame.composer.content.approval = Some(ApprovalState {
+            pending: vec![approval_request(), approval_request()],
+            active_idx: 0,
+            view_mode: ApprovalViewMode::TabView,
+        });
+        local.reconcile(&frame);
+        assert_eq!(local.approval_active, 1, "越界的光标要夹回来");
+
+        local.reconcile(&frame_without_approval());
+        assert_eq!(local.approval_active, 0, "队列空了就归零");
+    }
+
+    /// 答完一个之后光标回队列头。留在原地的话，下一个请求一到会凭空成为 active
+    /// ——而 `merge` 现在从 active 那条推算输入框锁不锁，于是输入框会在用户打了
+    /// 一半的草稿底下自己锁上。
+    #[test]
+    fn answering_puts_the_cursor_back_at_the_head_of_the_queue() {
+        let mut local = local_with("");
+        local.approval_active = 1;
+        local.approval_selected = 2;
+        let handle = FakeHandle::new();
+
+        respond(
+            &handle,
+            &mut local,
+            &approval_request(),
+            ApprovalOption::PermitOnce,
+        );
+
+        assert_eq!(local.approval_active, 0);
+        assert_eq!(local.approval_selected, 0);
+    }
+
     // ── /resume 会话选择器 ──
 
     /// `/resume` 不能就地处理：列表要读盘，而 `submit` 是同步的。它必须把这件事
@@ -2649,6 +2801,38 @@ mod tests {
             "当前这条是权限请求，输入框该锁上"
         );
         assert!(active_choice(&merged).is_some(), "键盘该归对话框了");
+    }
+
+    /// 上一条测的是"处理函数到得了"，这一条测的是"按键真能路由过去"。
+    ///
+    /// 两件事是分开的：`ask.next-request` 绑在 `Tab` 上，而默认键位里 `editor.*`
+    /// 排在 `ask.*` 前面、遮住了 `ask.prev`/`ask.next`/`ask.confirm`。要是 `Tab` 也
+    /// 被谁占了，处理函数写得再对也永远轮不到。
+    #[test]
+    fn tab_reaches_the_queue_switch_from_the_editor_context() {
+        let mut frame = frame_without_approval();
+        frame.composer.content.approval = Some(ApprovalState {
+            pending: vec![
+                question_request(AnswerWith::Type, Vec::new()),
+                approval_request(),
+            ],
+            active_idx: 0,
+            view_mode: ApprovalViewMode::TabView,
+        });
+        let mut local = local_with("");
+        let handle = FakeHandle::new();
+        let mut resolver = Resolver::new(default_bindings());
+        let snapshot = merge(frame, &local);
+
+        dispatch_key(
+            KeyEvent::new(CtKeyCode::Tab, KeyModifiers::NONE),
+            &mut resolver,
+            &mut local,
+            &handle,
+            &snapshot,
+        );
+
+        assert_eq!(local.approval_active, 1, "Tab 没有路由到队列切换上");
     }
 
     /// 排在自由文本题后面的权限请求必须 Tab 得到。
