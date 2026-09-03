@@ -7,10 +7,10 @@
 //! 的模式，边框让人一眼知道自己不在主 UI 里。
 
 use crate::frame_state::BtwState;
-use crate::regions::style::{COLOR_ACCENT, COLOR_SECONDARY};
+use crate::regions::style::{COLOR_ACCENT, COLOR_SECONDARY, COLOR_WARNING};
 use ratatui::{
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
     Frame,
@@ -26,6 +26,26 @@ pub fn height(area: Rect) -> u16 {
     // 至少 6 行：边框 2 + 问题 1 + 答案 1 + 状态栏 1 还得留一行余量。屏幕矮到连这个
     // 都放不下时，宁可让它占满，也不要画一个自己都装不下自己的框。
     (area.height / SHARE).max(6).min(area.height)
+}
+
+/// 最多能跳过多少条，才不至于把内容滚出视口外。
+///
+/// 从最后一条往回数它们软换行之后各占几行，加到装满 `body` 为止——`Paragraph` 的
+/// `Wrap` 是按屏幕列宽折的，所以能滚多远这件事只有算过宽度才知道。
+fn max_skip(lines: &[Line<'static>], body: Rect) -> usize {
+    let avail = body.width.max(1) as usize;
+    let cap = body.height as usize;
+    // 至少留最后一条在屏幕上：它自己就比整块区域高时，也还是要看得见。
+    let mut skip = lines.len().saturating_sub(1);
+    let mut used = 0usize;
+    for (i, line) in lines.iter().enumerate().rev() {
+        used += line.width().max(1).div_ceil(avail);
+        if used > cap {
+            break;
+        }
+        skip = i;
+    }
+    skip
 }
 
 pub fn render(frame: &mut Frame, area: Rect, state: &BtwState) {
@@ -97,26 +117,42 @@ pub fn render(frame: &mut Frame, area: Rect, state: &BtwState) {
 
     // 滚动：`scroll` 是跳过的行数，夹在能滚的范围内——答案变短（翻到别的条）之后
     // 悬空的偏移会让整个区域看起来空白一片。
-    let max_skip = lines.len().saturating_sub(body.height as usize);
-    let skip = state.scroll.min(max_skip);
+    //
+    // 上限按**软换行之后占几行**算，不能按 `lines.len()` 算：一段中文回答在 60 列
+    // 底下一条会摊成三四行，按条数夹的话尾巴永远滚不到——而尾巴正是回答的结论。
+    let skip = state.scroll.min(max_skip(&lines, body));
     let shown: Vec<Line<'static>> = lines.into_iter().skip(skip).collect();
     frame.render_widget(Paragraph::new(shown).wrap(Wrap { trim: false }), body);
 
-    let hint = if state.streaming {
-        "Esc 退出 · 正在回答…"
+    // 外面有请求在等的话，这条线先说那件事——**流式期间也说**，那正是最容易撞上
+    // 的时候（模型跑着工具、你在这儿问闲话）。侧问区把审批框整个盖住了，主 turn 就
+    // 停在那儿等，默认 300 秒之后引擎按"未作答不是同意"拒掉它。不说的话，用户看到
+    // 的只是"主任务怎么不动了"。
+    let (hint, color) = if state.waiting > 0 {
+        (
+            format!(
+                "⚠ 外面有 {} 个请求在等你答 · Esc 退出侧问区去答",
+                state.waiting
+            ),
+            COLOR_WARNING,
+        )
+    } else if state.streaming {
+        ("Esc 退出 · 正在回答…".to_string(), COLOR_SECONDARY)
     } else if state.earlier.is_empty() && state.older == 0 {
-        "↑↓ 滚动 · Esc/Enter 退出"
+        ("↑↓ 滚动 · Esc/Enter 退出".to_string(), COLOR_SECONDARY)
     } else {
-        "↑↓ 滚动 · ←→ 翻看早前 · x 清空 · Esc/Enter 退出"
+        (
+            "↑↓ 滚动 · ←→ 翻看早前 · x 清空 · Esc/Enter 退出".to_string(),
+            COLOR_SECONDARY,
+        )
     };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             format!(" {hint}"),
-            Style::default().fg(COLOR_SECONDARY),
+            Style::default().fg(color),
         ))),
         hint_row,
     );
-    let _ = Color::Reset;
 }
 
 #[cfg(test)]
@@ -133,6 +169,7 @@ mod tests {
             earlier: Vec::new(),
             older: 0,
             viewing: 0,
+            waiting: 0,
         }
     }
 
@@ -221,6 +258,46 @@ mod tests {
         s.viewing = 2;
         let (found, screen) = draw(&s, 60, 12);
         assert!(found.contains("第2条"), "{screen}");
+    }
+
+    /// 侧问区盖住了审批框，那期间到达的请求在屏幕上没有任何痕迹，主 turn 停着等，
+    /// 五分钟后被引擎拒掉。至少得让人知道有东西在等、知道怎么去答。
+    #[test]
+    fn it_says_when_something_outside_is_waiting_to_be_answered() {
+        let mut s = state();
+        s.waiting = 2;
+        let (found, screen) = draw(&s, 60, 12);
+        assert!(found.contains("2个请求在等你答"), "{screen}");
+        assert!(found.contains("Esc退出侧问区去答"), "{screen}");
+    }
+
+    /// 而且**流式期间也要说** —— 模型跑着工具、你在这儿问闲话，正是最容易撞上的
+    /// 时候，那会儿的状态栏本来只写"正在回答…"。
+    #[test]
+    fn the_warning_outranks_the_streaming_hint() {
+        let mut s = state();
+        s.answer.clear();
+        s.streaming = true;
+        s.waiting = 1;
+        let (found, screen) = draw(&s, 60, 12);
+        assert!(found.contains("1个请求在等你答"), "{screen}");
+    }
+
+    /// 长回答滚得到底。夹回去的上限得按**软换行之后**占几行算——按条数算的话，
+    /// 一段中文回答的最后几行永远露不出来，而结论恰好在那儿。
+    #[test]
+    fn a_long_wrapped_answer_can_be_scrolled_all_the_way_down() {
+        let mut s = state();
+        let body: Vec<String> = (0..30)
+            .map(|i| format!("第{i}段，这一段长到在四十列的框里要折成好几行才放得下。"))
+            .collect();
+        s.answer = format!("{}\n结尾标记", body.join("\n"));
+        s.scroll = 9999;
+        let (found, screen) = draw(&s, 40, 12);
+        assert!(
+            found.contains("结尾标记"),
+            "滚到底应该看得见最后一行:\n{screen}"
+        );
     }
 
     /// 滚动偏移超出范围时要夹回来——答案变短之后悬空的偏移会让整片变空白。

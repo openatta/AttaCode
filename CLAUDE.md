@@ -15,7 +15,9 @@ AttaCode/
 ├── docs/
 │   ├── reqs/                 需求规格
 │   ├── design/               架构设计文档
-│   └── TUI_DESIGN.md         Z/R/S 布局坐标系
+│   ├── TUI_DESIGN.md         区域名（代码路径 / English / 中文）— 唯一权威
+│   ├── tui-region-map.html   同一张表的图，浏览器打开，悬停联动
+│   └── manual-smoke-checklist.md  改了渲染/事件循环/装配之后要在真终端过一遍的清单
 ├── scripts/                  开发辅助脚本 / patch 规格
 │   └── lsp-process-pool.patch.md   AttaCore LspTool 进程池改进方案（待贡献）
 ├── Cargo.toml                workspace: app + bridge + tui + keybindings

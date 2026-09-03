@@ -1,5 +1,5 @@
 //! Pure data snapshot for one rendered frame. No AttaCore types anywhere in this file —
-//! see docs/TUI_DESIGN.md for the Z/R/S coordinate this maps to.
+//! see docs/TUI_DESIGN.md for the region names (code path / English / 中文) these map to.
 
 use serde::{Deserialize, Serialize};
 
@@ -451,6 +451,16 @@ pub struct BtwState {
     pub older: usize,
     /// 正在看第几条（0 = 当前这条，往大 = 越早）。
     pub viewing: usize,
+    /// 外面有多少个请求正等着人答（权限审批 + 模型的提问）。
+    ///
+    /// **侧问区把审批对话框整个盖住了**，键盘也归它。所以这期间到达的权限请求在
+    /// 屏幕上没有任何痕迹，而主 turn 就停在那儿等——默认 300 秒之后引擎按"未作答
+    /// 不是同意"把它拒掉。用户看到的是"主任务怎么不动了"，五分钟后拿到一次被拒的
+    /// 工具调用，而他从头到尾没见过那个框。
+    ///
+    /// 答还是得出去答（这里没有第二个对话框），但至少要让人知道有东西在等。
+    #[serde(default)]
+    pub waiting: usize,
 }
 
 // ═══ FrameState ═══

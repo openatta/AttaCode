@@ -139,11 +139,14 @@ pub struct BridgeHandle {
     /// `/btw` 侧问。见 [`crate::btw`]。
     side_questions: Option<Arc<crate::btw::SideQuestions>>,
     /// Same token passed to `Agent::run()` — it ends the *whole session*, and is
-    /// nothing to do with the interrupt key. Held here so a future "switch
-    /// session"/"shut the engine down" command has it; `BridgeCommand::CancelTurn`
-    /// goes through `EngineCommand::CancelTurn` instead, which interrupts one turn
-    /// and leaves the session usable.
-    #[allow(dead_code)]
+    /// nothing to do with the interrupt key. `BridgeCommand::CancelTurn` goes
+    /// through `EngineCommand::CancelTurn` instead, which interrupts one turn and
+    /// leaves the session usable.
+    ///
+    /// `/btw` hangs its own requests off a child of this token, so ending the
+    /// session ends them too — a side question outliving the engine it borrowed
+    /// its context from would be answering about a conversation nobody is in
+    /// any more.
     cancel: CancellationToken,
 }
 
@@ -298,7 +301,15 @@ impl EngineHandle for BridgeHandle {
                         }
                         self.reducer.btw_clear_earlier();
                     }
-                    BtwKey::Close => self.reducer.btw_close(),
+                    // 关掉 = 不要了。在途那次调用照着跑完的话，用户按了 Esc 之后
+                    // 还在替他烧 token，答完了还进 `exchanges` —— 而他已经不想要
+                    // 这个答案了。见 `SideQuestions::abandon`。
+                    BtwKey::Close => {
+                        if let Some(side) = &self.side_questions {
+                            side.abandon();
+                        }
+                        self.reducer.btw_close();
+                    }
                 }
                 Ok(())
             }
@@ -315,8 +326,8 @@ impl EngineHandle for BridgeHandle {
                     match earlier.last().cloned() {
                         Some(last) => {
                             let head = earlier[..earlier.len() - 1].to_vec();
-                            self.reducer.btw_open(last.question, head);
-                            self.reducer.btw_done(Some(last.answer));
+                            let generation = self.reducer.btw_open(last.question, head);
+                            self.reducer.btw_done(generation, Some(last.answer));
                         }
                         None => self
                             .reducer
@@ -327,16 +338,22 @@ impl EngineHandle for BridgeHandle {
 
                 // 立刻上屏（带着"在想"），答案随后流式填进来。**这一步不 await**——
                 // 侧问跑在自己的 task 上，主 turn 一点都不等它。
-                self.reducer.btw_open(question.clone(), side.exchanges());
+                //
+                // `generation` 一路带进回调：关掉侧问区**不**取消已经发出去的那次请求，
+                // 所以用户 Esc 之后马上再问一句时，上一问的 task 还在往回吐字。不带
+                // 编号的话那些字会落进这一问的答案框里。见 `Reducer::btw_delta`。
+                let generation = self.reducer.btw_open(question.clone(), side.exchanges());
                 let reducer = self.reducer.clone();
                 let cancel = self.cancel.child_token();
                 tokio::spawn(async move {
                     let outcome = side
-                        .ask(&question, cancel, |delta| reducer.btw_delta(delta))
+                        .ask(&question, cancel, |delta| {
+                            reducer.btw_delta(generation, delta)
+                        })
                         .await;
                     // 失败也要说出来。一个答不出来的侧问必须说自己答不出来，
                     // 而不是留一个永远"在想"的空框。
-                    reducer.btw_done(outcome.err());
+                    reducer.btw_done(generation, outcome.err());
                 });
                 Ok(())
             }
@@ -658,5 +675,202 @@ mod tests {
         assert!(handle
             .dispatch(BridgeCommand::Note { text: "x".into() })
             .is_ok());
+    }
+
+    // ── /btw 侧问区 ──
+
+    /// 一个装着侧问的 handle。`side` 那一半由 `crate::btw::stub` 提供。
+    fn handle_with_side(
+        side: Arc<crate::btw::SideQuestions>,
+    ) -> (BridgeHandle, watch::Receiver<FrameState>) {
+        let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel();
+        // 引擎那头没人收，但 `/btw` 一条都不往那儿发——留着别让 sender 立刻废掉。
+        std::mem::forget(input_rx);
+        let (reducer, frame_rx) = Reducer::build_for_test();
+        let (commands_tx, commands_rx) = watch::channel(Vec::new());
+        std::mem::forget(commands_tx);
+        let (questions, questions_rx) = crate::ask::Questions::new();
+        std::mem::forget(questions_rx);
+        let handle = BridgeHandle::new(
+            EngineParts {
+                input_tx,
+                questions,
+                health: None,
+                history: None,
+                side_questions: Some(side),
+            },
+            frame_rx.clone(),
+            commands_rx,
+            reducer,
+            CancellationToken::new(),
+        );
+        (handle, frame_rx)
+    }
+
+    /// 等到某一帧满足条件为止。侧问跑在自己的 task 上，所以帧是异步到的。
+    async fn until(
+        rx: &mut watch::Receiver<FrameState>,
+        mut ready: impl FnMut(&FrameState) -> bool,
+    ) -> FrameState {
+        let wait = async {
+            loop {
+                {
+                    let frame = rx.borrow_and_update();
+                    if ready(&frame) {
+                        return frame.clone();
+                    }
+                }
+                rx.changed().await.expect("归约器还活着");
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), wait)
+            .await
+            .expect("等超时了")
+    }
+
+    /// 问一句：立刻上屏（带着"在想"），答案随后流式填进来，最后收掉"在想"。
+    #[tokio::test]
+    async fn a_side_question_lands_on_screen_and_then_fills_in() {
+        let side = crate::btw::stub::ready("叫 settings.json");
+        let (handle, mut frame_rx) = handle_with_side(side.clone());
+
+        handle
+            .dispatch(BridgeCommand::Btw {
+                question: "那个配置文件叫什么".into(),
+            })
+            .unwrap();
+
+        let frame = until(&mut frame_rx, |f| {
+            f.btw.as_ref().is_some_and(|b| !b.streaming)
+        })
+        .await;
+        let btw = frame.btw.unwrap();
+        assert_eq!(btw.question, "那个配置文件叫什么");
+        assert_eq!(btw.answer, "叫 settings.json");
+        assert_eq!(side.exchanges().len(), 1, "答完了要记进早前问答");
+    }
+
+    /// `/btw` 不带问题、而且一句都还没问过：说清楚该怎么用，别开一个空框。
+    #[tokio::test]
+    async fn an_empty_btw_with_nothing_asked_yet_says_how_to_ask() {
+        let side = crate::btw::stub::ready("x");
+        let (handle, frame_rx) = handle_with_side(side);
+
+        handle
+            .dispatch(BridgeCommand::Btw {
+                question: "  ".into(),
+            })
+            .unwrap();
+
+        let frame = frame_rx.borrow();
+        assert!(frame.btw.is_none(), "没东西可看就别开这个区域");
+        assert!(
+            frame
+                .transcript
+                .body
+                .entries
+                .iter()
+                .any(|e| e.text.contains("nothing asked yet")),
+            "得说一句，否则用户以为命令没生效"
+        );
+    }
+
+    /// `/btw` 不带问题 = 重开侧问区，停在最近一次问答上（照 CC）。
+    #[tokio::test]
+    async fn an_empty_btw_reopens_the_last_exchange() {
+        let side = crate::btw::stub::ready("答案一");
+        let (handle, mut frame_rx) = handle_with_side(side);
+
+        handle
+            .dispatch(BridgeCommand::Btw {
+                question: "问题一".into(),
+            })
+            .unwrap();
+        until(&mut frame_rx, |f| {
+            f.btw.as_ref().is_some_and(|b| !b.streaming)
+        })
+        .await;
+        handle
+            .dispatch(BridgeCommand::BtwKey(BtwKey::Close))
+            .unwrap();
+
+        handle
+            .dispatch(BridgeCommand::Btw {
+                question: String::new(),
+            })
+            .unwrap();
+        let btw = frame_rx.borrow().btw.clone().expect("该重新开出来");
+        assert_eq!(btw.question, "问题一");
+        assert_eq!(btw.answer, "答案一");
+        assert!(!btw.streaming, "翻出来的旧问答不该显示成还在等模型");
+        assert!(
+            btw.earlier.is_empty(),
+            "它自己就是最近那条，不该又列自己一遍"
+        );
+    }
+
+    /// `x` 得把两处状态一起清掉：屏幕上那份，和下一问要带上去的那份。只清一处的话，
+    /// 用户看着清空了，下一问照样把它们发出去。
+    #[tokio::test]
+    async fn clearing_earlier_exchanges_clears_both_copies() {
+        let side = crate::btw::stub::ready("答案");
+        let (handle, mut frame_rx) = handle_with_side(side.clone());
+
+        for q in ["问题一", "问题二"] {
+            handle
+                .dispatch(BridgeCommand::Btw { question: q.into() })
+                .unwrap();
+            until(&mut frame_rx, |f| {
+                f.btw.as_ref().is_some_and(|b| !b.streaming)
+            })
+            .await;
+        }
+        assert_eq!(side.exchanges().len(), 2);
+        assert!(!frame_rx.borrow().btw.as_ref().unwrap().earlier.is_empty());
+
+        handle
+            .dispatch(BridgeCommand::BtwKey(BtwKey::ClearEarlier))
+            .unwrap();
+        assert!(side.exchanges().is_empty(), "下一问要带的那份没清");
+        assert!(
+            frame_rx.borrow().btw.as_ref().unwrap().earlier.is_empty(),
+            "屏幕上那份没清"
+        );
+    }
+
+    /// 关掉侧问区 = 不要在途那一问了。它照着跑完的话，用户按了 Esc 之后还在替他
+    /// 烧 token，答完还进早前问答——而他已经不想要这个答案了。
+    #[tokio::test]
+    async fn closing_the_panel_abandons_the_question_still_in_flight() {
+        let (side, dropped) = crate::btw::stub::never_ends_watched("答到一半");
+        let (handle, mut frame_rx) = handle_with_side(side.clone());
+
+        handle
+            .dispatch(BridgeCommand::Btw {
+                question: "问一句".into(),
+            })
+            .unwrap();
+        until(&mut frame_rx, |f| {
+            f.btw.as_ref().is_some_and(|b| !b.answer.is_empty())
+        })
+        .await;
+
+        handle
+            .dispatch(BridgeCommand::BtwKey(BtwKey::Close))
+            .unwrap();
+        assert!(frame_rx.borrow().btw.is_none());
+
+        // 收尾是那个 task 自己做的，给它跑完的机会再看它留下了什么。
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "那次请求得真的断掉 —— 断开的动作就是把 stream 丢掉"
+        );
+        assert!(
+            side.exchanges().is_empty(),
+            "被中断的那一问不该留下半截答案"
+        );
     }
 }

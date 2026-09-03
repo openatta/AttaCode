@@ -58,10 +58,19 @@ struct DomainState {
     cwd: String,
     /// 侧问区。`Some` = 激活，它独占屏幕下半和键盘。见 [`crate::btw`]。
     btw: Option<BtwSession>,
+    /// 下一问的编号。见 [`BtwSession::generation`]。
+    btw_next_generation: u64,
 }
 
 /// 侧问区当前的样子。
 struct BtwSession {
+    /// 这是本次进程的第几问。
+    ///
+    /// **流式回调靠它认门。** 一问还在流的时候用户可以 Esc 关掉侧问区、再 `/btw`
+    /// 问下一问（关掉不取消已经发出去的那次请求），于是两个 task 同时活着。不认门
+    /// 的话，前一问接着往下写的字会落进后一问的答案框里，而它的 `btw_done` 会把
+    /// 后一问的"在想"提前关掉——一个正在等答案的框，显示着另一问答了一半的话。
+    generation: u64,
     question: String,
     answer: String,
     streaming: bool,
@@ -238,6 +247,7 @@ impl Reducer {
             model_name,
             cwd,
             btw: None,
+            btw_next_generation: 0,
         };
         let initial_frame = render(&initial);
         let (frame_tx, frame_rx) = watch::channel(initial_frame);
@@ -279,7 +289,7 @@ impl Reducer {
     /// 供调用方送入 `InputMessage::User`。
     pub fn begin_turn(&self, text: String) -> String {
         let turn_id = base::id::Id::new().to_string();
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state();
         state.turns.push(Turn {
             id: turn_id.clone(),
             blocks: vec![Block::UserPrompt(text)],
@@ -302,7 +312,7 @@ impl Reducer {
     /// A no-op when nothing is running, mirroring Core: `CancelTurn` arriving while
     /// idle cancels an already-finished turn's token and does not arm the next one.
     pub fn request_cancel(&self) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state();
         if state.active_turn_started.is_none() {
             return;
         }
@@ -316,7 +326,7 @@ impl Reducer {
     /// turn is in flight, independent of whether any `AgentEvent` has arrived recently
     /// (e.g. a slow tool call produces no `TextDelta` in the meantime).
     fn tick(&self) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state();
         if state.active_turn_started.is_none() {
             return;
         }
@@ -326,15 +336,31 @@ impl Reducer {
 
     /// 用户对某个待确认请求做出决定：立即从 pending 列表移除（不等 Core 确认）。
     pub fn resolve_prompt(&self, prompt_id: &str) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state();
         state.pending_asks.retain(|p| p.prompt_id != prompt_id);
         self.broadcast(&state);
     }
 
+    /// 取归约器的状态锁。**中毒也接着用。**
+    ///
+    /// 锁中毒的意思是某一次 `apply_*` 在持锁时 panic 了。那一帧确实可能没算完，
+    /// 但从那之后 `lock().unwrap()` 会让**之后每一帧**都 panic——一次画面故障就此
+    /// 升级成一个再也不刷新的终端，而用户手上还开着一个正在跑的会话。宁可带着一帧
+    /// 可疑的状态接着画。`crate::btw` 和 `crate::ask` 早就是这么做的，这里跟上。
+    fn state(&self) -> std::sync::MutexGuard<'_, DomainState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// `/btw` 开一问：立刻上屏（带着"在想"），答案随后流式填进来。
-    pub fn btw_open(&self, question: String, earlier: Vec<crate::btw::Exchange>) {
-        let mut state = self.state.lock().unwrap();
+    ///
+    /// 返回这一问的编号，[`Reducer::btw_delta`] / [`Reducer::btw_done`] 要拿着它回来
+    /// ——见 [`BtwSession::generation`]。
+    pub fn btw_open(&self, question: String, earlier: Vec<crate::btw::Exchange>) -> u64 {
+        let mut state = self.state();
+        let generation = state.btw_next_generation;
+        state.btw_next_generation += 1;
         state.btw = Some(BtwSession {
+            generation,
             question,
             answer: String::new(),
             streaming: true,
@@ -343,43 +369,45 @@ impl Reducer {
             viewing: 0,
         });
         self.broadcast_as("btw.open", &state);
+        generation
     }
 
-    /// 答案又长出一段。
-    pub fn btw_delta(&self, text: &str) {
-        let mut state = self.state.lock().unwrap();
-        if let Some(btw) = &mut state.btw {
-            btw.answer.push_str(text);
+    /// 答案又长出一段。`generation` 对不上就丢——那是上一问的尾巴。
+    pub fn btw_delta(&self, generation: u64, text: &str) {
+        let mut state = self.state();
+        match &mut state.btw {
+            Some(btw) if btw.generation == generation => btw.answer.push_str(text),
+            _ => return,
         }
         self.broadcast_as("btw.delta", &state);
     }
 
     /// 这一问答完了（或者失败了——`answer` 里就是那句失败原因）。
-    pub fn btw_done(&self, answer: Option<String>) {
-        let mut state = self.state.lock().unwrap();
-        if let Some(btw) = &mut state.btw {
-            if let Some(text) = answer {
-                btw.answer = text;
+    /// `generation` 对不上就丢，理由同 [`Reducer::btw_delta`]。
+    pub fn btw_done(&self, generation: u64, answer: Option<String>) {
+        let mut state = self.state();
+        match &mut state.btw {
+            Some(btw) if btw.generation == generation => {
+                if let Some(text) = answer {
+                    btw.answer = text;
+                }
+                btw.streaming = false;
             }
-            btw.streaming = false;
+            _ => return,
         }
         self.broadcast_as("btw.done", &state);
     }
 
     /// 退出侧问区，回主 UI。
     pub fn btw_close(&self) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state();
         state.btw = None;
         self.broadcast_as("btw.close", &state);
     }
 
-    pub fn btw_is_open(&self) -> bool {
-        self.state.lock().unwrap().btw.is_some()
-    }
-
     /// 滚动答案。`delta` 是行数，负数往上。
     pub fn btw_scroll(&self, delta: isize) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state();
         if let Some(btw) = &mut state.btw {
             btw.scroll = btw.scroll.saturating_add_signed(delta);
         }
@@ -390,7 +418,7 @@ impl Reducer {
     ///
     /// 还在流式回答的时候不给翻——答案正在长，翻走再翻回来会看见半截。
     pub fn btw_step(&self, back: bool) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state();
         let Some(btw) = &mut state.btw else { return };
         if btw.streaming {
             return;
@@ -407,7 +435,7 @@ impl Reducer {
 
     /// 清空早前问答（`x`）。当前这一问答留着——用户看的就是它。
     pub fn btw_clear_earlier(&self) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state();
         if let Some(btw) = &mut state.btw {
             btw.earlier.clear();
             btw.viewing = 0;
@@ -419,7 +447,7 @@ impl Reducer {
     pub fn apply_question(&self, event: QuestionEvent) {
         match event {
             QuestionEvent::Ask(q) => {
-                let mut state = self.state.lock().unwrap();
+                let mut state = self.state();
                 state.pending_asks.push(pending_from_question(q));
                 self.broadcast_as("Question", &state);
             }
@@ -434,7 +462,7 @@ impl Reducer {
     /// 也没有对应的确认事件；等一个不会来的事件只会让状态栏一直显示旧模型。
     /// 下一个 turn 起效：`runtime::turn` 每轮开头重读 `settings.model.model_name`。
     pub fn set_model(&self, name: String) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state();
         push_note(
             &mut state.turns,
             format!("model switched to {name} (takes effect next turn)"),
@@ -446,14 +474,14 @@ impl Reducer {
     /// 往转录里写一条 app 侧的提示（未知的本地命令、`/model` 的用法等）。
     /// app 不持有转录，这是它唯一能往里说话的口子。
     pub fn note(&self, text: String) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state();
         push_note(&mut state.turns, text);
         self.broadcast(&state);
     }
 
     /// 翻转某个可折叠工具块的展开态，重新派生并广播。
     pub fn toggle_expand(&self, block_id: &str) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state();
         for turn in state.turns.iter_mut() {
             for block in turn.blocks.iter_mut() {
                 if let Block::Tool { id, expanded, .. } = block {
@@ -469,7 +497,7 @@ impl Reducer {
     fn apply_event(&self, event: AgentEvent) {
         // 打点要的事件名。在 `match` 消费掉 `event` 之前先取出来。
         let event_name = event_name(&event);
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state();
         match event {
             AgentEvent::TextDelta { text, turn_id } => {
                 let turn = find_or_create_turn(&mut state.turns, &turn_id);
@@ -1013,9 +1041,14 @@ fn parse_todos(input: &serde_json::Value) -> Option<Vec<TaskItem>> {
 }
 
 fn summarize_input(input: &serde_json::Value) -> String {
+    /// 摘要掐到这么多**字符**。
+    const MAX_CHARS: usize = 80;
     let s = serde_json::to_string(input).unwrap_or_default();
-    if s.len() > 80 {
-        format!("{}…", &s[..80])
+    // 按字符掐，不按字节。`serde_json` 不转义非 ASCII，所以入参里的中文原样躺在这个
+    // 串里（一个字三个字节）——`&s[..80]` 有三分之二的机会切在字符中间，那不是截断，
+    // 是 panic。而这个函数每一次 `ToolUse` 都要跑一遍。
+    if s.chars().count() > MAX_CHARS {
+        format!("{}…", s.chars().take(MAX_CHARS).collect::<String>())
     } else {
         s
     }
@@ -1148,6 +1181,8 @@ fn render(state: &DomainState) -> FrameState {
                     .collect(),
                 older: b.earlier.len().saturating_sub(SHOWN),
                 viewing: b.viewing,
+                // 侧问区盖住了审批对话框，这是它唯一说得出"外面有东西在等"的地方。
+                waiting: state.pending_asks.len(),
             }
         }),
         sub_agent_bar: SubAgentBarState {
@@ -2752,5 +2787,62 @@ mod tests {
             .collect();
         assert_eq!(thinking.len(), 1);
         assert_eq!(thinking[0].text, "let me check");
+    }
+
+    // ── /btw 侧问区 ──
+
+    fn exchange(q: &str, a: &str) -> crate::btw::Exchange {
+        crate::btw::Exchange {
+            question: q.into(),
+            answer: a.into(),
+        }
+    }
+
+    /// 上一问还在流的时候关掉侧问区、再问下一问：前一问接着吐出来的字**不能**落进
+    /// 后一问的框里，它的收尾也不能把后一问的"在想"提前关掉。
+    #[test]
+    fn a_still_running_side_question_does_not_write_into_the_next_one() {
+        let (r, rx) = reducer();
+        let first = r.btw_open("第一问".into(), Vec::new());
+        r.btw_delta(first, "第一答");
+        r.btw_close();
+
+        let second = r.btw_open("第二问".into(), vec![exchange("第一问", "第一答")]);
+        // 第一问的 task 这才反应过来。
+        r.btw_delta(first, "……还有半句");
+        r.btw_done(first, None);
+
+        let btw = frame(&rx).btw.expect("侧问区还开着");
+        assert_eq!(btw.question, "第二问");
+        assert_eq!(btw.answer, "", "上一问的尾巴不该落进来");
+        assert!(btw.streaming, "上一问的收尾不该关掉这一问的『在想』");
+
+        // 自己的那份照常收得到。
+        r.btw_delta(second, "第二答");
+        r.btw_done(second, None);
+        let btw = frame(&rx).btw.unwrap();
+        assert_eq!(btw.answer, "第二答");
+        assert!(!btw.streaming);
+    }
+
+    /// 关掉之后迟到的那份不该把侧问区重新拽出来。
+    #[test]
+    fn a_late_answer_does_not_reopen_a_closed_panel() {
+        let (r, rx) = reducer();
+        let gen = r.btw_open("问".into(), Vec::new());
+        r.btw_close();
+        r.btw_delta(gen, "迟到的字");
+        r.btw_done(gen, Some("迟到的答".into()));
+        assert!(frame(&rx).btw.is_none());
+    }
+
+    /// 工具入参里有中文是这个项目的常态，而摘要是按 80 **字符**掐的——按字节掐会
+    /// 切在字符中间，那不是截断是 panic，而且每一次 `ToolUse` 都要走一遍。
+    #[test]
+    fn a_long_chinese_tool_input_is_summarized_without_panicking() {
+        let input = serde_json::json!({ "command": "echo ".to_string() + &"中".repeat(200) });
+        let summary = summarize_input(&input);
+        assert!(summary.ends_with('…'));
+        assert_eq!(summary.chars().count(), 81);
     }
 }

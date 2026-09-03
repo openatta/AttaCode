@@ -2774,6 +2774,7 @@ mod tests {
             earlier: vec!["第一问".into()],
             older: 0,
             viewing: 0,
+            waiting: 0,
         });
         f
     }
