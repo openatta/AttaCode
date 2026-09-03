@@ -1,18 +1,21 @@
 # 真机验收清单
 
+> 提到 TUI 的某一块时，用 `docs/TUI_DESIGN.md` 里的规范名（代码路径 / English / 中文
+> 三选一，比如 `composer.content.ask` = Ask Box = 输入·提问框）。那张表是唯一权威。
+
 单元测试覆盖不到的东西：raw mode 下的渲染、和真 API 的时序、按键在真实终端里的编码。
 每次动了渲染/事件循环/装配之后跑一遍这份清单。
 
-## 打点：跑的时候看每个区块到底收到了什么
+## 打点：跑的时候看每个区域到底收到了什么
 
 `ATTACODE_TRACE=<路径>` 打开之后，每一帧和每一次按键都会记一行 JSON——按键记
-"收到了什么键、解析成了哪个 action"，帧记"这一刻各区块各有多少内容"。跑完：
+"收到了什么键、解析成了哪个 action"，帧记"这一刻各区域各有多少内容"。跑完：
 
 ```sh
 scripts/trace_report.py /tmp/attacode-trace.jsonl
 ```
 
-报告会直接指出**哪些区块从来没收到过内容**。两条经验：
+报告会直接指出**哪些区域从来没收到过内容**。两条经验：
 
 - 打点打在 app 渲染前那一帧（合并之后），不是 bridge 广播那一刻——选中块、滚动、
   草稿都是 app 才加上去的，只打 bridge 那侧会把"块选中态"误报成红的。
@@ -60,8 +63,8 @@ cargo build --workspace          # 先确认能编译，别在 alt screen 里看
 ## 0.5 靶子项目
 
 `scripts/testbed/make_testbed.sh` 造一个固定内容的小项目（`/tmp/attacode-testbed`），
-每个文件都冲着某个区块去；配套的提示词在 `scripts/testbed/prompts.md`，一条点一个
-区块。别拿 AttaCode 自己当靶子——模型可能真去改源码，而且每次看到的东西都不一样，
+每个文件都冲着某个区域去；配套的提示词在 `scripts/testbed/prompts.md`，一条点一个
+区域。别拿 AttaCode 自己当靶子——模型可能真去改源码，而且每次看到的东西都不一样，
 跑出来没法比。
 
 ## 0. 无终端冒烟（先跑这个）

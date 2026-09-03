@@ -5,7 +5,7 @@
 //! `--resume` 只能手打一个 BASE58 的 id——一个人得先自己去
 //! `~/.atta/projects/<项目>/` 底下翻文件名。
 //!
-//! 这里把结果投影成 [`CompletionCandidate`]（`name` + `description`）而不是往上传
+//! 这里把结果投影成 [`PickerCandidate`]（`name` + `description`）而不是往上传
 //! `history::store::SessionSummary`：`crates/app` 不许看见任何 AttaCore 类型，
 //! 而补全弹窗要的本来就是这两个字段。
 //!
@@ -15,7 +15,7 @@
 //! 就是"最近的那些"。分成两个函数只会多一个两边可能说不一样话的地方。
 
 use history::store::{JsonlHistoryStore, SessionSummary};
-use tui::frame_state::CompletionCandidate;
+use tui::frame_state::PickerCandidate;
 
 /// 弹窗里一次最多列这么多。
 ///
@@ -27,7 +27,7 @@ pub const MAX_CANDIDATES: usize = 20;
 ///
 /// 出错不是致命的：`/resume` 是个查询，查不到就该是一份空列表加一句话，而不是让
 /// 整个 TUI 停下来。调用方拿到空列表时说"没有找到"。
-pub async fn candidates(store: &JsonlHistoryStore, query: &str) -> Vec<CompletionCandidate> {
+pub async fn candidates(store: &JsonlHistoryStore, query: &str) -> Vec<PickerCandidate> {
     let query = query.trim();
     let found = if query.is_empty() {
         store.list_recent_session_summaries(MAX_CANDIDATES).await
@@ -47,13 +47,13 @@ pub async fn candidates(store: &JsonlHistoryStore, query: &str) -> Vec<Completio
 ///
 /// `name` 必须是**完整的 session id**，因为选中之后它就是 `--resume` 的参数。
 /// 展示归 `description` 管。
-fn describe(s: &SessionSummary) -> CompletionCandidate {
+fn describe(s: &SessionSummary) -> PickerCandidate {
     let subject = s
         .title
         .clone()
         .filter(|t| !t.trim().is_empty())
         .unwrap_or_else(|| first_line(&s.preview));
-    CompletionCandidate {
+    PickerCandidate {
         name: s.session_id.to_string(),
         description: format!("{}  {} msgs  {}", s.last_modified, s.message_count, subject),
     }

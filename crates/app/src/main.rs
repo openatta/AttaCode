@@ -1,7 +1,7 @@
 //! `attacode` — application entry point: terminal setup, event loop, key dispatch.
 //!
 //! Owns two concerns bridge intentionally doesn't: terminal I/O (ratatui/crossterm) and
-//! UI-local composer state (draft/cursor/completion selection). Everything Core-related
+//! UI-local composer state (draft/cursor/picker selection). Everything Core-related
 //! goes through `bridge::EngineHandle` — this file never touches an AttaCore type directly.
 //!
 //! Composer editing lives in the `impl LocalUi` block near the bottom: insert/delete
@@ -24,8 +24,7 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io::stdout;
 use tokio_stream::StreamExt;
 use tui::frame_state::{
-    AnswerWith, ApprovalOption, ApprovalRequest, CompletionCandidate, CompletionKind,
-    CompletionPopupState,
+    AnswerWith, AskOption, AskRequest, PickerCandidate, PickerKind, PickerState,
 };
 
 const USAGE: &str = "\
@@ -163,23 +162,23 @@ struct LocalUi {
     cursor: usize,
     /// Latest slash-command list from `bridge::commands` — Core's own live
     /// `CommandRegistry`, refreshed when the engine reports the skill catalog changed.
-    commands: Vec<CompletionCandidate>,
-    completion_selected: usize,
+    commands: Vec<PickerCandidate>,
+    picker_selected: usize,
     /// `/resume` 选择器的候选，`None` = 没开。
     ///
     /// 和补全弹窗不同，这一份**不是**从 `draft` 推出来的：它是一次读盘的结果，
-    /// 推不出来，只能存着。高亮位复用 `completion_selected`——同一时刻两个列表不会
+    /// 推不出来，只能存着。高亮位复用 `picker_selected`——同一时刻两个列表不会
     /// 都开着（选择器一开就霸占键盘，`draft` 也被清空了，补全的前提没了）。
-    session_picker: Option<Vec<CompletionCandidate>>,
+    session_picker: Option<Vec<PickerCandidate>>,
     /// Esc closes the popup without touching `draft`; re-typing anything reopens it
     /// (see `note_draft_changed`).
-    completion_dismissed: bool,
+    picker_dismissed: bool,
     /// 权限对话框里高亮的选项下标。和补全选择一样是纯 UI-本地状态：bridge 只知道
     /// 有哪些选项，不知道光标停在哪一项。渲染前由 `merge` 覆盖进快照。
-    approval_selected: usize,
+    ask_selected: usize,
     /// 同时有多个待确认请求时，正在看第几个（Tab 切换）。同样是 UI-本地的：
     /// bridge 只维护待确认队列本身。渲染前由 `merge` 夹进合法范围。
-    approval_active: usize,
+    ask_active: usize,
     /// 转录滚动位置：`None` = 跟住底部（新内容自动滚进来），`Some(n)` = 冻在
     /// "跳过前 n 条"的位置不动。滚动位置同样是 UI-本地的——bridge 每帧都会把
     /// `auto_follow` 置回 true，由 `merge` 按这个字段覆盖。
@@ -204,16 +203,16 @@ struct LocalUi {
 }
 
 impl LocalUi {
-    fn new(commands: Vec<CompletionCandidate>) -> Self {
+    fn new(commands: Vec<PickerCandidate>) -> Self {
         Self {
             draft: String::new(),
             cursor: 0,
             commands,
-            completion_selected: 0,
+            picker_selected: 0,
             session_picker: None,
-            completion_dismissed: false,
-            approval_selected: 0,
-            approval_active: 0,
+            picker_dismissed: false,
+            ask_selected: 0,
+            ask_active: 0,
             scroll_offset: None,
             selected_block: None,
             history: Vec::new(),
@@ -304,8 +303,8 @@ impl LocalUi {
     }
 
     fn note_draft_changed(&mut self) {
-        self.completion_selected = 0;
-        self.completion_dismissed = false;
+        self.picker_selected = 0;
+        self.picker_dismissed = false;
     }
 
     /// 把本地状态和刚到的这一帧对齐。**在 `merge` 之前调**。
@@ -315,52 +314,50 @@ impl LocalUi {
     /// 自由文本题会让选择器**从屏幕上消失却继续吃着键盘**，用户打字没反应，回车
     /// 静默换了会话。收起来是唯一诚实的选择：屏幕上没有的东西不该能被操作。
     fn reconcile(&mut self, frame: &tui::FrameState) {
-        if frame.composer.content.approval.is_some() {
+        if frame.composer.content.ask.is_some() {
             self.close_picker();
         }
         // 队列缩短时本地光标要跟着回来。`merge` 只是在**渲染用的那份拷贝**上夹了一次
         // （`active_idx = min(...)`），从没写回本地，于是本地光标能停在队列末尾之外：
         // 3 个请求、Tab 到第 3 个，前面一个自己超时消失之后，再按一次 Tab
         // 算出来还是同一个——一次按键什么都不发生。
-        let Some(approval) = &frame.composer.content.approval else {
-            self.reset_approval_cursor();
+        let Some(ask) = &frame.composer.content.ask else {
+            self.reset_ask_cursor();
             return;
         };
-        self.approval_active = self
-            .approval_active
-            .min(approval.pending.len().saturating_sub(1));
-        // **选项下标也得跟着夹。** 两个下标是一对（`reset_approval_cursor` 的文档
+        self.ask_active = self.ask_active.min(ask.pending.len().saturating_sub(1));
+        // **选项下标也得跟着夹。** 两个下标是一对（`reset_ask_cursor` 的文档
         // 就是这么说的），只夹一个的后果是回车变成死键：队列 `[A(4 个选项),
         // B(2 个)]`，用户在 A 上选到第 4 项，A 自己超时消失，active 落到 B——
         // 屏幕上高亮的是 B 的第一项（`merge` 把越界的渲染值归了 0），而
         // `ask.confirm` 读的是没夹过的本地值，`options.get(3)` 是 None，于是
         // 什么都不发生，得先按一下方向键把它绕回范围内。
-        let options = approval.active().map_or(0, |r| r.options.len());
-        if self.approval_selected >= options {
-            self.approval_selected = 0;
+        let options = ask.active().map_or(0, |r| r.options.len());
+        if self.ask_selected >= options {
+            self.ask_selected = 0;
         }
     }
 
     /// 答完一个之后，光标回到队列头。
     ///
-    /// 两个下标都要复位。只复位 `approval_selected` 的话，`approval_active` 会留在
+    /// 两个下标都要复位。只复位 `ask_selected` 的话，`ask_active` 会留在
     /// 原地——而 `merge` 现在**从 active 那一条推算输入框锁不锁**，于是队列
     /// `[问答题, 权限B]`、用户 Tab 到 1 答掉 B 之后光标还停在 1；下一个权限请求一到，
     /// 它凭空成了 active，输入框在用户打了一半的草稿底下自己锁上。
-    fn reset_approval_cursor(&mut self) {
-        self.approval_selected = 0;
-        self.approval_active = 0;
+    fn reset_ask_cursor(&mut self) {
+        self.ask_selected = 0;
+        self.ask_active = 0;
     }
 
     /// 打开 `/resume` 选择器。高亮位归零——上一次停在第几项和这一次的列表无关。
-    fn open_picker(&mut self, candidates: Vec<CompletionCandidate>) {
+    fn open_picker(&mut self, candidates: Vec<PickerCandidate>) {
         self.session_picker = Some(candidates);
-        self.completion_selected = 0;
+        self.picker_selected = 0;
     }
 
     fn close_picker(&mut self) {
         self.session_picker = None;
-        self.completion_selected = 0;
+        self.picker_selected = 0;
     }
 }
 
@@ -420,7 +417,7 @@ async fn run(
                     // 读盘。放在这里而不是 `submit` 里，是因为只有这一层是 async 的
                     // ——一个几百个会话的项目要读一会儿，同步做就是画面卡住。
                     Flow::ListSessions(query) => {
-                        // 屏幕太矮时弹窗根本画不出来（`render_completion_popup` 在
+                        // 屏幕太矮时弹窗根本画不出来（`render_picker` 在
                         // 上方放不下时直接不画），而键盘路由不知道这件事——列表会
                         // 一个字都不显示却吃掉方向键，回车直接换到一个用户从没看见
                         // 过的会话。宁可不开，并说清楚为什么。
@@ -474,13 +471,13 @@ fn dispatch_key(
         let pending = snapshot
             .composer
             .content
-            .approval
+            .ask
             .as_ref()
             .map(|a| a.pending.len())
             .unwrap_or(1);
         return match outcome {
             ResolveOutcome::Action(action) => {
-                dispatch_approval_action(&action, local, handle, req, pending)
+                dispatch_ask_action(&action, local, handle, req, pending)
             }
             // 对话框开着时普通字符没有去处（composer 锁着），直接丢。
             _ => Flow::Continue,
@@ -519,16 +516,16 @@ fn dispatch_picker_action(action: &str, local: &mut LocalUi, handle: &dyn Engine
     let len = local.session_picker.as_ref().map_or(0, Vec::len);
     match action {
         "editor.history.prev" | "ask.prev" => {
-            local.completion_selected = step(local.completion_selected, -1, len)
+            local.picker_selected = step(local.picker_selected, -1, len)
         }
         "editor.history.next" | "ask.next" => {
-            local.completion_selected = step(local.completion_selected, 1, len)
+            local.picker_selected = step(local.picker_selected, 1, len)
         }
         "editor.submit" | "ask.confirm" => {
             let picked = local
                 .session_picker
                 .as_ref()
-                .and_then(|c| c.get(local.completion_selected))
+                .and_then(|c| c.get(local.picker_selected))
                 .map(|c| c.name.clone());
             local.close_picker();
             // 选不出东西（空列表）时只是关掉，不是"恢复到一个叫空串的会话"。
@@ -554,39 +551,39 @@ fn dispatch_picker_action(action: &str, local: &mut LocalUi, handle: &dyn Engine
 /// `default_bindings()` 里 `editor.*` 排在 `ask.*` 前面、占着同样的 Up/Down/Enter
 /// ——`ask.prev`/`ask.next`/`ask.confirm` 在默认键位下根本轮不到（用户把它们改绑到
 /// 别的键才会出现）。认两个名字，两条路都通。
-fn dispatch_approval_action(
+fn dispatch_ask_action(
     action: &str,
     local: &mut LocalUi,
     handle: &dyn EngineHandle,
-    req: &ApprovalRequest,
+    req: &AskRequest,
     pending: usize,
 ) -> Flow {
     match action {
         // 多个请求排队时切下一个。渲染那边早就画了 tab 条，但一直没有键能切——
         // `active_idx` 恒为 0，后面的请求只能等前面的答完才看得见。
         "ask.next-request" => {
-            local.approval_active = step(local.approval_active, 1, pending);
-            local.approval_selected = 0;
+            local.ask_active = step(local.ask_active, 1, pending);
+            local.ask_selected = 0;
         }
         "editor.history.prev" | "ask.prev" => {
-            local.approval_selected = step(local.approval_selected, -1, req.options.len())
+            local.ask_selected = step(local.ask_selected, -1, req.options.len())
         }
         "editor.history.next" | "ask.next" => {
-            local.approval_selected = step(local.approval_selected, 1, req.options.len())
+            local.ask_selected = step(local.ask_selected, 1, req.options.len())
         }
         "editor.submit" | "ask.confirm" => {
             // 选不出东西时什么都不做，而不是替用户拒绝：这个分支现在也服务模型的
             // 提问，那里 `Deny` 根本不在选项里，凭空发一个等于替用户答了道没答过
             // 的题。空选项列表在 `AnswerWith::Choose` 下本就不该出现（见
             // `bridge::reducer::pending_from_question`），真出现了也该卡住而不是乱答。
-            if let Some(choice) = req.options.get(local.approval_selected).cloned() {
+            if let Some(choice) = req.options.get(local.ask_selected).cloned() {
                 respond(handle, local, req, choice);
             }
         }
         // `y`/`n` 是权限门那道题的快捷键。模型的提问里没有这两个选项，按下去
         // 应该什么都不发生——`shortcut` 只在选项表里真有它的时候才作数。
-        "ask.yes-shortcut" => shortcut(handle, local, req, ApprovalOption::PermitOnce),
-        "ask.no-shortcut" | "repl.dismiss" => shortcut(handle, local, req, ApprovalOption::Deny),
+        "ask.yes-shortcut" => shortcut(handle, local, req, AskOption::PermitOnce),
+        "ask.no-shortcut" | "repl.dismiss" => shortcut(handle, local, req, AskOption::Deny),
         // 权限检查把 turn 卡住了，中断它仍然是合理动作。
         "repl.cancel" => {
             let _ = handle.dispatch(BridgeCommand::CancelTurn);
@@ -597,36 +594,31 @@ fn dispatch_approval_action(
 }
 
 /// 只在 `option` 真的是这道题的选项之一时才回它。
-fn shortcut(
-    handle: &dyn EngineHandle,
-    local: &mut LocalUi,
-    req: &ApprovalRequest,
-    option: ApprovalOption,
-) {
+fn shortcut(handle: &dyn EngineHandle, local: &mut LocalUi, req: &AskRequest, option: AskOption) {
     if req.options.contains(&option) {
         respond(handle, local, req, option);
     }
 }
 
-fn active_approval(snapshot: &tui::FrameState) -> Option<&ApprovalRequest> {
-    snapshot.composer.content.approval.as_ref()?.active()
+fn active_ask(snapshot: &tui::FrameState) -> Option<&AskRequest> {
+    snapshot.composer.content.ask.as_ref()?.active()
 }
 
 /// 当前这条待办里**要用选的**那种。`None` 包括"没有待办"和"待办是道问答题"。
 ///
-/// 判据来自 [`tui::frame_state::ApprovalState::locks_composer`]——和渲染那边锁不锁
+/// 判据来自 [`tui::frame_state::AskState::locks_composer`]——和渲染那边锁不锁
 /// 输入框读的是同一个方法。这里自己写一遍 `== Choose` 就是在重新制造那个 bug。
-fn active_choice(snapshot: &tui::FrameState) -> Option<&ApprovalRequest> {
-    let approval = snapshot.composer.content.approval.as_ref()?;
-    approval.locks_composer().then(|| approval.active())?
+fn active_choice(snapshot: &tui::FrameState) -> Option<&AskRequest> {
+    let ask = snapshot.composer.content.ask.as_ref()?;
+    ask.locks_composer().then(|| ask.active())?
 }
 
 /// 当前**正在答的**那条，如果它是道自由文本题。
 ///
 /// 取的是 active 那一条，不是队列里随便找一条 `Type`：队列 `[Type, Choose]` 而
 /// 用户 Tab 到了后面那个权限请求时，回车该确认权限，不该去答那道已经不在眼前的题。
-fn pending_typed_question(snapshot: &tui::FrameState) -> Option<&ApprovalRequest> {
-    active_approval(snapshot).filter(|r| r.answer_with == AnswerWith::Type)
+fn pending_typed_question(snapshot: &tui::FrameState) -> Option<&AskRequest> {
+    active_ask(snapshot).filter(|r| r.answer_with == AnswerWith::Type)
 }
 
 /// 在 `[0, len)` 内环绕移动。`len == 0` 时原地不动（没有选项可选）。
@@ -644,10 +636,10 @@ fn dispatch_action(
     handle: &dyn EngineHandle,
     snapshot: &tui::FrameState,
 ) -> Flow {
-    let completion_active = compute_completion(local).is_some();
+    let picker_active = compute_command_picker(local).is_some();
     match action {
-        "editor.submit" if completion_active && !completion_already_typed(local) => {
-            accept_completion(local)
+        "editor.submit" if picker_active && !picker_already_typed(local) => {
+            accept_picker_candidate(local)
         }
         "editor.submit" => return submit(local, handle, snapshot),
         "editor.newline" => local.insert('\n'),
@@ -668,8 +660,8 @@ fn dispatch_action(
         "editor.redraw" => local.redraw_requested = true,
         // Up/Down 一键三义，按当前上下文取一个：补全弹窗开着时移动选中项；
         // 多行草稿里先在行间走；走到首/末行（单行草稿则一开始就是）才翻历史。
-        "editor.history.prev" if completion_active => move_completion_selection(local, -1),
-        "editor.history.next" if completion_active => move_completion_selection(local, 1),
+        "editor.history.prev" if picker_active => move_picker_selection(local, -1),
+        "editor.history.next" if picker_active => move_picker_selection(local, 1),
         "editor.history.prev" => local.up(),
         "editor.history.next" => local.down(),
         "repl.scroll-up" => {
@@ -686,18 +678,18 @@ fn dispatch_action(
                 return Flow::Quit;
             }
         }
-        "repl.dismiss" if completion_active => local.completion_dismissed = true,
+        "repl.dismiss" if picker_active => local.picker_dismissed = true,
         // Esc 没有对话框/弹窗要关时，退出块选择——和它在别处"退出当前模式"的语义一致。
         "repl.dismiss" if local.selected_block.is_some() => {
             local.selected_block = None;
         }
-        // 队列里排到下一个。以前这个 action 只在 `dispatch_approval_action` 里，而那个
+        // 队列里排到下一个。以前这个 action 只在 `dispatch_ask_action` 里，而那个
         // 函数只有 active 是选择题时才到得了——于是排在一道自由文本题后面的权限请求
         // 永远 Tab 不到、永远答不了，一直挂到 300 秒超时被自动拒绝。
         "ask.next-request" => {
-            if let Some(approval) = &snapshot.composer.content.approval {
-                local.approval_active = step(local.approval_active, 1, approval.pending.len());
-                local.approval_selected = 0;
+            if let Some(ask) = &snapshot.composer.content.ask {
+                local.ask_active = step(local.ask_active, 1, ask.pending.len());
+                local.ask_selected = 0;
             }
         }
         "transcript.select-prev" => local.select_block(snapshot, -1),
@@ -846,7 +838,7 @@ fn local_command(text: &str) -> Option<LocalCommand> {
 
 /// 本地命令也要出现在补全弹窗里——它们和 Core 那些一样是用户敲 `/` 想找的东西，
 /// 只是解析发生在这一层。Core 的 registry 里没有同名项，不用去重。
-fn local_command_candidates() -> Vec<CompletionCandidate> {
+fn local_command_candidates() -> Vec<PickerCandidate> {
     [
         (
             "/model",
@@ -864,7 +856,7 @@ fn local_command_candidates() -> Vec<CompletionCandidate> {
         ("/exit", "Exit AttaCode"),
     ]
     .into_iter()
-    .map(|(name, description)| CompletionCandidate {
+    .map(|(name, description)| PickerCandidate {
         name: name.into(),
         description: description.into(),
     })
@@ -893,7 +885,7 @@ fn submit(local: &mut LocalUi, handle: &dyn EngineHandle, snapshot: &tui::FrameS
             prompt_id: req.prompt_id.clone(),
             text,
         });
-        local.reset_approval_cursor();
+        local.reset_ask_cursor();
         return Flow::Continue;
     }
     let cmd = match local_command(&text) {
@@ -916,17 +908,12 @@ fn submit(local: &mut LocalUi, handle: &dyn EngineHandle, snapshot: &tui::FrameS
 
 /// 回一个权限决定，并把选择位复位——下一个请求从第一项（"Yes"）开始，而不是
 /// 继承上一个对话框停在哪。
-fn respond(
-    handle: &dyn EngineHandle,
-    local: &mut LocalUi,
-    req: &ApprovalRequest,
-    decision: ApprovalOption,
-) {
+fn respond(handle: &dyn EngineHandle, local: &mut LocalUi, req: &AskRequest, decision: AskOption) {
     let _ = handle.dispatch(BridgeCommand::Respond {
         prompt_id: req.prompt_id.clone(),
         decision,
     });
-    local.reset_approval_cursor();
+    local.reset_ask_cursor();
 }
 
 fn insert_char(key: KeyEvent, local: &mut LocalUi) {
@@ -1081,8 +1068,8 @@ impl LocalUi {
             }
         }
         self.cursor = self.draft.len();
-        self.completion_selected = 0;
-        self.completion_dismissed = false;
+        self.picker_selected = 0;
+        self.picker_dismissed = false;
     }
 
     /// 记一条提交过的输入。连续重复的不重复记——连按两次同一条命令之后，
@@ -1145,23 +1132,23 @@ impl LocalUi {
     }
 }
 
-/// Slash-command completion is UI-local, computed fresh from `local.draft` +
+/// The slash-command picker is UI-local, computed fresh from `local.draft` +
 /// `local.commands` each time (mirrors how draft/cursor are already merged in) —
 /// bridge only supplies the raw candidate list, not the filtered/open-or-closed popup.
-fn compute_completion(local: &LocalUi) -> Option<CompletionPopupState> {
-    // 选择器开着时补全不该同时冒出来。它俩共用 `completion_selected`，两个都开
+fn compute_command_picker(local: &LocalUi) -> Option<PickerState> {
+    // 选择器开着时补全不该同时冒出来。它俩共用 `picker_selected`，两个都开
     // 就是两个列表争同一个高亮位。
     if local.session_picker.is_some() {
         return None;
     }
-    if local.completion_dismissed {
+    if local.picker_dismissed {
         return None;
     }
     let rest = local.draft.strip_prefix('/')?;
     if rest.is_empty() || rest.contains(' ') || rest.contains('\n') {
         return None;
     }
-    let candidates: Vec<CompletionCandidate> = local_command_candidates()
+    let candidates: Vec<PickerCandidate> = local_command_candidates()
         .into_iter()
         .chain(local.commands.iter().cloned())
         .filter(|c| c.name.trim_start_matches('/').starts_with(rest))
@@ -1169,9 +1156,9 @@ fn compute_completion(local: &LocalUi) -> Option<CompletionPopupState> {
     if candidates.is_empty() {
         return None;
     }
-    let selected = local.completion_selected.min(candidates.len() - 1);
-    Some(CompletionPopupState {
-        kind: CompletionKind::SlashCommand,
+    let selected = local.picker_selected.min(candidates.len() - 1);
+    Some(PickerState {
+        kind: PickerKind::SlashCommand,
         query: rest.to_string(),
         candidates,
         selected,
@@ -1183,8 +1170,8 @@ fn compute_completion(local: &LocalUi) -> Option<CompletionPopupState> {
 /// 不加这条判断的话，打全 `/model` 再回车只会把草稿补成 `/model `（多个空格），
 /// 得按第二次才提交；更糟的是接着打的字会续在同一条草稿上，看起来像"回车没反应"。
 /// 真机跑一遍才发现——这条路径所有单测都是"打一半"的前缀，从没打全过。
-fn completion_already_typed(local: &LocalUi) -> bool {
-    let Some(popup) = compute_completion(local) else {
+fn picker_already_typed(local: &LocalUi) -> bool {
+    let Some(popup) = compute_command_picker(local) else {
         return false;
     };
     popup
@@ -1193,17 +1180,17 @@ fn completion_already_typed(local: &LocalUi) -> bool {
         .is_some_and(|c| local.draft == c.name)
 }
 
-fn move_completion_selection(local: &mut LocalUi, delta: i32) {
-    let Some(popup) = compute_completion(local) else {
+fn move_picker_selection(local: &mut LocalUi, delta: i32) {
+    let Some(popup) = compute_command_picker(local) else {
         return;
     };
     let len = popup.candidates.len() as i32;
     let next = (popup.selected as i32 + delta).rem_euclid(len);
-    local.completion_selected = next as usize;
+    local.picker_selected = next as usize;
 }
 
-fn accept_completion(local: &mut LocalUi) {
-    let Some(popup) = compute_completion(local) else {
+fn accept_picker_candidate(local: &mut LocalUi) {
+    let Some(popup) = compute_command_picker(local) else {
         return;
     };
     let Some(candidate) = popup.candidates.get(popup.selected) else {
@@ -1241,17 +1228,15 @@ fn merge(mut frame: tui::FrameState, local: &LocalUi) -> tui::FrameState {
             .iter()
             .any(|e| e.block_id.as_deref() == Some(id.as_str()))
     });
-    match &mut frame.composer.content.approval {
-        Some(approval) => {
+    match &mut frame.composer.content.ask {
+        Some(ask) => {
             // 请求答掉一个就少一个，本地下标可能悬空——夹回去。
-            approval.active_idx = local
-                .approval_active
-                .min(approval.pending.len().saturating_sub(1));
-            let active = approval.active_idx;
-            if let Some(req) = approval.pending.get_mut(active) {
+            ask.active_idx = local.ask_active.min(ask.pending.len().saturating_sub(1));
+            let active = ask.active_idx;
+            if let Some(req) = ask.pending.get_mut(active) {
                 // 越界夹回 0：选项数是 bridge 说了算的，本地下标只是个光标。
-                req.selected_option = if local.approval_selected < req.options.len() {
-                    local.approval_selected
+                req.selected_option = if local.ask_selected < req.options.len() {
+                    local.ask_selected
                 } else {
                     0
                 };
@@ -1259,11 +1244,12 @@ fn merge(mut frame: tui::FrameState, local: &LocalUi) -> tui::FrameState {
             // bridge 那边按 `active_idx = 0` 算了一个默认值，真正的 active 是上面这行
             // 夹出来的——用同一个方法重算一次。Tab 到一道自由文本题时输入框要解锁，
             // Tab 回权限请求时要锁上。
-            let locks = approval.locks_composer();
+            let locks = ask.locks_composer();
             frame.composer.content.editor.locked = locks;
         }
         None => {
-            frame.composer.content.completion = session_popup(local).or(compute_completion(local))
+            frame.composer.content.picker =
+                session_picker_state(local).or(compute_command_picker(local))
         }
     }
     frame
@@ -1274,13 +1260,13 @@ fn merge(mut frame: tui::FrameState, local: &LocalUi) -> tui::FrameState {
 /// 借而不是新画一个：它要的东西补全弹窗已经全有了——一列 `名字 + 说明`、一个高亮
 /// 位、上下键和回车。区别只在选中之后做什么，而那是 `dispatch_picker_action` 的事，
 /// 不是渲染的事。
-fn session_popup(local: &LocalUi) -> Option<CompletionPopupState> {
+fn session_picker_state(local: &LocalUi) -> Option<PickerState> {
     let candidates = local.session_picker.clone()?;
     let selected = local
-        .completion_selected
+        .picker_selected
         .min(candidates.len().saturating_sub(1));
-    Some(CompletionPopupState {
-        kind: CompletionKind::Session,
+    Some(PickerState {
+        kind: PickerKind::Session,
         query: String::new(),
         candidates,
         selected,
@@ -1299,19 +1285,19 @@ fn spinner_frame() -> char {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tui::frame_state::{ApprovalState, ApprovalViewMode, LineKind, TranscriptEntry};
+    use tui::frame_state::{AskState, AskViewMode, LineKind, TranscriptEntry};
 
     fn local_with(draft: &str) -> LocalUi {
         let commands = vec![
-            CompletionCandidate {
+            PickerCandidate {
                 name: "/commit".into(),
                 description: "Create a commit".into(),
             },
-            CompletionCandidate {
+            PickerCandidate {
                 name: "/compact".into(),
                 description: "Compact context".into(),
             },
-            CompletionCandidate {
+            PickerCandidate {
                 name: "/help".into(),
                 description: "Show help".into(),
             },
@@ -1325,44 +1311,44 @@ mod tests {
 
     #[test]
     fn no_popup_without_slash_prefix() {
-        assert!(compute_completion(&local_with("hello")).is_none());
+        assert!(compute_command_picker(&local_with("hello")).is_none());
     }
 
     #[test]
     fn no_popup_once_a_space_is_typed() {
-        assert!(compute_completion(&local_with("/commit fix bug")).is_none());
+        assert!(compute_command_picker(&local_with("/commit fix bug")).is_none());
     }
 
     #[test]
     fn filters_by_prefix() {
-        let popup = compute_completion(&local_with("/com")).unwrap();
+        let popup = compute_command_picker(&local_with("/com")).unwrap();
         let names: Vec<_> = popup.candidates.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, vec!["/commit", "/compact"]);
     }
 
     #[test]
     fn no_popup_when_nothing_matches() {
-        assert!(compute_completion(&local_with("/zzz")).is_none());
+        assert!(compute_command_picker(&local_with("/zzz")).is_none());
     }
 
     #[test]
     fn selection_wraps_around_in_both_directions() {
         let mut local = local_with("/com");
-        move_completion_selection(&mut local, 1);
-        assert_eq!(local.completion_selected, 1);
-        move_completion_selection(&mut local, 1);
-        assert_eq!(local.completion_selected, 0); // wrapped past 2 candidates
-        move_completion_selection(&mut local, -1);
-        assert_eq!(local.completion_selected, 1); // wrapped the other way
+        move_picker_selection(&mut local, 1);
+        assert_eq!(local.picker_selected, 1);
+        move_picker_selection(&mut local, 1);
+        assert_eq!(local.picker_selected, 0); // wrapped past 2 candidates
+        move_picker_selection(&mut local, -1);
+        assert_eq!(local.picker_selected, 1); // wrapped the other way
     }
 
     #[test]
     fn accept_fills_draft_with_selected_candidate_and_a_trailing_space() {
         let mut local = local_with("/com");
-        move_completion_selection(&mut local, 1); // -> /compact
-        accept_completion(&mut local);
+        move_picker_selection(&mut local, 1); // -> /compact
+        accept_picker_candidate(&mut local);
         assert_eq!(local.draft, "/compact ");
-        assert!(compute_completion(&local).is_none()); // space closes the popup
+        assert!(compute_command_picker(&local).is_none()); // space closes the popup
     }
 
     // ── 转录滚动 ──
@@ -1429,7 +1415,7 @@ mod tests {
     #[test]
     fn keys_reach_their_handlers_through_the_real_resolver() {
         let handle = FakeHandle::new();
-        let mut snapshot = frame_without_approval();
+        let mut snapshot = frame_without_ask();
         snapshot.transcript.body.entries = (0..100)
             .map(|i| TranscriptEntry {
                 continues_previous: false,
@@ -1508,7 +1494,7 @@ mod tests {
     #[test]
     fn merge_turns_off_auto_follow_only_while_scrolled() {
         let mut local = local_with("");
-        let mut frame = frame_without_approval();
+        let mut frame = frame_without_ask();
         frame.transcript.body.entries = (0..50)
             .map(|i| TranscriptEntry {
                 continues_previous: false,
@@ -1530,7 +1516,7 @@ mod tests {
 
     /// 三个块、块 "b" 占两行，用来验证"按块走"而不是"按行走"。
     fn frame_with_blocks() -> tui::FrameState {
-        let mut frame = frame_without_approval();
+        let mut frame = frame_without_ask();
         frame.transcript.body.entries = [("a", 1), ("b", 2), ("c", 1)]
             .iter()
             .flat_map(|(id, rows)| {
@@ -1616,7 +1602,7 @@ mod tests {
     /// 选中靠上的块要把它滚进视口；靠底部的块则回到跟随模式。
     #[test]
     fn selecting_scrolls_the_block_into_view() {
-        let mut frame = frame_without_approval();
+        let mut frame = frame_without_ask();
         frame.transcript.body.entries = (0..50)
             .map(|i| TranscriptEntry {
                 continues_previous: false,
@@ -1664,7 +1650,7 @@ mod tests {
         let mut local = local_with("/model claude-opus-5");
         let handle = FakeHandle::new();
         assert_eq!(
-            submit(&mut local, &handle, &frame_without_approval()),
+            submit(&mut local, &handle, &frame_without_ask()),
             Flow::Continue
         );
         assert!(matches!(
@@ -1678,7 +1664,7 @@ mod tests {
     fn submitting_bare_model_reports_the_current_one() {
         let mut local = local_with("/model");
         let handle = FakeHandle::new();
-        let mut frame = frame_without_approval();
+        let mut frame = frame_without_ask();
         frame.footer_hints.model = "claude-sonnet-5".into();
         assert_eq!(submit(&mut local, &handle, &frame), Flow::Continue);
         assert!(matches!(
@@ -1692,16 +1678,11 @@ mod tests {
     #[test]
     fn enter_submits_when_the_command_is_already_fully_typed() {
         let mut local = local_with("/model");
-        assert!(compute_completion(&local).is_some(), "弹窗应该开着");
-        assert!(completion_already_typed(&local));
+        assert!(compute_command_picker(&local).is_some(), "弹窗应该开着");
+        assert!(picker_already_typed(&local));
 
         let handle = FakeHandle::new();
-        dispatch_action(
-            "editor.submit",
-            &mut local,
-            &handle,
-            &frame_without_approval(),
-        );
+        dispatch_action("editor.submit", &mut local, &handle, &frame_without_ask());
         assert!(
             matches!(handle.commands().as_slice(), [BridgeCommand::Note { .. }]),
             "应该提交（/model 无参 → 报当前模型），而不是补全；实际: {:?}",
@@ -1714,22 +1695,17 @@ mod tests {
     #[test]
     fn enter_still_completes_a_partially_typed_command() {
         let mut local = local_with("/mod");
-        assert!(!completion_already_typed(&local));
+        assert!(!picker_already_typed(&local));
 
         let handle = FakeHandle::new();
-        dispatch_action(
-            "editor.submit",
-            &mut local,
-            &handle,
-            &frame_without_approval(),
-        );
+        dispatch_action("editor.submit", &mut local, &handle, &frame_without_ask());
         assert_eq!(local.draft, "/model ");
         assert!(handle.commands().is_empty(), "补全不该发命令给 bridge");
     }
 
     #[test]
-    fn local_commands_show_up_in_the_completion_popup() {
-        let popup = compute_completion(&local_with("/mod")).expect("应该有候选");
+    fn local_commands_show_up_in_the_picker() {
+        let popup = compute_command_picker(&local_with("/mod")).expect("应该有候选");
         assert!(popup.candidates.iter().any(|c| c.name == "/model"));
     }
 
@@ -1782,7 +1758,7 @@ mod tests {
         let mut local = local_with("hello");
         local.scroll_offset = Some(30);
         let handle = FakeHandle::new();
-        submit(&mut local, &handle, &frame_without_approval());
+        submit(&mut local, &handle, &frame_without_ask());
         assert_eq!(local.scroll_offset, None);
     }
 
@@ -1904,7 +1880,7 @@ mod tests {
     fn submitted(local: &mut LocalUi, handle: &FakeHandle, text: &str) {
         local.draft = text.into();
         local.cursor = local.draft.len();
-        submit(local, handle, &frame_without_approval());
+        submit(local, handle, &frame_without_ask());
     }
 
     #[test]
@@ -1974,7 +1950,7 @@ mod tests {
     fn the_sticky_header_hides_while_its_prompt_is_still_on_screen() {
         let mut local = local_with("");
         local.viewport_lines = 3;
-        let mut frame = frame_without_approval();
+        let mut frame = frame_without_ask();
         frame.transcript.header = tui::frame_state::HeaderState {
             text: Some("问题".into()),
             source: tui::frame_state::HeaderSource::UserPrompt,
@@ -2027,7 +2003,7 @@ mod tests {
             text: text.into(),
             block_id: None,
         };
-        let mut frame = frame_without_approval();
+        let mut frame = frame_without_ask();
         // 3 条 = 正好一屏，prompt 在最上面一行 → 还看得见。
         frame.transcript.body.entries = vec![
             entry(LineKind::UserPrompt, "问题"),
@@ -2049,7 +2025,7 @@ mod tests {
     fn header_visibility_follows_the_scroll_offset() {
         let mut local = local_with("");
         local.viewport_lines = 2;
-        let mut frame = frame_without_approval();
+        let mut frame = frame_without_ask();
         frame.transcript.body.entries = (0..10)
             .map(|i| TranscriptEntry {
                 continues_previous: false,
@@ -2074,7 +2050,7 @@ mod tests {
     /// resume 起手时输入历史接着上次——从转录里恢复出来的用户输入读。
     #[test]
     fn history_is_seeded_from_a_restored_transcript() {
-        let mut frame = frame_without_approval();
+        let mut frame = frame_without_ask();
         frame.transcript.body.entries = vec![
             TranscriptEntry {
                 continues_previous: false,
@@ -2098,82 +2074,82 @@ mod tests {
     /// 请求只能等前面的答完才看得见。这是审计用例覆盖时发现的**功能**缺口，
     /// 不是测试缺口。
     #[test]
-    fn tab_switches_between_pending_approvals() {
+    fn tab_switches_between_pending_asks() {
         let mut local = local_with("");
         let handle = FakeHandle::new();
-        let two = |a: usize| ApprovalState {
+        let two = |a: usize| AskState {
             pending: vec![
-                ApprovalRequest {
+                AskRequest {
                     answer_with: AnswerWith::Choose,
                     prompt_id: "p1".into(),
                     tool_name: "Bash".into(),
                     message: "第一个".into(),
-                    options: vec![ApprovalOption::PermitOnce, ApprovalOption::Deny],
+                    options: vec![AskOption::PermitOnce, AskOption::Deny],
                     selected_option: 0,
                 },
-                ApprovalRequest {
+                AskRequest {
                     answer_with: AnswerWith::Choose,
                     prompt_id: "p2".into(),
                     tool_name: "Write".into(),
                     message: "第二个".into(),
-                    options: vec![ApprovalOption::PermitOnce, ApprovalOption::Deny],
+                    options: vec![AskOption::PermitOnce, AskOption::Deny],
                     selected_option: 0,
                 },
             ],
             active_idx: a,
-            view_mode: ApprovalViewMode::TabView,
+            view_mode: AskViewMode::TabView,
         };
 
         // 先把第一个的选项挪一格，切 tab 之后要复位（不然会带着上一个的高亮）。
-        local.approval_selected = 1;
-        dispatch_approval_action(
+        local.ask_selected = 1;
+        dispatch_ask_action(
             "ask.next-request",
             &mut local,
             &handle,
             &two(0).pending[0],
             2,
         );
-        assert_eq!(local.approval_active, 1);
-        assert_eq!(local.approval_selected, 0, "切 tab 之后选项高亮要复位");
+        assert_eq!(local.ask_active, 1);
+        assert_eq!(local.ask_selected, 0, "切 tab 之后选项高亮要复位");
 
-        let mut frame = frame_without_approval();
-        frame.composer.content.approval = Some(two(0));
+        let mut frame = frame_without_ask();
+        frame.composer.content.ask = Some(two(0));
         let merged = merge(frame, &local);
-        let approval = merged.composer.content.approval.unwrap();
-        assert_eq!(approval.active_idx, 1, "快照要跟着切");
-        assert_eq!(approval.pending[1].prompt_id, "p2");
+        let ask = merged.composer.content.ask.unwrap();
+        assert_eq!(ask.active_idx, 1, "快照要跟着切");
+        assert_eq!(ask.pending[1].prompt_id, "p2");
 
         // 环回去。
-        dispatch_approval_action(
+        dispatch_ask_action(
             "ask.next-request",
             &mut local,
             &handle,
             &two(1).pending[1],
             2,
         );
-        assert_eq!(local.approval_active, 0);
+        assert_eq!(local.ask_active, 0);
     }
 
     /// 答掉一个之后队列变短，本地下标可能悬空——夹回去，别越界。
     #[test]
-    fn merge_clamps_the_active_approval_after_one_is_answered() {
+    fn merge_clamps_the_active_ask_after_one_is_answered() {
         let mut local = local_with("");
-        local.approval_active = 1;
-        let mut frame = frame_without_approval();
-        frame.composer.content.approval = Some(ApprovalState {
-            pending: vec![ApprovalRequest {
+        local.ask_active = 1;
+        let mut frame = frame_without_ask();
+        frame.composer.content.ask = Some(AskState {
+            pending: vec![AskRequest {
                 answer_with: AnswerWith::Choose,
                 prompt_id: "p2".into(),
                 tool_name: "Write".into(),
                 message: "只剩一个了".into(),
-                options: vec![ApprovalOption::Deny],
+                options: vec![AskOption::Deny],
                 selected_option: 0,
             }],
             active_idx: 1,
-            view_mode: ApprovalViewMode::TabView,
+            view_mode: AskViewMode::TabView,
         });
         let merged = merge(frame, &local);
-        assert_eq!(merged.composer.content.approval.unwrap().active_idx, 0);
+        assert_eq!(merged.composer.content.ask.unwrap().active_idx, 0);
     }
 
     // ── 编辑器不变量（随机操作序列）──
@@ -2255,7 +2231,7 @@ mod tests {
         let mut local = editing("hello |world");
         let handle = FakeHandle::new();
         assert_eq!(
-            submit(&mut local, &handle, &frame_without_approval()),
+            submit(&mut local, &handle, &frame_without_ask()),
             Flow::Continue
         );
         assert!(matches!(
@@ -2270,7 +2246,7 @@ mod tests {
     /// 只走 `dispatch` + `sessions`——订阅接口在这些测试里不会被碰到。
     struct FakeHandle(
         std::sync::Mutex<Vec<BridgeCommand>>,
-        std::sync::Mutex<Vec<CompletionCandidate>>,
+        std::sync::Mutex<Vec<PickerCandidate>>,
     );
 
     impl FakeHandle {
@@ -2294,7 +2270,7 @@ mod tests {
                 })
                 .collect()
         }
-        fn decisions(&self) -> Vec<ApprovalOption> {
+        fn decisions(&self) -> Vec<AskOption> {
             self.0
                 .lock()
                 .unwrap()
@@ -2309,7 +2285,7 @@ mod tests {
 
     #[bridge::async_trait]
     impl EngineHandle for FakeHandle {
-        async fn sessions(&self, _query: &str) -> Vec<CompletionCandidate> {
+        async fn sessions(&self, _query: &str) -> Vec<PickerCandidate> {
             self.1.lock().unwrap().clone()
         }
         fn dispatch(&self, cmd: BridgeCommand) -> Result<(), bridge::BridgeError> {
@@ -2319,22 +2295,22 @@ mod tests {
         fn subscribe(&self) -> tokio::sync::watch::Receiver<tui::FrameState> {
             unimplemented!("these tests only exercise dispatch")
         }
-        fn subscribe_commands(&self) -> tokio::sync::watch::Receiver<Vec<CompletionCandidate>> {
+        fn subscribe_commands(&self) -> tokio::sync::watch::Receiver<Vec<PickerCandidate>> {
             unimplemented!("these tests only exercise dispatch")
         }
     }
 
-    fn approval_request() -> ApprovalRequest {
-        ApprovalRequest {
+    fn ask_request() -> AskRequest {
+        AskRequest {
             answer_with: AnswerWith::Choose,
             prompt_id: "p1".into(),
             tool_name: "Bash".into(),
             message: "run rm -rf /?".into(),
             options: vec![
-                ApprovalOption::PermitOnce,
-                ApprovalOption::PermitSession,
-                ApprovalOption::PermitProject,
-                ApprovalOption::Deny,
+                AskOption::PermitOnce,
+                AskOption::PermitSession,
+                AskOption::PermitProject,
+                AskOption::Deny,
             ],
             selected_option: 0,
         }
@@ -2346,30 +2322,30 @@ mod tests {
     fn confirm_sends_the_highlighted_option() {
         let mut local = local_with("");
         let handle = FakeHandle::new();
-        let req = approval_request();
+        let req = ask_request();
 
-        dispatch_approval_action("editor.history.next", &mut local, &handle, &req, 1);
-        dispatch_approval_action("editor.history.next", &mut local, &handle, &req, 1);
-        dispatch_approval_action("editor.submit", &mut local, &handle, &req, 1);
+        dispatch_ask_action("editor.history.next", &mut local, &handle, &req, 1);
+        dispatch_ask_action("editor.history.next", &mut local, &handle, &req, 1);
+        dispatch_ask_action("editor.submit", &mut local, &handle, &req, 1);
 
-        assert_eq!(handle.decisions(), vec![ApprovalOption::PermitProject]);
-        assert_eq!(local.approval_selected, 0, "下一个请求应该从头开始");
+        assert_eq!(handle.decisions(), vec![AskOption::PermitProject]);
+        assert_eq!(local.ask_selected, 0, "下一个请求应该从头开始");
     }
 
     #[test]
-    fn approval_selection_wraps_and_quick_keys_still_work() {
+    fn ask_selection_wraps_and_quick_keys_still_work() {
         let mut local = local_with("");
         let handle = FakeHandle::new();
-        let req = approval_request();
+        let req = ask_request();
 
-        dispatch_approval_action("ask.prev", &mut local, &handle, &req, 1);
-        assert_eq!(local.approval_selected, 3, "从第一项往上应该绕到最后一项");
+        dispatch_ask_action("ask.prev", &mut local, &handle, &req, 1);
+        assert_eq!(local.ask_selected, 3, "从第一项往上应该绕到最后一项");
 
-        dispatch_approval_action("ask.yes-shortcut", &mut local, &handle, &req, 1);
-        dispatch_approval_action("ask.no-shortcut", &mut local, &handle, &req, 1);
+        dispatch_ask_action("ask.yes-shortcut", &mut local, &handle, &req, 1);
+        dispatch_ask_action("ask.no-shortcut", &mut local, &handle, &req, 1);
         assert_eq!(
             handle.decisions(),
-            vec![ApprovalOption::PermitOnce, ApprovalOption::Deny]
+            vec![AskOption::PermitOnce, AskOption::Deny]
         );
     }
 
@@ -2377,8 +2353,8 @@ mod tests {
     fn escape_denies_rather_than_leaving_the_tool_call_hanging() {
         let mut local = local_with("");
         let handle = FakeHandle::new();
-        dispatch_approval_action("repl.dismiss", &mut local, &handle, &approval_request(), 1);
-        assert_eq!(handle.decisions(), vec![ApprovalOption::Deny]);
+        dispatch_ask_action("repl.dismiss", &mut local, &handle, &ask_request(), 1);
+        assert_eq!(handle.decisions(), vec![AskOption::Deny]);
     }
 
     /// `y`/`n` 绑的是裸字符：没有对话框时它们必须落进草稿，否则打 "yes" 会变成 "es"。
@@ -2387,7 +2363,7 @@ mod tests {
         let mut local = local_with("");
         let handle = FakeHandle::new();
         let mut resolver = Resolver::new(default_bindings());
-        let snapshot = frame_without_approval();
+        let snapshot = frame_without_ask();
 
         for c in "yn".chars() {
             dispatch_key(
@@ -2408,11 +2384,11 @@ mod tests {
         let mut local = local_with("hello");
         let handle = FakeHandle::new();
         let mut resolver = Resolver::new(default_bindings());
-        let mut snapshot = frame_without_approval();
-        snapshot.composer.content.approval = Some(ApprovalState {
-            pending: vec![approval_request()],
+        let mut snapshot = frame_without_ask();
+        snapshot.composer.content.ask = Some(AskState {
+            pending: vec![ask_request()],
             active_idx: 0,
-            view_mode: ApprovalViewMode::TabView,
+            view_mode: AskViewMode::TabView,
         });
 
         dispatch_key(
@@ -2433,8 +2409,8 @@ mod tests {
         );
     }
 
-    fn question_request(answer_with: AnswerWith, options: Vec<ApprovalOption>) -> ApprovalRequest {
-        ApprovalRequest {
+    fn question_request(answer_with: AnswerWith, options: Vec<AskOption>) -> AskRequest {
+        AskRequest {
             answer_with,
             prompt_id: "t1".into(),
             tool_name: "Branch name".into(),
@@ -2444,12 +2420,12 @@ mod tests {
         }
     }
 
-    fn frame_with(req: ApprovalRequest) -> tui::FrameState {
-        let mut snapshot = frame_without_approval();
-        snapshot.composer.content.approval = Some(ApprovalState {
+    fn frame_with(req: AskRequest) -> tui::FrameState {
+        let mut snapshot = frame_without_ask();
+        snapshot.composer.content.ask = Some(AskState {
             pending: vec![req],
             active_idx: 0,
-            view_mode: ApprovalViewMode::TabView,
+            view_mode: AskViewMode::TabView,
         });
         snapshot
     }
@@ -2462,23 +2438,23 @@ mod tests {
         let req = question_request(
             AnswerWith::Choose,
             vec![
-                ApprovalOption::Answer {
+                AskOption::Answer {
                     key: "a".into(),
                     label: "feat/x".into(),
                 },
-                ApprovalOption::Answer {
+                AskOption::Answer {
                     key: "b".into(),
                     label: "fix/y".into(),
                 },
             ],
         );
 
-        dispatch_approval_action("editor.history.next", &mut local, &handle, &req, 1);
-        dispatch_approval_action("editor.submit", &mut local, &handle, &req, 1);
+        dispatch_ask_action("editor.history.next", &mut local, &handle, &req, 1);
+        dispatch_ask_action("editor.submit", &mut local, &handle, &req, 1);
 
         assert_eq!(
             handle.decisions(),
-            vec![ApprovalOption::Answer {
+            vec![AskOption::Answer {
                 key: "b".into(),
                 label: "fix/y".into()
             }]
@@ -2493,14 +2469,14 @@ mod tests {
         let handle = FakeHandle::new();
         let req = question_request(
             AnswerWith::Choose,
-            vec![ApprovalOption::Answer {
+            vec![AskOption::Answer {
                 key: "a".into(),
                 label: "A".into(),
             }],
         );
 
         for action in ["ask.yes-shortcut", "ask.no-shortcut", "repl.dismiss"] {
-            dispatch_approval_action(action, &mut local, &handle, &req, 1);
+            dispatch_ask_action(action, &mut local, &handle, &req, 1);
         }
         assert!(handle.decisions().is_empty());
     }
@@ -2562,7 +2538,7 @@ mod tests {
 
     /// `(kind, text, 是不是上一条的续行)`。
     fn frame_with_entries(entries: Vec<(LineKind, &str, bool)>) -> tui::FrameState {
-        let mut f = frame_without_approval();
+        let mut f = frame_without_ask();
         f.transcript.body.entries = entries
             .into_iter()
             .map(|(kind, text, continues_previous)| TranscriptEntry {
@@ -2647,22 +2623,22 @@ mod tests {
     #[test]
     fn the_local_cursor_follows_a_shrinking_queue() {
         let mut local = local_with("");
-        local.approval_active = 2;
+        local.ask_active = 2;
 
-        let mut frame = frame_without_approval();
-        frame.composer.content.approval = Some(ApprovalState {
-            pending: vec![approval_request(), approval_request()],
+        let mut frame = frame_without_ask();
+        frame.composer.content.ask = Some(AskState {
+            pending: vec![ask_request(), ask_request()],
             active_idx: 0,
-            view_mode: ApprovalViewMode::TabView,
+            view_mode: AskViewMode::TabView,
         });
         local.reconcile(&frame);
-        assert_eq!(local.approval_active, 1, "越界的光标要夹回来");
+        assert_eq!(local.ask_active, 1, "越界的光标要夹回来");
 
-        local.reconcile(&frame_without_approval());
-        assert_eq!(local.approval_active, 0, "队列空了就归零");
+        local.reconcile(&frame_without_ask());
+        assert_eq!(local.ask_active, 0, "队列空了就归零");
     }
 
-    /// **两个下标必须一起夹。** 只夹 `approval_active` 的话回车会变成死键：
+    /// **两个下标必须一起夹。** 只夹 `ask_active` 的话回车会变成死键：
     /// 队列 `[A(4 个选项), B(2 个)]`，用户在 A 上选到第 4 项，A 自己超时消失，
     /// active 落到 B——屏幕上高亮的是 B 的第一项（`merge` 把越界的渲染值归了 0），
     /// 而 `ask.confirm` 读的是**没夹过的本地值**，`options.get(3)` 是 None，于是
@@ -2672,35 +2648,35 @@ mod tests {
         let two_options = question_request(
             AnswerWith::Choose,
             vec![
-                ApprovalOption::Answer {
+                AskOption::Answer {
                     key: "a".into(),
                     label: "A".into(),
                 },
-                ApprovalOption::Answer {
+                AskOption::Answer {
                     key: "b".into(),
                     label: "B".into(),
                 },
             ],
         );
-        let mut frame = frame_without_approval();
-        frame.composer.content.approval = Some(ApprovalState {
+        let mut frame = frame_without_ask();
+        frame.composer.content.ask = Some(AskState {
             pending: vec![two_options.clone()],
             active_idx: 0,
-            view_mode: ApprovalViewMode::TabView,
+            view_mode: AskViewMode::TabView,
         });
 
         let mut local = local_with("");
-        local.approval_active = 1; // 前面那条刚消失
-        local.approval_selected = 3; // 停在前面那条的第 4 个选项上
+        local.ask_active = 1; // 前面那条刚消失
+        local.ask_selected = 3; // 停在前面那条的第 4 个选项上
         local.reconcile(&frame);
-        assert_eq!(local.approval_selected, 0, "越界的选项下标要归零");
+        assert_eq!(local.ask_selected, 0, "越界的选项下标要归零");
 
         // 回车必须真的答出一个东西来，而不是什么都不发生。
         let handle = FakeHandle::new();
-        dispatch_approval_action("editor.submit", &mut local, &handle, &two_options, 1);
+        dispatch_ask_action("editor.submit", &mut local, &handle, &two_options, 1);
         assert_eq!(
             handle.decisions(),
-            vec![ApprovalOption::Answer {
+            vec![AskOption::Answer {
                 key: "a".into(),
                 label: "A".into()
             }]
@@ -2710,16 +2686,16 @@ mod tests {
     /// 还在范围内的选择不该被无端复位——用户挑到第 2 项、队列没动，就该停在那儿。
     #[test]
     fn an_in_range_selection_survives_reconcile() {
-        let mut frame = frame_without_approval();
-        frame.composer.content.approval = Some(ApprovalState {
-            pending: vec![approval_request()],
+        let mut frame = frame_without_ask();
+        frame.composer.content.ask = Some(AskState {
+            pending: vec![ask_request()],
             active_idx: 0,
-            view_mode: ApprovalViewMode::TabView,
+            view_mode: AskViewMode::TabView,
         });
         let mut local = local_with("");
-        local.approval_selected = 2;
+        local.ask_selected = 2;
         local.reconcile(&frame);
-        assert_eq!(local.approval_selected, 2);
+        assert_eq!(local.ask_selected, 2);
     }
 
     /// 答完一个之后光标回队列头。留在原地的话，下一个请求一到会凭空成为 active
@@ -2728,19 +2704,14 @@ mod tests {
     #[test]
     fn answering_puts_the_cursor_back_at_the_head_of_the_queue() {
         let mut local = local_with("");
-        local.approval_active = 1;
-        local.approval_selected = 2;
+        local.ask_active = 1;
+        local.ask_selected = 2;
         let handle = FakeHandle::new();
 
-        respond(
-            &handle,
-            &mut local,
-            &approval_request(),
-            ApprovalOption::PermitOnce,
-        );
+        respond(&handle, &mut local, &ask_request(), AskOption::PermitOnce);
 
-        assert_eq!(local.approval_active, 0);
-        assert_eq!(local.approval_selected, 0);
+        assert_eq!(local.ask_active, 0);
+        assert_eq!(local.ask_selected, 0);
     }
 
     // ── /resume 会话选择器 ──
@@ -2756,7 +2727,7 @@ mod tests {
             ("/resume   ", ""),
         ] {
             let mut local = local_with(draft);
-            let flow = submit(&mut local, &handle, &frame_without_approval());
+            let flow = submit(&mut local, &handle, &frame_without_ask());
             assert_eq!(flow, Flow::ListSessions(expected.into()), "draft: {draft}");
         }
         assert!(
@@ -2776,7 +2747,7 @@ mod tests {
             dispatch_picker_action("ask.next", &mut local, &handle),
             Flow::Continue
         );
-        assert_eq!(local.completion_selected, 1);
+        assert_eq!(local.picker_selected, 1);
         assert_eq!(
             dispatch_picker_action("ask.confirm", &mut local, &handle),
             Flow::Resume("bbb".into())
@@ -2811,24 +2782,24 @@ mod tests {
                 &mut resolver,
                 &mut local,
                 &handle,
-                &frame_without_approval(),
+                &frame_without_ask(),
             );
         }
         assert_eq!(local.draft, "");
         assert!(local.session_picker.is_some());
     }
 
-    /// 选择器和补全弹窗共用 `completion_selected`，两个同时开就是两个列表争一个
+    /// 选择器和补全弹窗共用 `picker_selected`，两个同时开就是两个列表争一个
     /// 高亮位。选择器开着时补全必须让路。
     #[test]
-    fn the_picker_and_the_completion_popup_are_never_both_open() {
+    fn the_session_picker_and_the_command_picker_are_never_both_open() {
         let mut local = local_with("/mo");
-        assert!(compute_completion(&local).is_some());
+        assert!(compute_command_picker(&local).is_some());
         local.open_picker(candidates(&["aaa"]));
-        assert!(compute_completion(&local).is_none());
+        assert!(compute_command_picker(&local).is_none());
 
-        let popup = session_popup(&local).expect("选择器要能上屏");
-        assert_eq!(popup.kind, CompletionKind::Session);
+        let popup = session_picker_state(&local).expect("选择器要能上屏");
+        assert_eq!(popup.kind, PickerKind::Session);
         assert_eq!(popup.candidates[0].name, "aaa");
     }
 
@@ -2878,7 +2849,7 @@ mod tests {
         local.reconcile(&frame_with(question_request(AnswerWith::Type, Vec::new())));
 
         assert!(local.session_picker.is_none());
-        assert!(session_popup(&local).is_none());
+        assert!(session_picker_state(&local).is_none());
     }
 
     /// 队列 `[自由文本题, 权限请求]`：锁不锁输入框，看的是**当前正在答的那一条**。
@@ -2887,14 +2858,14 @@ mod tests {
     /// 于是输入框画成灰的（说"不能打字"），而打字确实能打——UI 和行为互相打脸。
     #[test]
     fn locking_follows_the_active_request_not_the_whole_queue() {
-        let mut frame = frame_without_approval();
-        frame.composer.content.approval = Some(ApprovalState {
+        let mut frame = frame_without_ask();
+        frame.composer.content.ask = Some(AskState {
             pending: vec![
                 question_request(AnswerWith::Type, Vec::new()),
-                approval_request(),
+                ask_request(),
             ],
             active_idx: 0,
-            view_mode: ApprovalViewMode::TabView,
+            view_mode: AskViewMode::TabView,
         });
 
         let mut local = local_with("");
@@ -2906,7 +2877,7 @@ mod tests {
         assert!(active_choice(&merged).is_none(), "键盘不该归对话框");
 
         // Tab 到后面那个权限请求。
-        local.approval_active = 1;
+        local.ask_active = 1;
         let merged = merge(frame, &local);
         assert!(
             merged.composer.content.editor.locked,
@@ -2922,14 +2893,14 @@ mod tests {
     /// 被谁占了，处理函数写得再对也永远轮不到。
     #[test]
     fn tab_reaches_the_queue_switch_from_the_editor_context() {
-        let mut frame = frame_without_approval();
-        frame.composer.content.approval = Some(ApprovalState {
+        let mut frame = frame_without_ask();
+        frame.composer.content.ask = Some(AskState {
             pending: vec![
                 question_request(AnswerWith::Type, Vec::new()),
-                approval_request(),
+                ask_request(),
             ],
             active_idx: 0,
-            view_mode: ApprovalViewMode::TabView,
+            view_mode: AskViewMode::TabView,
         });
         let mut local = local_with("");
         let handle = FakeHandle::new();
@@ -2944,24 +2915,24 @@ mod tests {
             &snapshot,
         );
 
-        assert_eq!(local.approval_active, 1, "Tab 没有路由到队列切换上");
+        assert_eq!(local.ask_active, 1, "Tab 没有路由到队列切换上");
     }
 
     /// 排在自由文本题后面的权限请求必须 Tab 得到。
     ///
-    /// 以前 `ask.next-request` 只在 `dispatch_approval_action` 里，而那个函数只有
+    /// 以前 `ask.next-request` 只在 `dispatch_ask_action` 里，而那个函数只有
     /// 当前这条是选择题时才到得了——于是那个权限请求永远答不了，一直挂到 300 秒
     /// 超时被自动拒绝。
     #[test]
     fn a_permission_prompt_queued_behind_a_question_can_still_be_reached() {
-        let mut frame = frame_without_approval();
-        frame.composer.content.approval = Some(ApprovalState {
+        let mut frame = frame_without_ask();
+        frame.composer.content.ask = Some(AskState {
             pending: vec![
                 question_request(AnswerWith::Type, Vec::new()),
-                approval_request(),
+                ask_request(),
             ],
             active_idx: 0,
-            view_mode: ApprovalViewMode::TabView,
+            view_mode: AskViewMode::TabView,
         });
         let mut local = local_with("");
         let handle = FakeHandle::new();
@@ -2969,12 +2940,12 @@ mod tests {
 
         dispatch_action("ask.next-request", &mut local, &handle, &snapshot);
 
-        assert_eq!(local.approval_active, 1, "Tab 该切到那个权限请求上");
+        assert_eq!(local.ask_active, 1, "Tab 该切到那个权限请求上");
     }
 
-    fn candidates(ids: &[&str]) -> Vec<CompletionCandidate> {
+    fn candidates(ids: &[&str]) -> Vec<PickerCandidate> {
         ids.iter()
-            .map(|id| CompletionCandidate {
+            .map(|id| PickerCandidate {
                 name: (*id).into(),
                 description: "yesterday  3 msgs  x".into(),
             })
@@ -2985,20 +2956,20 @@ mod tests {
     #[test]
     fn merge_writes_the_local_selection_into_the_active_request() {
         let mut local = local_with("");
-        local.approval_selected = 2;
-        let mut snapshot = frame_without_approval();
-        snapshot.composer.content.approval = Some(ApprovalState {
-            pending: vec![approval_request()],
+        local.ask_selected = 2;
+        let mut snapshot = frame_without_ask();
+        snapshot.composer.content.ask = Some(AskState {
+            pending: vec![ask_request()],
             active_idx: 0,
-            view_mode: ApprovalViewMode::TabView,
+            view_mode: AskViewMode::TabView,
         });
 
         let merged = merge(snapshot, &local);
-        let approval = merged.composer.content.approval.unwrap();
-        assert_eq!(approval.pending[0].selected_option, 2);
+        let ask = merged.composer.content.ask.unwrap();
+        assert_eq!(ask.pending[0].selected_option, 2);
     }
 
-    fn frame_without_approval() -> tui::FrameState {
+    fn frame_without_ask() -> tui::FrameState {
         use tui::frame_state::*;
         tui::FrameState {
             transcript: TranscriptState {
@@ -3034,8 +3005,8 @@ mod tests {
                         paste_placeholder: None,
                         locked: false,
                     },
-                    completion: None,
-                    approval: None,
+                    picker: None,
+                    ask: None,
                 },
                 bottom_rule: BottomRuleState {
                     color: SeparatorColor::DarkGray,
@@ -3055,13 +3026,13 @@ mod tests {
     #[test]
     fn dismiss_hides_popup_until_draft_changes_again() {
         let mut local = local_with("/com");
-        assert!(compute_completion(&local).is_some());
-        local.completion_dismissed = true;
-        assert!(compute_completion(&local).is_none());
+        assert!(compute_command_picker(&local).is_some());
+        local.picker_dismissed = true;
+        assert!(compute_command_picker(&local).is_none());
         insert_char(
             KeyEvent::new(CtKeyCode::Char('m'), KeyModifiers::NONE),
             &mut local,
         );
-        assert!(compute_completion(&local).is_some());
+        assert!(compute_command_picker(&local).is_some());
     }
 }

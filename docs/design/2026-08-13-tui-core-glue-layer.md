@@ -1,5 +1,9 @@
 # TUI↔Core 粘合层 架构设计
 
+> **注意（后补）**：本文写作时使用的 `Z/R/S` 坐标体系已于 TUI_DESIGN v4 废止，
+> 换成了「代码路径 + English + 中文」三列对照名。这里保持原样不改——它是当时决策的
+> 记录。换算表见 `docs/TUI_DESIGN.md`。
+
 **日期：** 2026-08-13
 **基于需求：** `docs/reqs/2026-08-13-tui-core-glue-layer.md`
 

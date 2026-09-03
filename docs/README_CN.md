@@ -78,7 +78,7 @@ crates/app: dispatch_action()
 
 ## FrameState（`crates/tui/src/frame_state.rs`）
 
-`FrameState` 是渲染器消费的唯一可序列化、不含 AttaCore 类型的快照。完整的 Z0–Z4 区域树见 `docs/TUI_DESIGN.md`。它混合了两类状态：
+`FrameState` 是渲染器消费的唯一可序列化、不含 AttaCore 类型的快照。完整的区域树和中英文对照名见 `docs/TUI_DESIGN.md`。它混合了两类状态：
 
 - **Core 权威状态**，由 `bridge` 拥有并派生：转录条目、待确认的权限请求、子代理栏、累计会话用量。
 - **UI 本地状态**，由 `crates/app` 拥有，渲染前才合并进去：composer 草稿/光标、滚动位置。
@@ -124,7 +124,7 @@ AttaCode/
 ├── crates/
 │   ├── tui/                  纯 ratatui 渲染
 │   │   ├── src/frame_state.rs    FrameState + 各区域子状态
-│   │   ├── src/layout.rs         Z0..Z4 组合
+│   │   ├── src/layout.rs         顶层区域组合
 │   │   ├── src/regions/          每个区域一个渲染模块
 │   │   └── examples/layout_demo.rs   脚本化可视化 demo，不涉及 Core
 │   ├── bridge/                粘合层本体
@@ -135,7 +135,8 @@ AttaCode/
 │   ├── app/                   bin `attacode` —— 终端事件循环
 │   └── keybindings/           快捷键/组合键解析器 + 匹配器
 ├── docs/
-│   ├── TUI_DESIGN.md              Z0–Z4 区域设计
+│   ├── TUI_DESIGN.md              区域设计 + 中英文对照名（唯一权威）
+│   ├── tui-region-map.html        同一张表的图，浏览器打开，悬停联动
 │   ├── reqs/, design/             各特性的需求/架构文档
 │   └── README_CN.md               本文件
 ├── scripts/                   开发辅助脚本 / AttaCore patch 规格

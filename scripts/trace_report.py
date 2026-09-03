@@ -17,16 +17,20 @@ from collections import Counter
 # （大写字母带 SHIFT，一样是打字——漏掉它会让 "TODO" 这种输入混进快捷键统计。）
 TYPING = re.compile(r"^KeyModifiers\((0x0|SHIFT)\)\+Char\(")
 
-# 每个区块：怎么判断"这一帧它有内容"，以及没收到时该往哪儿看。
+# 每个区域：怎么判断"这一帧它有内容"，以及没收到时该往哪儿看。
+#
+# 名字用 docs/TUI_DESIGN.md 的规范名（代码路径 + 中文），不再用 Z/R/S 坐标——那套
+# 已经废止，而且这张表里曾经就把任务清单标成 Z1（实际 Z1.R1）、把提问框标成 Z2
+# （实际 Z2.R2.S2）：要数三层才写得对的东西，写着写着就不对了。
 REGIONS = [
-    ("转录 (Z0.R1)", lambda f: f["entries"] > 0, "reducer 的 apply_event"),
-    ("sticky header (Z0.R0)", lambda f: f["header"] is not None, "reducer::current_prompt + app::merge"),
-    ("状态行 (Z1)", lambda f: f["status"] is not None, "reducer::refresh_running_status"),
-    ("任务清单 (Z1)", lambda f: f["tasks"] > 0, "TodoWrite 工具的 input"),
-    ("子代理条 (Z3)", lambda f: f["sub_agents"] > 0, "AgentEvent::SubagentProgress"),
-    ("权限对话框 (Z2)", lambda f: f["approvals"] > 0, "AgentEvent::PermissionPrompt"),
-    ("块选中态", lambda f: f["selected_block"] is not None, "app 的 Alt+↑/↓"),
-    ("用量 (Z4)", lambda f: f["tok_in"] > 0 or f["tok_out"] > 0, "TurnComplete.usage"),
+    ("转录·正文 transcript.body", lambda f: f["entries"] > 0, "reducer 的 apply_event"),
+    ("转录·顶栏 transcript.header", lambda f: f["header"] is not None, "reducer::current_prompt + app::merge"),
+    ("状态·状态行 operation_status.status_line", lambda f: f["status"] is not None, "reducer::refresh_running_status"),
+    ("状态·任务清单 operation_status.task_list", lambda f: f["tasks"] > 0, "TodoWrite 工具的 input"),
+    ("子代理条 sub_agent_bar", lambda f: f["sub_agents"] > 0, "AgentEvent::SubagentProgress"),
+    ("输入·提问框 composer.content.ask", lambda f: f["asks"] > 0, "AgentEvent::PermissionPrompt / bridge::ask"),
+    ("转录块选中态 transcript.body.selected_block", lambda f: f["selected_block"] is not None, "app 的 Alt+↑/↓"),
+    ("底栏·用量 footer_hints.usage", lambda f: f["tok_in"] > 0 or f["tok_out"] > 0, "TurnComplete.usage"),
 ]
 
 

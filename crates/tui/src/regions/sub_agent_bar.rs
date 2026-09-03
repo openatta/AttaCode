@@ -1,4 +1,4 @@
-//! Z3 SubAgentBar — leaf region, roster of running/recently-finished sub agents.
+//! `sub_agent_bar` — Sub-Agent Bar / 子代理条。叶子区域，列出在跑的和刚跑完的子代理。
 
 use crate::frame_state::{SubAgentBarState, SubAgentState};
 use crate::regions::style::{self, COLOR_ERROR, COLOR_SECONDARY, COLOR_SUCCESS};

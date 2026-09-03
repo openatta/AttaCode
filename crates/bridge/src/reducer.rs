@@ -37,7 +37,7 @@ pub struct Reducer {
 
 struct DomainState {
     turns: Vec<Turn>,
-    pending_approvals: Vec<PendingApproval>,
+    pending_asks: Vec<PendingAsk>,
     sub_agents: Vec<SubAgentInfo>,
     /// 模型自己维护的待办清单，来自 `TodoWrite` 工具调用的入参。Core 没有"清单变了"
     /// 这类事件——清单是那个工具的 input，所以这里从 `ToolUse` 里读。每次调用是
@@ -87,21 +87,21 @@ struct ToolOutcome {
 /// 引擎的权限门（`AgentEvent::PermissionPrompt`），和模型自己的提问
 /// （`AskUserQuestion`，见 [`crate::ask`]）。区别全在 `answer_with`/`options` 上，
 /// 以及答案回到哪儿去——那是 `handle` 的事。
-struct PendingApproval {
+struct PendingAsk {
     prompt_id: String,
     tool_name: String,
     message: String,
     answer_with: AnswerWith,
-    options: Vec<ApprovalOption>,
+    options: Vec<AskOption>,
 }
 
 /// 权限门那一档的四个答案。每个待批准请求都是同一套，所以只写一次。
-fn permission_options() -> Vec<ApprovalOption> {
+fn permission_options() -> Vec<AskOption> {
     vec![
-        ApprovalOption::PermitOnce,
-        ApprovalOption::PermitSession,
-        ApprovalOption::PermitProject,
-        ApprovalOption::Deny,
+        AskOption::PermitOnce,
+        AskOption::PermitSession,
+        AskOption::PermitProject,
+        AskOption::Deny,
     ]
 }
 
@@ -110,13 +110,13 @@ fn permission_options() -> Vec<ApprovalOption> {
 /// `options` 为空是 Core schema 明说的一档（自由文本），这里翻成
 /// [`AnswerWith::Type`]：对话框只显示问题，composer 不锁，用户提交的下一行就是
 /// 答案。**不能**退回成"没有选项的多选题"——那是个选不动也退不出的死框。
-fn pending_from_question(q: PendingQuestion) -> PendingApproval {
+fn pending_from_question(q: PendingQuestion) -> PendingAsk {
     let answer_with = if q.options.is_empty() {
         AnswerWith::Type
     } else {
         AnswerWith::Choose
     };
-    PendingApproval {
+    PendingAsk {
         prompt_id: q.id,
         tool_name: q.header,
         message: q.question,
@@ -124,7 +124,7 @@ fn pending_from_question(q: PendingQuestion) -> PendingApproval {
         options: q
             .options
             .into_iter()
-            .map(|(key, label)| ApprovalOption::Answer { key, label })
+            .map(|(key, label)| AskOption::Answer { key, label })
             .collect(),
     }
 }
@@ -213,7 +213,7 @@ impl Reducer {
     ) -> (Arc<Self>, watch::Receiver<FrameState>) {
         let initial = DomainState {
             turns: restore_turns(restored),
-            pending_approvals: Vec::new(),
+            pending_asks: Vec::new(),
             sub_agents: Vec::new(),
             tasks: Vec::new(),
             usage: SessionUsageState::default(),
@@ -312,7 +312,7 @@ impl Reducer {
     /// 用户对某个待确认请求做出决定：立即从 pending 列表移除（不等 Core 确认）。
     pub fn resolve_prompt(&self, prompt_id: &str) {
         let mut state = self.state.lock().unwrap();
-        state.pending_approvals.retain(|p| p.prompt_id != prompt_id);
+        state.pending_asks.retain(|p| p.prompt_id != prompt_id);
         self.broadcast(&state);
     }
 
@@ -321,7 +321,7 @@ impl Reducer {
         match event {
             QuestionEvent::Ask(q) => {
                 let mut state = self.state.lock().unwrap();
-                state.pending_approvals.push(pending_from_question(q));
+                state.pending_asks.push(pending_from_question(q));
                 self.broadcast_as("Question", &state);
             }
             QuestionEvent::Withdraw(id) => self.resolve_prompt(&id),
@@ -450,7 +450,7 @@ impl Reducer {
                 message,
                 ..
             } => {
-                state.pending_approvals.push(PendingApproval {
+                state.pending_asks.push(PendingAsk {
                     prompt_id,
                     tool_name,
                     message,
@@ -930,14 +930,14 @@ fn render(state: &DomainState) -> FrameState {
         }
     }
 
-    let approval = if state.pending_approvals.is_empty() {
+    let ask = if state.pending_asks.is_empty() {
         None
     } else {
-        Some(ApprovalState {
+        Some(AskState {
             pending: state
-                .pending_approvals
+                .pending_asks
                 .iter()
-                .map(|p| ApprovalRequest {
+                .map(|p| AskRequest {
                     prompt_id: p.prompt_id.clone(),
                     tool_name: p.tool_name.clone(),
                     message: p.message.clone(),
@@ -947,14 +947,14 @@ fn render(state: &DomainState) -> FrameState {
                 })
                 .collect(),
             active_idx: 0,
-            view_mode: ApprovalViewMode::TabView,
+            view_mode: AskViewMode::TabView,
         })
     };
-    // 判据只有一个，在 `ApprovalState::locks_composer` 上。这里算出来的是**默认值**：
+    // 判据只有一个，在 `AskState::locks_composer` 上。这里算出来的是**默认值**：
     // `active_idx` 是 UI-本地状态（用户 Tab 到第几个），bridge 不知道，所以这一帧
     // 先按 0 算，`crates/app` 的 `merge` 夹完 `active_idx` 之后会用同一个方法重算。
     // 两处调的是同一个函数，不会各说各话。
-    let locked = approval.as_ref().is_some_and(|a| a.locks_composer());
+    let locked = ask.as_ref().is_some_and(|a| a.locks_composer());
 
     FrameState {
         transcript: TranscriptState {
@@ -1005,8 +1005,8 @@ fn render(state: &DomainState) -> FrameState {
                     paste_placeholder: None,
                     locked,
                 },
-                completion: None,
-                approval,
+                picker: None,
+                ask,
             },
             bottom_rule: BottomRuleState {
                 color: SeparatorColor::DarkGray,
@@ -1226,15 +1226,15 @@ mod tests {
         })
     }
 
-    fn only_pending(f: &FrameState) -> ApprovalRequest {
-        let approval = f
+    fn only_pending(f: &FrameState) -> AskRequest {
+        let ask = f
             .composer
             .content
-            .approval
+            .ask
             .as_ref()
             .expect("a dialog should be up");
-        assert_eq!(approval.pending.len(), 1);
-        approval.pending[0].clone()
+        assert_eq!(ask.pending.len(), 1);
+        ask.pending[0].clone()
     }
 
     /// 多选题：选项原样上屏，`key` 一个字都不能改——模型可能在拿它做匹配。
@@ -1251,11 +1251,11 @@ mod tests {
         assert_eq!(
             req.options,
             vec![
-                ApprovalOption::Answer {
+                AskOption::Answer {
                     key: "a".into(),
                     label: "feat/x".into()
                 },
-                ApprovalOption::Answer {
+                AskOption::Answer {
                     key: "b".into(),
                     label: "fix/y".into()
                 },
@@ -1289,11 +1289,11 @@ mod tests {
     fn withdrawing_a_question_takes_the_dialog_away() {
         let (r, rx) = reducer();
         r.apply_question(question("t3", &[("a", "A")]));
-        assert!(frame(&rx).composer.content.approval.is_some());
+        assert!(frame(&rx).composer.content.ask.is_some());
 
         r.apply_question(QuestionEvent::Withdraw("t3".into()));
         let f = frame(&rx);
-        assert!(f.composer.content.approval.is_none());
+        assert!(f.composer.content.ask.is_none());
         assert!(!f.composer.content.editor.locked);
     }
 
@@ -1311,7 +1311,7 @@ mod tests {
         r.apply_question(question("t4", &[]));
 
         let f = frame(&rx);
-        let pending = &f.composer.content.approval.as_ref().unwrap().pending;
+        let pending = &f.composer.content.ask.as_ref().unwrap().pending;
         assert_eq!(pending.len(), 2);
         assert_eq!(pending[0].answer_with, AnswerWith::Choose);
         assert_eq!(pending[0].options, permission_options());
@@ -2261,7 +2261,7 @@ mod tests {
     }
 
     #[test]
-    fn permission_prompt_populates_approval_and_resolve_clears_it() {
+    fn permission_prompt_populates_the_ask_queue_and_resolve_clears_it() {
         let (r, rx) = reducer();
         let turn_id = r.begin_turn("q".into());
         r.apply_event(AgentEvent::PermissionPrompt {
@@ -2272,12 +2272,12 @@ mod tests {
             turn_id,
         });
         let f = frame(&rx);
-        assert!(f.composer.content.approval.is_some());
+        assert!(f.composer.content.ask.is_some());
         assert!(f.composer.content.editor.locked);
 
         r.resolve_prompt("p1");
         let f = frame(&rx);
-        assert!(f.composer.content.approval.is_none());
+        assert!(f.composer.content.ask.is_none());
         assert!(!f.composer.content.editor.locked);
     }
 

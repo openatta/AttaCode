@@ -1,0 +1,593 @@
+<title>AttaCode 区域图</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Noto+Sans+SC:wght@400;500;700&display=swap">
+
+<style>
+:root {
+  --ground:      #f4f3ef;
+  --surface:     #fffefb;
+  --surface-2:   #eceae4;
+  --ink:         #1c1f27;
+  --ink-2:       #4a4f5c;
+  --ink-3:       #7c8290;
+  --rule:        #d9d6cd;
+  --rule-strong: #b9b5a9;
+  --accent:      #b5722a;
+
+  --r-transcript: #2f7c74;
+  --r-status:     #a8762c;
+  --r-composer:   #4c5fb5;
+  --r-agents:     #85508f;
+  --r-footer:     #4f6373;
+  --r-overlay:    #8a6a3a;
+
+  --tint: 12%;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --ground:      #11141a;
+    --surface:     #181c24;
+    --surface-2:   #20252f;
+    --ink:         #e4e7ee;
+    --ink-2:       #a7aebd;
+    --ink-3:       #767e8f;
+    --rule:        #2a3040;
+    --rule-strong: #3c4457;
+    --accent:      #e0a05a;
+
+    --r-transcript: #56b3a8;
+    --r-status:     #d9a45a;
+    --r-composer:   #8394e6;
+    --r-agents:     #bb85c6;
+    --r-footer:     #8ba3b8;
+    --r-overlay:    #c9a061;
+
+    --tint: 18%;
+  }
+}
+
+:root[data-theme="dark"] {
+  --ground:      #11141a;
+  --surface:     #181c24;
+  --surface-2:   #20252f;
+  --ink:         #e4e7ee;
+  --ink-2:       #a7aebd;
+  --ink-3:       #767e8f;
+  --rule:        #2a3040;
+  --rule-strong: #3c4457;
+  --accent:      #e0a05a;
+
+  --r-transcript: #56b3a8;
+  --r-status:     #d9a45a;
+  --r-composer:   #8394e6;
+  --r-agents:     #bb85c6;
+  --r-footer:     #8ba3b8;
+  --r-overlay:    #c9a061;
+
+  --tint: 18%;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--ground);
+  color: var(--ink);
+  font-family: "Noto Sans SC", "PingFang SC", "Hiragino Sans GB", system-ui, sans-serif;
+  font-size: 16px;
+  line-height: 1.65;
+  -webkit-font-smoothing: antialiased;
+}
+
+.page {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: clamp(2rem, 5vw, 4.5rem) clamp(1rem, 4vw, 2.5rem) 5rem;
+  display: flex;
+  flex-direction: column;
+  gap: clamp(2.5rem, 5vw, 4rem);
+}
+
+.mono { font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+/* ── masthead ─────────────────────────────────────────── */
+
+header { display: flex; flex-direction: column; gap: .9rem; }
+
+.eyebrow {
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: .75rem;
+  letter-spacing: .16em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+
+h1 {
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-weight: 700;
+  font-size: clamp(1.9rem, 5vw, 2.9rem);
+  letter-spacing: -.02em;
+  line-height: 1.1;
+  margin: 0;
+  text-wrap: balance;
+}
+h1 .cursor {
+  display: inline-block;
+  width: .52em; height: 1.02em;
+  margin-left: .12em;
+  vertical-align: -.14em;
+  background: var(--accent);
+}
+@media (prefers-reduced-motion: no-preference) {
+  h1 .cursor { animation: blink 1.25s steps(1) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+}
+
+.lede {
+  max-width: 60ch;
+  color: var(--ink-2);
+  margin: 0;
+}
+.lede strong { color: var(--ink); font-weight: 500; }
+
+/* ── the map ──────────────────────────────────────────── */
+
+.map-wrap { overflow-x: auto; }
+
+.map {
+  min-width: 620px;
+  background: var(--surface);
+  border: 1px solid var(--rule-strong);
+  border-radius: 3px;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+}
+
+.zone {
+  --hue: var(--r-footer);
+  border: 1px solid color-mix(in srgb, var(--hue) 55%, transparent);
+  border-left: 3px solid var(--hue);
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--hue) var(--tint), var(--surface));
+  padding: 9px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  transition: background .12s ease, border-color .12s ease;
+}
+.zone.is-lit {
+  background: color-mix(in srgb, var(--hue) 30%, var(--surface));
+  border-color: var(--hue);
+}
+
+.zone[data-hue="transcript"] { --hue: var(--r-transcript); }
+.zone[data-hue="status"]     { --hue: var(--r-status); }
+.zone[data-hue="composer"]   { --hue: var(--r-composer); }
+.zone[data-hue="agents"]     { --hue: var(--r-agents); }
+.zone[data-hue="footer"]     { --hue: var(--r-footer); }
+.zone[data-hue="overlay"]    { --hue: var(--r-overlay); }
+
+.zone > .row { display: flex; flex-wrap: wrap; align-items: baseline; gap: .55rem; }
+
+.path {
+  font-weight: 700;
+  font-size: .84rem;
+  color: var(--hue);
+  letter-spacing: -.01em;
+}
+.cn {
+  font-family: "Noto Sans SC", system-ui, sans-serif;
+  font-size: .82rem;
+  font-weight: 500;
+  color: var(--ink);
+}
+.en { font-size: .72rem; color: var(--ink-3); }
+.note {
+  font-family: "Noto Sans SC", system-ui, sans-serif;
+  font-size: .74rem;
+  color: var(--ink-2);
+  margin-left: auto;
+  text-align: right;
+}
+
+.kids { display: flex; flex-direction: column; gap: 5px; }
+
+.kid {
+  border-left: 2px solid color-mix(in srgb, var(--hue) 45%, transparent);
+  background: var(--surface);
+  padding: 6px 10px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: .5rem;
+  transition: background .12s ease;
+}
+.kid.is-lit { background: color-mix(in srgb, var(--hue) 26%, var(--surface)); }
+.kid .path { font-weight: 500; font-size: .78rem; color: var(--ink); }
+.kid .cn   { font-size: .78rem; font-weight: 400; }
+
+.stack-label {
+  font-size: .68rem;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  padding-left: 2px;
+}
+
+.overlay-band {
+  margin-top: 4px;
+  border: 1px dashed color-mix(in srgb, var(--r-overlay) 60%, transparent);
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--r-overlay) 9%, var(--surface));
+  padding: 8px 12px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: .55rem;
+}
+
+/* ── lookup table ─────────────────────────────────────── */
+
+section h2 {
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: 1.05rem;
+  font-weight: 700;
+  letter-spacing: -.01em;
+  margin: 0 0 .35rem;
+}
+section > p { margin: 0 0 1.2rem; color: var(--ink-2); max-width: 62ch; }
+
+.table-wrap { overflow-x: auto; }
+
+table {
+  width: 100%;
+  min-width: 640px;
+  border-collapse: collapse;
+  font-size: .84rem;
+}
+thead th {
+  text-align: left;
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: .68rem;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  font-weight: 500;
+  padding: 0 .8rem .5rem;
+  border-bottom: 1px solid var(--rule-strong);
+  white-space: nowrap;
+}
+tbody tr { border-bottom: 1px solid var(--rule); transition: background .12s ease; }
+tbody tr.is-lit { background: var(--surface-2); }
+tbody td { padding: .55rem .8rem; vertical-align: top; }
+td.c-path {
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: .8rem;
+  white-space: nowrap;
+  border-left: 3px solid var(--swatch, transparent);
+  padding-left: .65rem;
+}
+td.c-en { color: var(--ink-3); font-size: .78rem; white-space: nowrap; }
+td.c-cn { white-space: nowrap; font-weight: 500; }
+td.c-what { color: var(--ink-2); }
+tr[data-depth="2"] td.c-path { padding-left: 1.5rem; }
+tr[data-depth="3"] td.c-path { padding-left: 2.4rem; }
+
+/* ── renames ──────────────────────────────────────────── */
+
+.renames { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
+.rename {
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  border-top: 3px solid var(--accent);
+  border-radius: 2px;
+  padding: 1rem 1.15rem 1.15rem;
+}
+.rename .swap {
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: .88rem;
+  margin-bottom: .5rem;
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: .45rem;
+}
+.rename .old { color: var(--ink-3); text-decoration: line-through; }
+.rename .arrow { color: var(--accent); }
+.rename .new { color: var(--ink); font-weight: 700; }
+.rename p { margin: 0; font-size: .84rem; color: var(--ink-2); }
+
+/* ── footer note ──────────────────────────────────────── */
+
+.retired {
+  border-left: 3px solid var(--rule-strong);
+  padding: .1rem 0 .1rem 1.1rem;
+  color: var(--ink-2);
+  font-size: .86rem;
+  max-width: 66ch;
+}
+.retired code, .lede code, .rename code, td code {
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: .92em;
+  background: var(--surface-2);
+  padding: .08em .32em;
+  border-radius: 2px;
+}
+
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+</style>
+
+<div class="page">
+
+  <header>
+    <div class="eyebrow">docs/TUI_DESIGN.md · v4</div>
+    <h1>AttaCode 区域图<span class="cursor"></span></h1>
+    <p class="lede">
+      一个区域一个名字，三种写法指同一个东西：<strong>代码路径</strong>（唯一标识，能 grep）、
+      <strong>English</strong>、<strong>中文</strong>。说哪个都行，但必须是这张表里的那个词。
+      鼠标移到任意一行，图上对应的区域会亮起来。
+    </p>
+  </header>
+
+  <section>
+    <h2>屏幕上是怎么摞的</h2>
+    <p>自上而下堆叠，转录区吃掉所有剩余高度。<code>overlay</code> 不在这个堆叠里 —— 它盖在全部之上。</p>
+
+    <div class="map-wrap">
+      <div class="map">
+
+        <div class="zone" data-hue="transcript" data-id="transcript">
+          <div class="row">
+            <span class="path">transcript</span>
+            <span class="cn">转录区</span>
+            <span class="en">Transcript</span>
+            <span class="note">动态高度，填满剩余空间</span>
+          </div>
+          <div class="kids">
+            <div class="kid" data-id="transcript.header">
+              <span class="path">.header</span><span class="cn">转录·顶栏</span>
+              <span class="en">Transcript Header</span>
+              <span class="note">滚上去了才显示</span>
+            </div>
+            <div class="kid" data-id="transcript.body">
+              <span class="path">.body</span><span class="cn">转录·正文</span>
+              <span class="en">Transcript Body</span>
+              <span class="note">一条 entry = 屏幕一行</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="zone" data-hue="status" data-id="operation_status">
+          <div class="row">
+            <span class="path">operation_status</span>
+            <span class="cn">状态区</span>
+            <span class="en">Operation Status</span>
+            <span class="note">条件显示</span>
+          </div>
+          <div class="kids">
+            <div class="kid" data-id="operation_status.status_line">
+              <span class="path">.status_line</span><span class="cn">状态·状态行</span>
+              <span class="en">Status Line</span>
+              <span class="note">跑 turn / 压缩中 / 隐藏</span>
+            </div>
+            <div class="kid" data-id="operation_status.task_list">
+              <span class="path">.task_list</span><span class="cn">状态·任务清单</span>
+              <span class="en">Task List</span>
+              <span class="note">有待办才显示</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="zone" data-hue="composer" data-id="composer">
+          <div class="row">
+            <span class="path">composer</span>
+            <span class="cn">输入区</span>
+            <span class="en">Composer</span>
+            <span class="note">常驻容器</span>
+          </div>
+          <div class="kids">
+            <div class="kid" data-id="composer.app_info">
+              <span class="path">.app_info</span><span class="cn">输入·信息行</span>
+              <span class="en">App Info Line</span>
+            </div>
+            <div class="kid" data-id="composer.top_rule">
+              <span class="path">.top_rule</span><span class="cn">输入·上分隔线</span>
+              <span class="en">Top Rule</span>
+              <span class="note">右侧聚焦标签</span>
+            </div>
+            <div class="kid" data-id="composer.content">
+              <span class="path">.content</span><span class="cn">输入·内容层</span>
+              <span class="en">Content</span>
+              <span class="note">三样叠在一起 ↓</span>
+            </div>
+            <div class="kid" data-id="composer.content.editor" style="margin-left:1.4rem">
+              <span class="path">.content.editor</span><span class="cn">输入·编辑器</span>
+              <span class="en">Editor</span>
+              <span class="note">底层，常驻</span>
+            </div>
+            <div class="kid" data-id="composer.content.picker" style="margin-left:1.4rem">
+              <span class="path">.content.picker</span><span class="cn">输入·候选列表</span>
+              <span class="en">Picker</span>
+              <span class="note">悬浮：补全 / @ / 会话</span>
+            </div>
+            <div class="kid" data-id="composer.content.ask" style="margin-left:1.4rem">
+              <span class="path">.content.ask</span><span class="cn">输入·提问框</span>
+              <span class="en">Ask Box</span>
+              <span class="note">盖在编辑器上方</span>
+            </div>
+            <div class="kid" data-id="composer.bottom_rule">
+              <span class="path">.bottom_rule</span><span class="cn">输入·下分隔线</span>
+              <span class="en">Bottom Rule</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="zone" data-hue="agents" data-id="sub_agent_bar">
+          <div class="row">
+            <span class="path">sub_agent_bar</span>
+            <span class="cn">子代理条</span>
+            <span class="en">Sub-Agent Bar</span>
+            <span class="note">条件显示</span>
+          </div>
+        </div>
+
+        <div class="zone" data-hue="footer" data-id="footer_hints">
+          <div class="row">
+            <span class="path">footer_hints</span>
+            <span class="cn">底栏</span>
+            <span class="en">Footer Hints</span>
+            <span class="note">常驻，1 行</span>
+          </div>
+        </div>
+
+        <div class="stack-label">盖在以上全部之上，一次只有一个</div>
+        <div class="overlay-band" data-id="overlay">
+          <span class="path" style="color:var(--r-overlay)">overlay:{help|model|resume|settings|doctor|search}</span>
+          <span class="cn">浮层</span>
+          <span class="en">Overlay</span>
+        </div>
+
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>对照表</h2>
+    <p>唯一权威。写 bug、写测试用例、口头讨论，都用这三列里的词。</p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>代码路径（唯一标识）</th>
+            <th>English</th>
+            <th>中文</th>
+            <th>里面是什么</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr data-id="transcript" data-depth="1" style="--swatch:var(--r-transcript)">
+            <td class="c-path">transcript</td><td class="c-en">Transcript</td><td class="c-cn">转录区</td>
+            <td class="c-what">整段对话，填满剩余高度</td>
+          </tr>
+          <tr data-id="transcript.header" data-depth="2" style="--swatch:var(--r-transcript)">
+            <td class="c-path">transcript.header</td><td class="c-en">Transcript Header</td><td class="c-cn">转录·顶栏</td>
+            <td class="c-what">滚上去时钉住当前提问的第一行</td>
+          </tr>
+          <tr data-id="transcript.body" data-depth="2" style="--swatch:var(--r-transcript)">
+            <td class="c-path">transcript.body</td><td class="c-en">Transcript Body</td><td class="c-cn">转录·正文</td>
+            <td class="c-what">输入回显、回答、思考、工具卡片、diff。<strong>一条 entry 就是屏幕一行</strong></td>
+          </tr>
+          <tr data-id="operation_status" data-depth="1" style="--swatch:var(--r-status)">
+            <td class="c-path">operation_status</td><td class="c-en">Operation Status</td><td class="c-cn">状态区</td>
+            <td class="c-what">这一刻引擎在忙什么</td>
+          </tr>
+          <tr data-id="operation_status.status_line" data-depth="2" style="--swatch:var(--r-status)">
+            <td class="c-path">operation_status.status_line</td><td class="c-en">Status Line</td><td class="c-cn">状态·状态行</td>
+            <td class="c-what">spinner、秒数、累计用量，或压缩进度。内容互斥</td>
+          </tr>
+          <tr data-id="operation_status.task_list" data-depth="2" style="--swatch:var(--r-status)">
+            <td class="c-path">operation_status.task_list</td><td class="c-en">Task List</td><td class="c-cn">状态·任务清单</td>
+            <td class="c-what"><code>TodoWrite</code> 写下的待办；独立于状态行显隐</td>
+          </tr>
+          <tr data-id="composer" data-depth="1" style="--swatch:var(--r-composer)">
+            <td class="c-path">composer</td><td class="c-en">Composer</td><td class="c-cn">输入区</td>
+            <td class="c-what">常驻容器</td>
+          </tr>
+          <tr data-id="composer.app_info" data-depth="2" style="--swatch:var(--r-composer)">
+            <td class="c-path">composer.app_info</td><td class="c-en">App Info Line</td><td class="c-cn">输入·信息行</td>
+            <td class="c-what">程序级通知，跟当前 turn 无关</td>
+          </tr>
+          <tr data-id="composer.top_rule" data-depth="2" style="--swatch:var(--r-composer)">
+            <td class="c-path">composer.top_rule</td><td class="c-en">Top Rule</td><td class="c-cn">输入·上分隔线</td>
+            <td class="c-what">右侧带"正聚焦哪个子代理"的标签</td>
+          </tr>
+          <tr data-id="composer.content" data-depth="2" style="--swatch:var(--r-composer)">
+            <td class="c-path">composer.content</td><td class="c-en">Content</td><td class="c-cn">输入·内容层</td>
+            <td class="c-what">叠加容器，自身不画东西</td>
+          </tr>
+          <tr data-id="composer.content.editor" data-depth="3" style="--swatch:var(--r-composer)">
+            <td class="c-path">composer.content.editor</td><td class="c-en">Editor</td><td class="c-cn">输入·编辑器</td>
+            <td class="c-what">草稿和光标。锁不锁由提问框当前那条决定</td>
+          </tr>
+          <tr data-id="composer.content.picker" data-depth="3" style="--swatch:var(--r-composer)">
+            <td class="c-path">composer.content.picker</td><td class="c-en">Picker</td><td class="c-cn">输入·候选列表</td>
+            <td class="c-what">一个壳子三种列表：slash 补全 / <code>@</code> 文件提及 / <code>/resume</code> 会话</td>
+          </tr>
+          <tr data-id="composer.content.ask" data-depth="3" style="--swatch:var(--r-composer)">
+            <td class="c-path">composer.content.ask</td><td class="c-en">Ask Box</td><td class="c-cn">输入·提问框</td>
+            <td class="c-what">一个框两个来源：权限审批 + 模型提问</td>
+          </tr>
+          <tr data-id="composer.bottom_rule" data-depth="2" style="--swatch:var(--r-composer)">
+            <td class="c-path">composer.bottom_rule</td><td class="c-en">Bottom Rule</td><td class="c-cn">输入·下分隔线</td>
+            <td class="c-what">纯分隔</td>
+          </tr>
+          <tr data-id="sub_agent_bar" data-depth="1" style="--swatch:var(--r-agents)">
+            <td class="c-path">sub_agent_bar</td><td class="c-en">Sub-Agent Bar</td><td class="c-cn">子代理条</td>
+            <td class="c-what">在跑的和刚跑完的子代理，带 token 数</td>
+          </tr>
+          <tr data-id="footer_hints" data-depth="1" style="--swatch:var(--r-footer)">
+            <td class="c-path">footer_hints</td><td class="c-en">Footer Hints</td><td class="c-cn">底栏</td>
+            <td class="c-what">模型、cwd、权限模式、会话累计用量</td>
+          </tr>
+          <tr data-id="overlay" data-depth="1" style="--swatch:var(--r-overlay)">
+            <td class="c-path">overlay</td><td class="c-en">Overlay</td><td class="c-cn">浮层</td>
+            <td class="c-what">全帧浮层，不参与堆叠，一次只有一个</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <h2>两个改过名的，和改名的理由</h2>
+    <p>这两个名字曾经只说中了一半 —— 名字不是不方便，是会误导。</p>
+    <div class="renames">
+      <div class="rename">
+        <div class="swap">
+          <span class="old">approval</span><span class="arrow">→</span><span class="new">ask</span>
+        </div>
+        <p>它现在同时装<strong>权限审批</strong>和<strong>模型提问</strong>（<code>AskUserQuestion</code>）。
+        而键位层早就叫 <code>ask.confirm</code> / <code>ask.prev</code> / <code>ask.next-request</code>
+        —— 新名字是去跟已有的词汇会合，不是另造一个。</p>
+      </div>
+      <div class="rename">
+        <div class="swap">
+          <span class="old">completion</span><span class="arrow">→</span><span class="new">picker</span>
+        </div>
+        <p>它现在装 slash 补全、<code>@</code> 文件提及、<code>/resume</code> 会话选择器<strong>三种</strong>。
+        <code>PickerKind::Session</code> 这个变体本身就是"completion 这个名字撑不住了"的信号。</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>已废止：Z/R/S 坐标</h2>
+    <p class="retired">
+      v3 那套 <code>Z0.R1</code> / <code>Z2.R2.S2</code> 已经退役。它被废掉不是因为难看，是因为
+      <strong>它已经在说谎</strong>：面向测试的两处曾把任务清单标成 <code>Z1</code>（实际
+      <code>Z1.R1</code>）、把提问框标成 <code>Z2</code>（实际 <code>Z2.R2.S2</code>）——
+      要数三层才写得对的东西，写着写着就不对了。而且它和代码是两套词汇（代码里从来只用语义路径），
+      中间插一个区域就得全体重编号。代码路径没有这些毛病：写错了 grep 不到、编译不过。
+    </p>
+  </section>
+
+</div>
+
+<script>
+(function () {
+  var all = document.querySelectorAll('[data-id]');
+  function light(id, on) {
+    all.forEach(function (el) {
+      if (el.getAttribute('data-id') !== id) return;
+      el.classList.toggle('is-lit', on);
+    });
+  }
+  all.forEach(function (el) {
+    var id = el.getAttribute('data-id');
+    el.addEventListener('mouseenter', function () { light(id, true); });
+    el.addEventListener('mouseleave', function () { light(id, false); });
+  });
+})();
+</script>

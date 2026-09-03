@@ -1,4 +1,5 @@
-//! Z0 Transcript — Z0.R0 Header (nested) + Z0.R1 Body.
+//! `transcript` — Transcript / 转录区。含 `transcript.header`（转录·顶栏）
+//! 与 `transcript.body`（转录·正文）。
 
 use crate::frame_state::{
     HeaderSource, HeaderState, LineKind, TranscriptBodyState, TranscriptEntry,

@@ -1,4 +1,6 @@
-//! Top-level Z0..Z4 composition — the only place that computes region heights and stacks them.
+//! 顶层区域的组合 —— 唯一计算各区域高度并自上而下堆叠它们的地方。
+//!
+//! 区域的规范名（代码路径 / English / 中文）见 `docs/TUI_DESIGN.md`。
 
 use crate::frame_state::FrameState;
 use crate::regions::{composer, footer_hints, operation_status, sub_agent_bar, transcript};

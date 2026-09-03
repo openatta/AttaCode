@@ -94,8 +94,8 @@ fn base() -> FrameState {
                     paste_placeholder: None,
                     locked: false,
                 },
-                completion: None,
-                approval: None,
+                picker: None,
+                ask: None,
             },
             bottom_rule: BottomRuleState {
                 color: SeparatorColor::DarkGray,
@@ -197,17 +197,17 @@ fn the_selection_gutter_marks_exactly_one_block() {
 fn an_open_approval_dialog_locks_the_composer() {
     let mut f = base();
     f.composer.content.editor.locked = true;
-    f.composer.content.approval = Some(ApprovalState {
-        pending: vec![ApprovalRequest {
+    f.composer.content.ask = Some(AskState {
+        pending: vec![AskRequest {
             answer_with: AnswerWith::Choose,
             prompt_id: "p1".into(),
             tool_name: "Bash".into(),
             message: "rm -rf /tmp/x".into(),
-            options: vec![ApprovalOption::PermitOnce, ApprovalOption::Deny],
+            options: vec![AskOption::PermitOnce, AskOption::Deny],
             selected_option: 1,
         }],
         active_idx: 0,
-        view_mode: ApprovalViewMode::TabView,
+        view_mode: AskViewMode::TabView,
     });
     let screen = draw_at(&f, W, 16).join("\n");
     for expected in [
@@ -227,8 +227,8 @@ fn an_open_approval_dialog_locks_the_composer() {
 fn a_cramped_approval_dialog_keeps_the_options_and_the_key_hint() {
     let mut f = base();
     f.composer.content.editor.locked = true;
-    f.composer.content.approval = Some(ApprovalState {
-        pending: vec![ApprovalRequest {
+    f.composer.content.ask = Some(AskState {
+        pending: vec![AskRequest {
             answer_with: AnswerWith::Choose,
             prompt_id: "p1".into(),
             tool_name: "Bash".into(),
@@ -236,11 +236,11 @@ fn a_cramped_approval_dialog_keeps_the_options_and_the_key_hint() {
                 .map(|i| format!("说明第{i}行"))
                 .collect::<Vec<_>>()
                 .join("\n"),
-            options: vec![ApprovalOption::PermitOnce, ApprovalOption::Deny],
+            options: vec![AskOption::PermitOnce, AskOption::Deny],
             selected_option: 0,
         }],
         active_idx: 0,
-        view_mode: ApprovalViewMode::TabView,
+        view_mode: AskViewMode::TabView,
     });
     let screen = draw_at(&f, W, 12).join("\n");
     for expected in ["Bash:", "❯ Yes", "No", "Enter=confirm  Esc=deny", "…"] {
@@ -259,18 +259,18 @@ fn a_cramped_approval_dialog_keeps_the_options_and_the_key_hint() {
 fn several_pending_approvals_get_a_tab_strip() {
     let mut f = base();
     f.composer.content.editor.locked = true;
-    let req = |id: &str, tool: &str| ApprovalRequest {
+    let req = |id: &str, tool: &str| AskRequest {
         answer_with: AnswerWith::Choose,
         prompt_id: id.into(),
         tool_name: tool.into(),
         message: format!("{tool} wants in"),
-        options: vec![ApprovalOption::PermitOnce, ApprovalOption::Deny],
+        options: vec![AskOption::PermitOnce, AskOption::Deny],
         selected_option: 0,
     };
-    f.composer.content.approval = Some(ApprovalState {
+    f.composer.content.ask = Some(AskState {
         pending: vec![req("p1", "Bash"), req("p2", "Write")],
         active_idx: 1,
-        view_mode: ApprovalViewMode::TabView,
+        view_mode: AskViewMode::TabView,
     });
     let screen = draw_at(&f, W, 18).join("\n");
     assert!(screen.contains("[Bash#1]"), "缺 tab 条:\n{screen}");
@@ -338,10 +338,10 @@ fn the_completion_popup_floats_above_the_editor() {
     let mut f = base();
     f.composer.content.editor.draft = "/mod".into();
     f.composer.content.editor.cursor = 4;
-    f.composer.content.completion = Some(CompletionPopupState {
-        kind: CompletionKind::SlashCommand,
+    f.composer.content.picker = Some(PickerState {
+        kind: PickerKind::SlashCommand,
         query: "mod".into(),
-        candidates: vec![CompletionCandidate {
+        candidates: vec![PickerCandidate {
             name: "/model".into(),
             description: "Switch the model".into(),
         }],

@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
-// ═══ Z0 Transcript ═══
+// ═══ transcript — Transcript / 转录区 ═══
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranscriptState {
@@ -80,7 +80,7 @@ pub enum LineKind {
     DiffContext,
 }
 
-// ═══ Z1 OperationStatus ═══
+// ═══ operation_status — Operation Status / 状态区 ═══
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OperationStatusState {
@@ -159,7 +159,7 @@ impl ItemStatus {
     }
 }
 
-// ═══ Z2 Composer ═══
+// ═══ composer — Composer / 输入区 ═══
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ComposerState {
@@ -215,8 +215,8 @@ pub struct BottomRuleState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContentState {
     pub editor: EditorState,
-    pub completion: Option<CompletionPopupState>,
-    pub approval: Option<ApprovalState>,
+    pub picker: Option<PickerState>,
+    pub ask: Option<AskState>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -242,15 +242,15 @@ pub struct PasteInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CompletionPopupState {
-    pub kind: CompletionKind,
+pub struct PickerState {
+    pub kind: PickerKind,
     pub query: String,
-    pub candidates: Vec<CompletionCandidate>,
+    pub candidates: Vec<PickerCandidate>,
     pub selected: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum CompletionKind {
+pub enum PickerKind {
     SlashCommand,
     FileMention,
     /// `/resume` 的会话选择器。名字是完整的 session id，说明是"什么时候 / 多少条 /
@@ -259,21 +259,21 @@ pub enum CompletionKind {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CompletionCandidate {
+pub struct PickerCandidate {
     pub name: String,
     pub description: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ApprovalState {
-    pub pending: Vec<ApprovalRequest>,
+pub struct AskState {
+    pub pending: Vec<AskRequest>,
     pub active_idx: usize,
-    pub view_mode: ApprovalViewMode,
+    pub view_mode: AskViewMode,
 }
 
-impl ApprovalState {
+impl AskState {
     /// 现在归谁答。`None` 只可能是 `active_idx` 越界——调用方夹过之后就不会。
-    pub fn active(&self) -> Option<&ApprovalRequest> {
+    pub fn active(&self) -> Option<&AskRequest> {
         self.pending.get(self.active_idx)
     }
 
@@ -290,7 +290,7 @@ impl ApprovalState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ApprovalRequest {
+pub struct AskRequest {
     /// Opaque identifier the glue layer uses to route the user's decision back
     /// to the originating request (e.g. `AgentEvent::PermissionPrompt.prompt_id`).
     /// Not shown in the UI — display uses `tool_name`/`message` only.
@@ -303,7 +303,7 @@ pub struct ApprovalRequest {
     /// inferred rule makes that one typo away.
     pub answer_with: AnswerWith,
     /// Empty exactly when `answer_with` is [`AnswerWith::Type`].
-    pub options: Vec<ApprovalOption>,
+    pub options: Vec<AskOption>,
     pub selected_option: usize,
 }
 
@@ -320,7 +320,7 @@ pub enum AnswerWith {
     Type,
 }
 
-/// Something the user can pick in the approval dialog.
+/// Something the user can pick in the Ask Box.
 ///
 /// Two unrelated questions share this dialog, which is why the four permission
 /// answers and [`Answer`](Self::Answer) sit in one enum: *may this tool call
@@ -328,7 +328,7 @@ pub enum AnswerWith {
 /// to know something* (`AskUserQuestion`). They look the same on screen and are
 /// routed to completely different places — see `bridge::handle`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ApprovalOption {
+pub enum AskOption {
     PermitOnce,
     PermitSession,
     PermitProject,
@@ -342,25 +342,25 @@ pub enum ApprovalOption {
     },
 }
 
-impl ApprovalOption {
+impl AskOption {
     pub fn label(&self) -> &str {
         match self {
-            ApprovalOption::PermitOnce => "Yes",
-            ApprovalOption::PermitSession => "Yes, allow for this session",
-            ApprovalOption::PermitProject => "Yes, allow for this project",
-            ApprovalOption::Deny => "No",
-            ApprovalOption::Answer { label, .. } => label,
+            AskOption::PermitOnce => "Yes",
+            AskOption::PermitSession => "Yes, allow for this session",
+            AskOption::PermitProject => "Yes, allow for this project",
+            AskOption::Deny => "No",
+            AskOption::Answer { label, .. } => label,
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ApprovalViewMode {
+pub enum AskViewMode {
     TabView,
     ListView,
 }
 
-// ═══ Z3 SubAgentBar ═══
+// ═══ sub_agent_bar — Sub-Agent Bar / 子代理条 ═══
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubAgentBarState {
@@ -382,7 +382,7 @@ pub enum SubAgentState {
     Failed,
 }
 
-// ═══ Z4 FooterHints ═══
+// ═══ footer_hints — Footer Hints / 底栏 ═══
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FooterHintsState {

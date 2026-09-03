@@ -8,7 +8,7 @@ use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
-use tui::frame_state::{ApprovalOption, CompletionCandidate};
+use tui::frame_state::{AskOption, PickerCandidate};
 use tui::FrameState;
 
 #[derive(Debug, Error)]
@@ -18,7 +18,7 @@ pub enum BridgeError {
 }
 
 /// `app` 层可下发给 bridge 的命令集合。风格上与 `runtime::InputMessage` 对齐。
-/// 权限决定复用既有 `tui::frame_state::ApprovalOption`，不重复定义一套等价枚举。
+/// 权限决定复用既有 `tui::frame_state::AskOption`，不重复定义一套等价枚举。
 #[derive(Debug, Clone)]
 pub enum BridgeCommand {
     Submit {
@@ -31,11 +31,11 @@ pub enum BridgeCommand {
     /// 不需要知道这一条最后走 `InputMessage` 还是走问答通道。
     Respond {
         prompt_id: String,
-        decision: ApprovalOption,
+        decision: AskOption,
     },
     /// 自由文本那一档的答复：用户提交的一整行。
     ///
-    /// 和 `Respond` 分开，是因为它没有对应的 `ApprovalOption`——那个枚举装的是
+    /// 和 `Respond` 分开，是因为它没有对应的 `AskOption`——那个枚举装的是
     /// "可以点的东西"，而这里的答案是打出来的。
     AnswerQuestion {
         prompt_id: String,
@@ -69,12 +69,12 @@ pub trait EngineHandle: Send + Sync {
     /// 里的会话数走。做成同步的话，事件循环会在一个几百个会话的项目里卡住画面。
     /// 返回投影过的候选而不是 Core 的 `SessionSummary`——`crates/app` 不许看见
     /// AttaCore 类型。见 [`crate::sessions`]。
-    async fn sessions(&self, query: &str) -> Vec<CompletionCandidate>;
+    async fn sessions(&self, query: &str) -> Vec<PickerCandidate>;
 
     fn subscribe(&self) -> watch::Receiver<FrameState>;
     /// 当前可用的 slash 命令列表——直接来自 `Agent` 自己那份实时 `CommandRegistry`，
     /// 就是提交后 Core 真正会解析的那一套（见 `crate::commands`）。
-    fn subscribe_commands(&self) -> watch::Receiver<Vec<CompletionCandidate>>;
+    fn subscribe_commands(&self) -> watch::Receiver<Vec<PickerCandidate>>;
 
     /// 诊断用：把**即将渲染的那一帧**记进 `ATTACODE_TRACE`（没开就是空操作）。
     /// 默认什么都不做，测试里的假 handle 不必理会。
@@ -104,7 +104,7 @@ pub struct EngineParts {
 pub struct BridgeHandle {
     input_tx: InputSender,
     frame_rx: watch::Receiver<FrameState>,
-    commands_rx: watch::Receiver<Vec<CompletionCandidate>>,
+    commands_rx: watch::Receiver<Vec<PickerCandidate>>,
     reducer: Arc<Reducer>,
     /// 模型提问的会合点。答案从这里回到还在 `await` 的那个工具调用上。
     questions: Arc<crate::ask::Questions>,
@@ -125,7 +125,7 @@ impl BridgeHandle {
     pub fn new(
         engine: EngineParts,
         frame_rx: watch::Receiver<FrameState>,
-        commands_rx: watch::Receiver<Vec<CompletionCandidate>>,
+        commands_rx: watch::Receiver<Vec<PickerCandidate>>,
         reducer: Arc<Reducer>,
         cancel: CancellationToken,
     ) -> Self {
@@ -165,7 +165,7 @@ impl BridgeHandle {
 
 #[async_trait::async_trait]
 impl EngineHandle for BridgeHandle {
-    async fn sessions(&self, query: &str) -> Vec<CompletionCandidate> {
+    async fn sessions(&self, query: &str) -> Vec<PickerCandidate> {
         match &self.history {
             Some(store) => crate::sessions::candidates(store, query).await,
             // 没有落盘后端就没有可恢复的东西。空列表，不是错误——`/doctor` 那边
@@ -192,7 +192,7 @@ impl EngineHandle for BridgeHandle {
             } => {
                 // 模型的提问不经过引擎的输入通道——它在等的是 `crate::ask` 里那个
                 // oneshot，`InputMessage::PermissionResponse` 那条路上没有它的位置。
-                if let ApprovalOption::Answer { key, .. } = decision {
+                if let AskOption::Answer { key, .. } = decision {
                     return self.answer_question(prompt_id, key);
                 }
                 // 三档"允许"是三件不同的事，不能都塌成 `Permit`：后两档要让引擎调
@@ -200,18 +200,18 @@ impl EngineHandle for BridgeHandle {
                 // 的 `PermitAlways` 分支）。塌成 `Permit` 的话，用户选了"本会话一直
                 // 允许"，下一次调用照样弹。
                 let runtime_decision = match decision {
-                    ApprovalOption::Deny => RuntimeDecision::Deny {
+                    AskOption::Deny => RuntimeDecision::Deny {
                         reason: "denied by user".into(),
                     },
-                    ApprovalOption::PermitOnce => RuntimeDecision::Permit,
-                    ApprovalOption::PermitSession => RuntimeDecision::PermitAlways {
+                    AskOption::PermitOnce => RuntimeDecision::Permit,
+                    AskOption::PermitSession => RuntimeDecision::PermitAlways {
                         scope: PersistScope::Session,
                     },
-                    ApprovalOption::PermitProject => RuntimeDecision::PermitAlways {
+                    AskOption::PermitProject => RuntimeDecision::PermitAlways {
                         scope: PersistScope::Local,
                     },
                     // 上面刚 return 过。
-                    ApprovalOption::Answer { .. } => unreachable!(),
+                    AskOption::Answer { .. } => unreachable!(),
                 };
                 self.reducer.resolve_prompt(&prompt_id);
                 self.input_tx
@@ -273,7 +273,7 @@ impl EngineHandle for BridgeHandle {
         self.frame_rx.clone()
     }
 
-    fn subscribe_commands(&self) -> watch::Receiver<Vec<CompletionCandidate>> {
+    fn subscribe_commands(&self) -> watch::Receiver<Vec<PickerCandidate>> {
         self.commands_rx.clone()
     }
 
@@ -362,12 +362,12 @@ mod tests {
     /// 三档"允许"是三件不同的事。塌成 `Permit` 的话，用户选了"本会话一直允许"，
     /// 下一次调用照样弹——设计文档专门点名的坑。
     #[test]
-    fn each_approval_option_maps_to_its_own_runtime_decision() {
+    fn each_permission_answer_maps_to_its_own_runtime_decision() {
         let cases = [
-            (ApprovalOption::PermitOnce, "Permit"),
-            (ApprovalOption::PermitSession, "PermitAlways(Session)"),
-            (ApprovalOption::PermitProject, "PermitAlways(Local)"),
-            (ApprovalOption::Deny, "Deny"),
+            (AskOption::PermitOnce, "Permit"),
+            (AskOption::PermitSession, "PermitAlways(Session)"),
+            (AskOption::PermitProject, "PermitAlways(Local)"),
+            (AskOption::Deny, "Deny"),
         ];
         for (option, expected) in cases {
             let (handle, mut rx, _frame) = handle();
@@ -420,7 +420,7 @@ mod tests {
         handle
             .dispatch(BridgeCommand::Respond {
                 prompt_id: "t1".into(),
-                decision: ApprovalOption::Answer {
+                decision: AskOption::Answer {
                     key: "a".into(),
                     label: "A".into(),
                 },
@@ -560,7 +560,7 @@ mod tests {
             BridgeCommand::SetModel { name: "m".into() },
             BridgeCommand::Respond {
                 prompt_id: "p".into(),
-                decision: ApprovalOption::Deny,
+                decision: AskOption::Deny,
             },
         ] {
             assert!(

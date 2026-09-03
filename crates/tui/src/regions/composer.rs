@@ -1,9 +1,16 @@
-//! Z2 Composer — Z2.R0 AppInfoLine, Z2.R1 TopRule, Z2.R2 Content (Z2.R2.S0 Editor base +
-//! Z2.R2.S1 CompletionPopup floating + Z2.R2.S2 Approval stacked above Editor), Z2.R3 BottomRule.
+//! `composer` — Composer / 输入区。
+//!
+//! - `composer.app_info`（输入·信息行）
+//! - `composer.top_rule`（输入·上分隔线）
+//! - `composer.content`（输入·内容层）—— 三样东西叠在一起：
+//!   - `composer.content.editor`（输入·编辑器）常驻在底
+//!   - `composer.content.picker`（输入·候选列表）悬浮其上
+//!   - `composer.content.ask`（输入·提问框）盖在编辑器上方
+//! - `composer.bottom_rule`（输入·下分隔线）
 
 use crate::frame_state::{
-    AnswerWith, ApprovalRequest, ApprovalState, ApprovalViewMode, BottomRuleState, CompletionKind,
-    CompletionPopupState, ComposerState, ContentState, EditorState, InputMode, TopRuleState,
+    AnswerWith, AskRequest, AskState, AskViewMode, BottomRuleState, ComposerState, ContentState,
+    EditorState, InputMode, PickerKind, PickerState, TopRuleState,
 };
 use crate::regions::style::{self, separator_color, COLOR_ACCENT, COLOR_SECONDARY};
 use ratatui::{
@@ -29,9 +36,9 @@ pub fn height(state: &ComposerState, width: u16) -> u16 {
 fn content_height(state: &ContentState, width: u16) -> u16 {
     editor_height(&state.editor, width)
         + state
-            .approval
+            .ask
             .as_ref()
-            .map(|a| approval_height(a, width))
+            .map(|a| ask_height(a, width))
             .unwrap_or(0)
 }
 
@@ -62,10 +69,10 @@ fn wrapped_line_count(text: &str, avail_width: u16) -> u16 {
     total.max(1)
 }
 
-fn approval_height(state: &ApprovalState, _width: u16) -> u16 {
+fn ask_height(state: &AskState, _width: u16) -> u16 {
     let border = 2;
     match state.view_mode {
-        ApprovalViewMode::TabView => {
+        AskViewMode::TabView => {
             let tabs = if state.pending.len() > 1 { 1 } else { 0 };
             let card = state
                 .pending
@@ -74,11 +81,11 @@ fn approval_height(state: &ApprovalState, _width: u16) -> u16 {
                 .unwrap_or(0);
             border + tabs + card
         }
-        ApprovalViewMode::ListView => border + 1 + state.pending.len() as u16 + 2,
+        AskViewMode::ListView => border + 1 + state.pending.len() as u16 + 2,
     }
 }
 
-fn card_inner_height(req: &ApprovalRequest) -> u16 {
+fn card_inner_height(req: &AskRequest) -> u16 {
     let msg_lines = req.message.lines().count().max(1) as u16;
     // 自由文本题的 `options` 是空的，那一段自然是 0 行——高度跟着选项数走就对了，
     // 不需要为它开一个分支。
@@ -143,21 +150,21 @@ fn render_bottom_rule(frame: &mut Frame, area: Rect, state: &BottomRuleState) {
 
 fn render_content(frame: &mut Frame, area: Rect, state: &ContentState) {
     let editor_h = editor_height(&state.editor, area.width);
-    let approval_h = state
-        .approval
+    let ask_h = state
+        .ask
         .as_ref()
-        .map(|a| approval_height(a, area.width))
+        .map(|a| ask_height(a, area.width))
         .unwrap_or(0);
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(approval_h), Constraint::Length(editor_h)])
+        .constraints([Constraint::Length(ask_h), Constraint::Length(editor_h)])
         .split(area);
 
     render_editor(frame, rows[1], &state.editor);
-    if let Some(approval) = &state.approval {
-        render_approval(frame, rows[0], approval);
-    } else if let Some(completion) = &state.completion {
-        render_completion_popup(frame, rows[1], completion);
+    if let Some(ask) = &state.ask {
+        render_ask(frame, rows[0], ask);
+    } else if let Some(picker) = &state.picker {
+        render_picker(frame, rows[1], picker);
     }
 }
 
@@ -267,15 +274,15 @@ fn popup_window_start(selected: usize, len: usize, visible: usize) -> usize {
     selected.saturating_sub(visible - 1).min(last_start)
 }
 
-fn render_completion_popup(frame: &mut Frame, editor_area: Rect, state: &CompletionPopupState) {
+fn render_picker(frame: &mut Frame, editor_area: Rect, state: &PickerState) {
     if state.candidates.is_empty() {
         return;
     }
     // 会话那一档的 `name` 是裸的 BASE58 id，人看不出任何东西；真正有用的是
     // `description`（什么时候 / 多少条 / 讲了什么）。所以那一档只画说明——反正
     // 选中之后是按 id 切过去的，用户不需要读它。
-    let ids_are_noise = state.kind == CompletionKind::Session;
-    let row_text = |c: &crate::frame_state::CompletionCandidate| -> (String, String) {
+    let ids_are_noise = state.kind == PickerKind::Session;
+    let row_text = |c: &crate::frame_state::PickerCandidate| -> (String, String) {
         if ids_are_noise {
             (c.description.clone(), String::new())
         } else {
@@ -355,14 +362,14 @@ fn render_completion_popup(frame: &mut Frame, editor_area: Rect, state: &Complet
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-fn render_approval(frame: &mut Frame, area: Rect, state: &ApprovalState) {
+fn render_ask(frame: &mut Frame, area: Rect, state: &AskState) {
     match state.view_mode {
-        ApprovalViewMode::TabView => render_approval_tabs(frame, area, state),
-        ApprovalViewMode::ListView => render_approval_list(frame, area, state),
+        AskViewMode::TabView => render_ask_tabs(frame, area, state),
+        AskViewMode::ListView => render_ask_list(frame, area, state),
     }
 }
 
-fn render_approval_tabs(frame: &mut Frame, area: Rect, state: &ApprovalState) {
+fn render_ask_tabs(frame: &mut Frame, area: Rect, state: &AskState) {
     let mut area = area;
     if state.pending.len() > 1 {
         let tab_area = Rect { height: 1, ..area };
@@ -478,7 +485,7 @@ fn fit_card(
     out
 }
 
-fn render_approval_list(frame: &mut Frame, area: Rect, state: &ApprovalState) {
+fn render_ask_list(frame: &mut Frame, area: Rect, state: &AskState) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(COLOR_ACCENT));
@@ -486,7 +493,7 @@ fn render_approval_list(frame: &mut Frame, area: Rect, state: &ApprovalState) {
     frame.render_widget(block, area);
 
     let mut lines = vec![Line::from(Span::styled(
-        format!("{} pending approvals", state.pending.len()),
+        format!("{} pending asks", state.pending.len()),
         Style::default().add_modifier(Modifier::BOLD),
     ))];
     for (i, req) in state.pending.iter().enumerate() {
@@ -519,7 +526,7 @@ fn render_approval_list(frame: &mut Frame, area: Rect, state: &ApprovalState) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frame_state::{ApprovalOption, SeparatorColor};
+    use crate::frame_state::{AskOption, SeparatorColor};
 
     fn empty_editor() -> EditorState {
         EditorState {
@@ -541,8 +548,8 @@ mod tests {
             },
             content: ContentState {
                 editor: empty_editor(),
-                completion: None,
-                approval: None,
+                picker: None,
+                ask: None,
             },
             bottom_rule: BottomRuleState {
                 color: SeparatorColor::DarkGray,
@@ -590,10 +597,10 @@ mod tests {
     #[test]
     fn a_popup_with_no_room_above_the_editor_is_skipped_rather_than_drawn_over_it() {
         use ratatui::{backend::TestBackend, Terminal};
-        let state = CompletionPopupState {
-            kind: CompletionKind::SlashCommand,
+        let state = PickerState {
+            kind: PickerKind::SlashCommand,
             query: "m".into(),
-            candidates: vec![crate::frame_state::CompletionCandidate {
+            candidates: vec![crate::frame_state::PickerCandidate {
                 name: "/model".into(),
                 description: "switch".into(),
             }],
@@ -608,7 +615,7 @@ mod tests {
                     width: 40,
                     height: 2,
                 };
-                render_completion_popup(f, editor, &state);
+                render_picker(f, editor, &state);
             })
             .unwrap();
             let buf = t.backend().buffer().clone();
@@ -626,11 +633,11 @@ mod tests {
     #[test]
     fn the_session_picker_shows_what_a_session_was_about_not_its_id() {
         use ratatui::{backend::TestBackend, Terminal};
-        let state = CompletionPopupState {
-            kind: CompletionKind::Session,
+        let state = PickerState {
+            kind: PickerKind::Session,
             query: String::new(),
             candidates: (0..20)
-                .map(|i| crate::frame_state::CompletionCandidate {
+                .map(|i| crate::frame_state::PickerCandidate {
                     name: format!("BASE58id{i:02}"),
                     description: format!("2026-09-0{}  4 msgs  第{i}次会话", i % 9 + 1),
                 })
@@ -645,7 +652,7 @@ mod tests {
                 width: 70,
                 height: 3,
             };
-            render_completion_popup(f, editor, &state);
+            render_picker(f, editor, &state);
         })
         .unwrap();
         let buf = t.backend().buffer().clone();
@@ -672,29 +679,26 @@ mod tests {
     }
 
     #[test]
-    fn single_pending_approval_has_no_tab_strip_height() {
-        let req = ApprovalRequest {
+    fn a_single_pending_ask_has_no_tab_strip_height() {
+        let req = AskRequest {
             answer_with: AnswerWith::Choose,
             prompt_id: "test-1".into(),
             tool_name: "Bash".into(),
             message: "git status".into(),
-            options: vec![ApprovalOption::PermitOnce, ApprovalOption::Deny],
+            options: vec![AskOption::PermitOnce, AskOption::Deny],
             selected_option: 0,
         };
-        let with_one = ApprovalState {
+        let with_one = AskState {
             pending: vec![req.clone()],
             active_idx: 0,
-            view_mode: ApprovalViewMode::TabView,
+            view_mode: AskViewMode::TabView,
         };
-        let with_two = ApprovalState {
+        let with_two = AskState {
             pending: vec![req.clone(), req],
             active_idx: 0,
-            view_mode: ApprovalViewMode::TabView,
+            view_mode: AskViewMode::TabView,
         };
-        assert_eq!(
-            approval_height(&with_two, 80) - approval_height(&with_one, 80),
-            1
-        );
+        assert_eq!(ask_height(&with_two, 80) - ask_height(&with_one, 80), 1);
     }
 
     #[test]

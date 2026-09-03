@@ -1,5 +1,5 @@
 //! Self-cycling visual demo — drives `FrameState` through a scripted scenario sequence so the
-//! whole Z0..Z4 layout can be eyeballed live. Run with: cargo run -p tui --example layout_demo
+//! 整个区域树都能直接用眼睛看。跑法：cargo run -p tui --example layout_demo
 //!
 //! Controls: q/Esc/Ctrl-C quit · space pause/resume auto-advance · n/p next/prev scenario.
 
@@ -224,8 +224,8 @@ fn base_frame(entries: Vec<TranscriptEntry>) -> FrameState {
                     paste_placeholder: None,
                     locked: false,
                 },
-                completion: None,
-                approval: None,
+                picker: None,
+                ask: None,
             },
             bottom_rule: BottomRuleState {
                 color: SeparatorColor::DarkGray,
@@ -322,19 +322,19 @@ fn scrolled_header(_elapsed: u64) -> FrameState {
 fn slash_completion(_elapsed: u64) -> FrameState {
     let mut f = base_frame(base_entries());
     f.composer.content.editor.draft = "/com".into();
-    f.composer.content.completion = Some(CompletionPopupState {
-        kind: CompletionKind::SlashCommand,
+    f.composer.content.picker = Some(PickerState {
+        kind: PickerKind::SlashCommand,
         query: "com".into(),
         candidates: vec![
-            CompletionCandidate {
+            PickerCandidate {
                 name: "/compact".into(),
                 description: "compact context window".into(),
             },
-            CompletionCandidate {
+            PickerCandidate {
                 name: "/command".into(),
                 description: "show available commands".into(),
             },
-            CompletionCandidate {
+            PickerCandidate {
                 name: "/complete".into(),
                 description: "trigger completion manually".into(),
             },
@@ -347,21 +347,21 @@ fn slash_completion(_elapsed: u64) -> FrameState {
 fn single_approval(_elapsed: u64) -> FrameState {
     let mut f = base_frame(base_entries());
     f.composer.content.editor.locked = true;
-    f.composer.content.approval = Some(ApprovalState {
-        pending: vec![ApprovalRequest {
+    f.composer.content.ask = Some(AskState {
+        pending: vec![AskRequest {
             answer_with: AnswerWith::Choose,
             prompt_id: "demo-1".into(),
             tool_name: "Bash".into(),
             message: "git push --force origin main".into(),
             options: vec![
-                ApprovalOption::PermitOnce,
-                ApprovalOption::PermitProject,
-                ApprovalOption::Deny,
+                AskOption::PermitOnce,
+                AskOption::PermitProject,
+                AskOption::Deny,
             ],
             selected_option: 0,
         }],
         active_idx: 0,
-        view_mode: ApprovalViewMode::TabView,
+        view_mode: AskViewMode::TabView,
     });
     f
 }
@@ -369,39 +369,39 @@ fn single_approval(_elapsed: u64) -> FrameState {
 fn multi_approval(elapsed: u64) -> FrameState {
     let mut f = base_frame(base_entries());
     f.composer.content.editor.locked = true;
-    f.composer.content.approval = Some(ApprovalState {
+    f.composer.content.ask = Some(AskState {
         pending: vec![
-            ApprovalRequest {
+            AskRequest {
                 answer_with: AnswerWith::Choose,
                 prompt_id: "demo-1".into(),
                 tool_name: "Bash".into(),
                 message: "git push --force origin main".into(),
-                options: vec![ApprovalOption::PermitOnce, ApprovalOption::Deny],
+                options: vec![AskOption::PermitOnce, AskOption::Deny],
                 selected_option: 0,
             },
-            ApprovalRequest {
+            AskRequest {
                 answer_with: AnswerWith::Choose,
                 prompt_id: "demo-2".into(),
                 tool_name: "Edit".into(),
                 message: "src/parser.rs".into(),
                 options: vec![
-                    ApprovalOption::PermitOnce,
-                    ApprovalOption::PermitSession,
-                    ApprovalOption::Deny,
+                    AskOption::PermitOnce,
+                    AskOption::PermitSession,
+                    AskOption::Deny,
                 ],
                 selected_option: 0,
             },
-            ApprovalRequest {
+            AskRequest {
                 answer_with: AnswerWith::Choose,
                 prompt_id: "demo-3".into(),
                 tool_name: "Agent".into(),
                 message: "spawn sub-agent: code-reviewer".into(),
-                options: vec![ApprovalOption::PermitOnce, ApprovalOption::Deny],
+                options: vec![AskOption::PermitOnce, AskOption::Deny],
                 selected_option: 0,
             },
         ],
         active_idx: ((elapsed / 3) % 3) as usize,
-        view_mode: ApprovalViewMode::TabView,
+        view_mode: AskViewMode::TabView,
     });
     f
 }

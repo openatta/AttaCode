@@ -1,4 +1,4 @@
-//! Z4 FooterHints — leaf region, always 1 line.
+//! `footer_hints` — Footer Hints / 底栏。叶子区域，常驻一行。
 
 use crate::frame_state::{AppMode, FooterHintsState};
 use crate::regions::style::{COLOR_ACCENT, COLOR_SECONDARY};

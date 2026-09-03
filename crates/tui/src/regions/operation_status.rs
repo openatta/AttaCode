@@ -1,4 +1,6 @@
-//! Z1 OperationStatus — Z1.R0 StatusLine (mutually-exclusive content) + Z1.R1 TaskList (nested).
+//! `operation_status` — Operation Status / 状态区。含
+//! `operation_status.status_line`（状态·状态行，几种内容互斥）与
+//! `operation_status.task_list`（状态·任务清单，独立显隐）。
 
 use crate::frame_state::{ItemStatus, StatusContent, StatusLineState, TaskItem, TaskListState};
 use crate::regions::style::{self, COLOR_ACCENT, COLOR_SECONDARY, COLOR_SUCCESS, COLOR_WARNING};

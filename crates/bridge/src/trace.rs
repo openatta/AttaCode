@@ -2,7 +2,7 @@
 //!
 //! 装在 bridge 派生完 `FrameState`、广播给 app 之前那一刻，也就是"TUI 能看到的
 //! 全部信息"这道口子上。每来一个 `AgentEvent` 写一行 JSON：这次是什么事件，
-//! 事件之后各个区块（转录/状态行/任务清单/子代理条/权限队列/footer）各有多少
+//! 事件之后各个区域（转录区/状态行/任务清单/子代理条/提问框/底栏）各有多少
 //! 内容。跑完拿 `scripts/trace_report.py` 一汇总，就知道哪些区块**从来没收到过
 //! 东西**——那正是"接了但其实是死的"最容易藏身的地方（子代理条曾经就是）。
 //!
@@ -89,7 +89,7 @@ impl Trace {
         };
         let line = format!(
             "{{\"event\":{},\"entries\":{},\"kinds\":{{{}}},\"header\":{},\"status\":{},\
-             \"tasks\":{},\"sub_agents\":{},\"approvals\":{},\"selected_block\":{},\
+             \"tasks\":{},\"sub_agents\":{},\"asks\":{},\"selected_block\":{},\
              \"model\":{},\"tok_in\":{},\"tok_out\":{},\"turns\":{}}}",
             json_str(event),
             frame.transcript.body.entries.len(),
@@ -101,7 +101,7 @@ impl Trace {
             frame
                 .composer
                 .content
-                .approval
+                .ask
                 .as_ref()
                 .map(|a| a.pending.len())
                 .unwrap_or(0),

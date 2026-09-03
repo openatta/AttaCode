@@ -13,11 +13,11 @@
 use runtime::commands::CommandRegistry;
 use std::sync::Arc;
 use tokio::sync::watch;
-use tui::frame_state::CompletionCandidate;
+use tui::frame_state::PickerCandidate;
 
 pub struct CommandCatalog {
     registry: Arc<CommandRegistry>,
-    tx: watch::Sender<Vec<CompletionCandidate>>,
+    tx: watch::Sender<Vec<PickerCandidate>>,
 }
 
 impl CommandCatalog {
@@ -27,7 +27,7 @@ impl CommandCatalog {
     /// `&mut self` 借走整个 session，spawn 之后就没有 `&Agent` 可问了。
     pub fn new(
         registry: Arc<CommandRegistry>,
-    ) -> (Arc<Self>, watch::Receiver<Vec<CompletionCandidate>>) {
+    ) -> (Arc<Self>, watch::Receiver<Vec<PickerCandidate>>) {
         let (tx, rx) = watch::channel(candidates(&registry));
         (Arc::new(Self { registry, tx }), rx)
     }
@@ -40,7 +40,7 @@ impl CommandCatalog {
 
 /// `list_detailed()` 给 name/description，`argument_hint()` 给参数提示——两者都走
 /// `resolve()` 的同一条优先级链，所以不会出现"弹窗里是技能版、提交后解析成插件版"。
-fn candidates(registry: &CommandRegistry) -> Vec<CompletionCandidate> {
+fn candidates(registry: &CommandRegistry) -> Vec<PickerCandidate> {
     registry
         .list_detailed()
         .into_iter()
@@ -49,7 +49,7 @@ fn candidates(registry: &CommandRegistry) -> Vec<CompletionCandidate> {
                 Some(hint) if !hint.is_empty() => format!("{}  (args: {hint})", info.description),
                 _ => info.description,
             };
-            CompletionCandidate {
+            PickerCandidate {
                 name: format!("/{}", info.name),
                 description,
             }

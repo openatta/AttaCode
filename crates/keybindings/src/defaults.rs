@@ -79,16 +79,12 @@ pub fn default_bindings() -> Vec<Keybinding> {
         // 这三条在默认键位下**解析不到**：`Resolver` 取第一条匹配的绑定，Up/Down/Enter
         // 上面已经被 `editor.*` 占了。DSL 里没有"上下文/模式"的概念，所以这件事是在
         // app 那层解决的——权限对话框开着时它按对话框的语义解释 `editor.submit` /
-        // `editor.history.*`（见 `dispatch_approval_action`）。这里留着这三条是给
+        // `editor.history.*`（见 `dispatch_ask_action`）。这里留着这三条是给
         // 想把选项导航改绑到别的键的用户用的，改了就能走通。
         bind("Up", "ask.prev", "Previous option in ask-dialog"),
         bind("Down", "ask.next", "Next option in ask-dialog"),
         bind("Enter", "ask.confirm", "Confirm current ask-dialog choice"),
-        bind(
-            "Tab",
-            "ask.next-request",
-            "Switch to the next pending approval",
-        ),
+        bind("Tab", "ask.next-request", "Switch to the next pending ask"),
         bind("y", "ask.yes-shortcut", "Quick-yes in ask-dialog"),
         bind("n", "ask.no-shortcut", "Quick-no in ask-dialog"),
     ]
